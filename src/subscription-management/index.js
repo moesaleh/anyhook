@@ -70,6 +70,77 @@ producer.on('error', (err) => {
     console.error('Kafka producer error:', err);
 });
 
+// Health check endpoint
+app.get('/health', async (req, res) => {
+    const health = { status: 'ok', timestamp: new Date().toISOString(), services: {} };
+    try {
+        await pool.query('SELECT 1');
+        health.services.postgres = 'connected';
+    } catch {
+        health.services.postgres = 'disconnected';
+        health.status = 'degraded';
+    }
+    try {
+        await redisClient.ping();
+        health.services.redis = 'connected';
+    } catch {
+        health.services.redis = 'disconnected';
+        health.status = 'degraded';
+    }
+    res.status(health.status === 'ok' ? 200 : 503).json(health);
+});
+
+// Get subscription status (checks Redis cache for live connection state)
+app.get('/subscriptions/:id/status', async (req, res) => {
+    const { id } = req.params;
+    try {
+        // Check PostgreSQL for the subscription record
+        const dbResult = await pool.query('SELECT * FROM subscriptions WHERE subscription_id = $1', [id]);
+        if (dbResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Subscription not found' });
+        }
+        const subscription = dbResult.rows[0];
+
+        // Check Redis cache — presence means the connector service has it loaded
+        const cached = await redisClient.get(id);
+        const isConnected = cached !== null;
+
+        res.status(200).json({
+            subscription_id: id,
+            db_status: subscription.status,
+            connected: isConnected,
+            cached_at: isConnected ? JSON.parse(cached).created_at : null,
+            checked_at: new Date().toISOString(),
+        });
+    } catch (err) {
+        console.error('Error checking subscription status:', err);
+        res.status(500).json({ error: 'Failed to check subscription status' });
+    }
+});
+
+// Get status for all subscriptions (bulk)
+app.get('/subscriptions/status/all', async (req, res) => {
+    try {
+        const dbResult = await pool.query('SELECT subscription_id, status FROM subscriptions');
+        const keys = await redisClient.keys('*');
+        const connectedIds = new Set(keys);
+
+        const statuses = dbResult.rows.map((row) => ({
+            subscription_id: row.subscription_id,
+            db_status: row.status,
+            connected: connectedIds.has(row.subscription_id),
+        }));
+
+        res.status(200).json({
+            statuses,
+            checked_at: new Date().toISOString(),
+        });
+    } catch (err) {
+        console.error('Error checking statuses:', err);
+        res.status(500).json({ error: 'Failed to check subscription statuses' });
+    }
+});
+
 // PostgreSQL: Get all subscriptions
 app.get('/subscriptions', async (req, res) => {
     try {

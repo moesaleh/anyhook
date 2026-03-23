@@ -1,39 +1,71 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useCallback } from "react";
 import Link from "next/link";
 import { Plus, AlertCircle, RefreshCw } from "lucide-react";
 import { SubscriptionTable } from "@/components/subscription-table";
 import { DeleteDialog } from "@/components/delete-dialog";
 import { EmptyState } from "@/components/empty-state";
-import { fetchSubscriptions, deleteSubscription } from "@/lib/api";
+import { LiveIndicator } from "@/components/live-indicator";
+import {
+  fetchSubscriptions,
+  fetchAllStatuses,
+  deleteSubscription,
+} from "@/lib/api";
 import type { Subscription } from "@/lib/api";
+
+const POLL_INTERVAL = 10000;
 
 export default function SubscriptionsPage() {
   const [subscriptions, setSubscriptions] = useState<Subscription[]>([]);
+  const [connectedIds, setConnectedIds] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [deleting, setDeleting] = useState<string | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
+  const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
+  const [isPolling, setIsPolling] = useState(true);
 
-  async function loadSubscriptions(showRefresh = false) {
-    try {
-      if (showRefresh) setRefreshing(true);
-      setError(null);
-      const data = await fetchSubscriptions();
-      setSubscriptions(data);
-    } catch {
-      setError("Unable to connect to the API.");
-    } finally {
-      setLoading(false);
-      setRefreshing(false);
-    }
-  }
+  const loadData = useCallback(
+    async (showRefresh = false) => {
+      try {
+        if (showRefresh) setRefreshing(true);
+        setError(null);
+        const [subs, statuses] = await Promise.all([
+          fetchSubscriptions(),
+          fetchAllStatuses().catch(() => null),
+        ]);
+        setSubscriptions(subs);
+        if (statuses) {
+          setConnectedIds(
+            new Set(
+              statuses.statuses
+                .filter((s) => s.connected)
+                .map((s) => s.subscription_id)
+            )
+          );
+        }
+        setLastUpdated(new Date());
+      } catch {
+        setError("Unable to connect to the API.");
+      } finally {
+        setLoading(false);
+        setRefreshing(false);
+      }
+    },
+    []
+  );
 
   useEffect(() => {
-    loadSubscriptions();
-  }, []);
+    loadData();
+  }, [loadData]);
+
+  useEffect(() => {
+    if (!isPolling) return;
+    const interval = setInterval(() => loadData(), POLL_INTERVAL);
+    return () => clearInterval(interval);
+  }, [isPolling, loadData]);
 
   async function handleDelete(id: string) {
     setDeleteTarget(id);
@@ -47,6 +79,11 @@ export default function SubscriptionsPage() {
       setSubscriptions((prev) =>
         prev.filter((s) => s.subscription_id !== deleteTarget)
       );
+      setConnectedIds((prev) => {
+        const next = new Set(prev);
+        next.delete(deleteTarget);
+        return next;
+      });
     } catch {
       setError("Failed to delete subscription.");
     } finally {
@@ -58,7 +95,7 @@ export default function SubscriptionsPage() {
   return (
     <div className="p-6 lg:p-8 max-w-7xl mx-auto">
       {/* Header */}
-      <div className="flex items-center justify-between mb-8">
+      <div className="flex items-center justify-between mb-6">
         <div>
           <h1 className="text-2xl font-bold tracking-tight">Subscriptions</h1>
           <p className="text-sm text-neutral-500 mt-1">
@@ -67,7 +104,7 @@ export default function SubscriptionsPage() {
         </div>
         <div className="flex items-center gap-3">
           <button
-            onClick={() => loadSubscriptions(true)}
+            onClick={() => loadData(true)}
             disabled={refreshing}
             className="inline-flex items-center gap-2 rounded-lg border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-950 px-3 py-2.5 text-sm font-medium hover:bg-neutral-50 dark:hover:bg-neutral-900 transition-colors"
           >
@@ -84,6 +121,15 @@ export default function SubscriptionsPage() {
             New Subscription
           </Link>
         </div>
+      </div>
+
+      {/* Live Indicator */}
+      <div className="mb-6">
+        <LiveIndicator
+          lastUpdated={lastUpdated}
+          isPolling={isPolling}
+          intervalMs={POLL_INTERVAL}
+        />
       </div>
 
       {error && (
@@ -105,6 +151,7 @@ export default function SubscriptionsPage() {
       ) : (
         <SubscriptionTable
           subscriptions={subscriptions}
+          connectedIds={connectedIds}
           onDelete={handleDelete}
           deleting={deleting}
         />

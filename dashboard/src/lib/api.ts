@@ -15,6 +15,38 @@ export interface Subscription {
   created_at: string;
 }
 
+export interface SubscriptionStatus {
+  subscription_id: string;
+  db_status: string;
+  connected: boolean;
+  cached_at: string | null;
+  checked_at: string;
+}
+
+export interface BulkStatusResponse {
+  statuses: {
+    subscription_id: string;
+    db_status: string;
+    connected: boolean;
+  }[];
+  checked_at: string;
+}
+
+export interface HealthResponse {
+  status: "ok" | "degraded";
+  timestamp: string;
+  services: {
+    postgres: "connected" | "disconnected";
+    redis: "connected" | "disconnected";
+  };
+}
+
+export async function fetchHealth(): Promise<HealthResponse> {
+  const res = await fetch(`${API_BASE}/health`, { cache: "no-store" });
+  if (!res.ok) throw new Error("Health check failed");
+  return res.json();
+}
+
 export async function fetchSubscriptions(): Promise<Subscription[]> {
   const res = await fetch(`${API_BASE}/subscriptions`, { cache: "no-store" });
   if (!res.ok) throw new Error("Failed to fetch subscriptions");
@@ -26,6 +58,24 @@ export async function fetchSubscription(id: string): Promise<Subscription> {
     cache: "no-store",
   });
   if (!res.ok) throw new Error("Subscription not found");
+  return res.json();
+}
+
+export async function fetchSubscriptionStatus(
+  id: string
+): Promise<SubscriptionStatus> {
+  const res = await fetch(`${API_BASE}/subscriptions/${id}/status`, {
+    cache: "no-store",
+  });
+  if (!res.ok) throw new Error("Failed to fetch status");
+  return res.json();
+}
+
+export async function fetchAllStatuses(): Promise<BulkStatusResponse> {
+  const res = await fetch(`${API_BASE}/subscriptions/status/all`, {
+    cache: "no-store",
+  });
+  if (!res.ok) throw new Error("Failed to fetch statuses");
   return res.json();
 }
 

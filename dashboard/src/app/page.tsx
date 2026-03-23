@@ -1,27 +1,58 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useCallback } from "react";
 import Link from "next/link";
-import { Radio, Webhook, Activity, AlertCircle, Plus } from "lucide-react";
+import {
+  Radio,
+  Webhook,
+  Activity,
+  AlertCircle,
+  Plus,
+  Zap,
+  ZapOff,
+} from "lucide-react";
 import { StatCard } from "@/components/stat-card";
 import { SubscriptionTable } from "@/components/subscription-table";
 import { DeleteDialog } from "@/components/delete-dialog";
 import { EmptyState } from "@/components/empty-state";
-import { fetchSubscriptions, deleteSubscription } from "@/lib/api";
+import { LiveIndicator } from "@/components/live-indicator";
+import { ServiceHealth } from "@/components/service-health";
+import {
+  fetchSubscriptions,
+  fetchAllStatuses,
+  deleteSubscription,
+} from "@/lib/api";
 import type { Subscription } from "@/lib/api";
+
+const POLL_INTERVAL = 10000;
 
 export default function DashboardPage() {
   const [subscriptions, setSubscriptions] = useState<Subscription[]>([]);
+  const [connectedIds, setConnectedIds] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [deleting, setDeleting] = useState<string | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
+  const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
 
-  async function loadSubscriptions() {
+  const loadData = useCallback(async () => {
     try {
       setError(null);
-      const data = await fetchSubscriptions();
-      setSubscriptions(data);
+      const [subs, statuses] = await Promise.all([
+        fetchSubscriptions(),
+        fetchAllStatuses().catch(() => null),
+      ]);
+      setSubscriptions(subs);
+      if (statuses) {
+        setConnectedIds(
+          new Set(
+            statuses.statuses
+              .filter((s) => s.connected)
+              .map((s) => s.subscription_id)
+          )
+        );
+      }
+      setLastUpdated(new Date());
     } catch {
       setError(
         "Unable to connect to the API. Make sure the backend is running on port 3001."
@@ -29,13 +60,13 @@ export default function DashboardPage() {
     } finally {
       setLoading(false);
     }
-  }
+  }, []);
 
   useEffect(() => {
-    loadSubscriptions();
-    const interval = setInterval(loadSubscriptions, 15000);
+    loadData();
+    const interval = setInterval(loadData, POLL_INTERVAL);
     return () => clearInterval(interval);
-  }, []);
+  }, [loadData]);
 
   async function handleDelete(id: string) {
     setDeleteTarget(id);
@@ -49,6 +80,11 @@ export default function DashboardPage() {
       setSubscriptions((prev) =>
         prev.filter((s) => s.subscription_id !== deleteTarget)
       );
+      setConnectedIds((prev) => {
+        const next = new Set(prev);
+        next.delete(deleteTarget);
+        return next;
+      });
     } catch {
       setError("Failed to delete subscription.");
     } finally {
@@ -60,6 +96,7 @@ export default function DashboardPage() {
   const totalActive = subscriptions.filter(
     (s) => s.status === "active"
   ).length;
+  const connectedCount = connectedIds.size;
   const graphqlCount = subscriptions.filter(
     (s) => s.connection_type === "graphql"
   ).length;
@@ -70,20 +107,32 @@ export default function DashboardPage() {
   return (
     <div className="p-6 lg:p-8 max-w-7xl mx-auto">
       {/* Header */}
-      <div className="flex items-center justify-between mb-8">
+      <div className="flex items-center justify-between mb-6">
         <div>
           <h1 className="text-2xl font-bold tracking-tight">Dashboard</h1>
           <p className="text-sm text-neutral-500 mt-1">
             Overview of your subscription proxy
           </p>
         </div>
-        <Link
-          href="/subscriptions/new"
-          className="inline-flex items-center gap-2 rounded-lg bg-indigo-600 text-white px-4 py-2.5 text-sm font-medium hover:bg-indigo-700 transition-colors shadow-sm"
-        >
-          <Plus className="h-4 w-4" />
-          New Subscription
-        </Link>
+        <div className="flex items-center gap-3">
+          <ServiceHealth />
+          <Link
+            href="/subscriptions/new"
+            className="inline-flex items-center gap-2 rounded-lg bg-indigo-600 text-white px-4 py-2.5 text-sm font-medium hover:bg-indigo-700 transition-colors shadow-sm"
+          >
+            <Plus className="h-4 w-4" />
+            New Subscription
+          </Link>
+        </div>
+      </div>
+
+      {/* Live Indicator */}
+      <div className="mb-6">
+        <LiveIndicator
+          lastUpdated={lastUpdated}
+          isPolling={true}
+          intervalMs={POLL_INTERVAL}
+        />
       </div>
 
       {/* Error Banner */}
@@ -92,7 +141,7 @@ export default function DashboardPage() {
           <AlertCircle className="h-4 w-4 flex-shrink-0" />
           {error}
           <button
-            onClick={loadSubscriptions}
+            onClick={loadData}
             className="ml-auto text-red-600 hover:text-red-800 dark:text-red-400 dark:hover:text-red-300 underline text-xs"
           >
             Retry
@@ -109,10 +158,10 @@ export default function DashboardPage() {
           description="All registered subscriptions"
         />
         <StatCard
-          title="Active"
-          value={loading ? "—" : totalActive}
-          icon={Activity}
-          description="Currently connected"
+          title="Connected"
+          value={loading ? "—" : connectedCount}
+          icon={Zap}
+          description={`${totalActive} active, ${connectedCount} connected`}
         />
         <StatCard
           title="GraphQL Sources"
@@ -141,6 +190,7 @@ export default function DashboardPage() {
       ) : (
         <SubscriptionTable
           subscriptions={subscriptions}
+          connectedIds={connectedIds}
           onDelete={handleDelete}
           deleting={deleting}
         />

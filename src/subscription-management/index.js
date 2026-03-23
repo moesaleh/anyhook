@@ -9,6 +9,18 @@ const { v4: uuidv4 } = require('uuid');
 const app = express();
 app.use(express.json());
 
+// Enable CORS for the dashboard frontend
+app.use((req, res, next) => {
+    const allowedOrigin = process.env.DASHBOARD_URL || 'http://localhost:3000';
+    res.header('Access-Control-Allow-Origin', allowedOrigin);
+    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    if (req.method === 'OPTIONS') {
+        return res.sendStatus(204);
+    }
+    next();
+});
+
 // Get port from environment variable or use default
 const PORT = process.env.PORT || 3001;
 

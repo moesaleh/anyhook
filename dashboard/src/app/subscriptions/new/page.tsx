@@ -3,14 +3,43 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
-import { ArrowLeft, AlertCircle, CheckCircle2 } from "lucide-react";
+import {
+  ArrowLeft,
+  ArrowRight,
+  AlertCircle,
+  CheckCircle2,
+  Loader2,
+} from "lucide-react";
 import { createSubscription } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import {
+  WizardStepper,
+  type WizardStep,
+} from "@/components/wizard/wizard-stepper";
+import { StepConnectionType } from "@/components/wizard/step-connection-type";
+import { StepSourceConfig } from "@/components/wizard/step-source-config";
+import { StepWebhook } from "@/components/wizard/step-webhook";
+import { StepReview } from "@/components/wizard/step-review";
 
 type ConnectionType = "graphql" | "websocket";
 
-export default function NewSubscriptionPage() {
+interface HeaderEntry {
+  key: string;
+  value: string;
+}
+
+const WIZARD_STEPS: WizardStep[] = [
+  { id: 1, label: "Connection", description: "Choose source type" },
+  { id: 2, label: "Source", description: "Configure endpoint" },
+  { id: 3, label: "Webhook", description: "Set destination" },
+  { id: 4, label: "Review", description: "Confirm & create" },
+];
+
+export default function NewSubscriptionWizard() {
   const router = useRouter();
+  const [step, setStep] = useState(1);
+
+  // Form state
   const [connectionType, setConnectionType] =
     useState<ConnectionType>("graphql");
   const [endpointUrl, setEndpointUrl] = useState("");
@@ -18,69 +47,146 @@ export default function NewSubscriptionPage() {
   const [query, setQuery] = useState("");
   const [message, setMessage] = useState("");
   const [eventType, setEventType] = useState("");
-  const [headers, setHeaders] = useState("");
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [headers, setHeaders] = useState<HeaderEntry[]>([]);
+
+  // UI state
+  const [errors, setErrors] = useState<Record<string, string>>({});
+  const [submitError, setSubmitError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
 
-  async function handleSubmit(e: React.FormEvent) {
-    e.preventDefault();
-    setError(null);
-    setSuccess(null);
+  function validateStep(s: number): boolean {
+    const errs: Record<string, string> = {};
 
-    if (!endpointUrl.trim()) {
-      setError("Source endpoint URL is required.");
-      return;
-    }
-    if (!webhookUrl.trim()) {
-      setError("Webhook URL is required.");
-      return;
-    }
-    if (connectionType === "graphql" && !query.trim()) {
-      setError("GraphQL subscription query is required.");
-      return;
-    }
+    if (s === 2) {
+      if (!endpointUrl.trim()) {
+        errs.endpointUrl = "Source endpoint URL is required.";
+      } else {
+        try {
+          const url = new URL(endpointUrl);
+          if (!["ws:", "wss:", "http:", "https:"].includes(url.protocol)) {
+            errs.endpointUrl =
+              "URL must use ws://, wss://, http://, or https:// protocol.";
+          }
+        } catch {
+          errs.endpointUrl = "Please enter a valid URL.";
+        }
+      }
 
-    let parsedHeaders: Record<string, string> = {};
-    if (headers.trim()) {
-      try {
-        parsedHeaders = JSON.parse(headers);
-      } catch {
-        setError("Headers must be valid JSON (e.g., {\"Authorization\": \"Bearer token\"}).");
-        return;
+      if (connectionType === "graphql" && !query.trim()) {
+        errs.query = "A GraphQL subscription query is required.";
       }
     }
 
+    if (s === 3) {
+      if (!webhookUrl.trim()) {
+        errs.webhookUrl = "Webhook URL is required.";
+      } else {
+        try {
+          const url = new URL(webhookUrl);
+          if (!["http:", "https:"].includes(url.protocol)) {
+            errs.webhookUrl = "Webhook URL must use http:// or https://.";
+          }
+        } catch {
+          errs.webhookUrl = "Please enter a valid URL.";
+        }
+      }
+    }
+
+    setErrors(errs);
+    return Object.keys(errs).length === 0;
+  }
+
+  function goNext() {
+    if (!validateStep(step)) return;
+    setStep((s) => Math.min(s + 1, 4));
+  }
+
+  function goBack() {
+    setErrors({});
+    setStep((s) => Math.max(s - 1, 1));
+  }
+
+  async function handleCreate() {
+    setSubmitError(null);
+    setLoading(true);
+
+    const headersObj: Record<string, string> = {};
+    headers.forEach((h) => {
+      if (h.key.trim()) headersObj[h.key.trim()] = h.value;
+    });
+
     const args: Record<string, unknown> = {
       endpoint_url: endpointUrl,
-      headers: parsedHeaders,
     };
+
+    if (Object.keys(headersObj).length > 0) {
+      args.headers = headersObj;
+    }
 
     if (connectionType === "graphql") {
       args.query = query;
     } else {
-      args.message = message || undefined;
-      args.event_type = eventType || undefined;
+      if (message) args.message = message;
+      if (eventType) args.event_type = eventType;
     }
 
-    setLoading(true);
     try {
       const result = await createSubscription({
         connection_type: connectionType,
         args,
         webhook_url: webhookUrl,
       });
-      setSuccess(`Subscription created: ${result.subscriptionId}`);
-      setTimeout(() => router.push("/"), 1500);
+      setSuccess(result.subscriptionId);
     } catch {
-      setError("Failed to create subscription. Check that the API is running.");
+      setSubmitError(
+        "Failed to create subscription. Make sure the API is running."
+      );
     } finally {
       setLoading(false);
     }
   }
 
+  // Success state — full-page confirmation
+  if (success) {
+    return (
+      <div className="p-6 lg:p-8 max-w-2xl mx-auto">
+        <div className="mt-12 flex flex-col items-center text-center">
+          <div className="w-16 h-16 rounded-full bg-emerald-50 dark:bg-emerald-950 flex items-center justify-center mb-5">
+            <CheckCircle2 className="h-8 w-8 text-emerald-600 dark:text-emerald-400" />
+          </div>
+          <h1 className="text-2xl font-bold tracking-tight mb-2">
+            Subscription Created
+          </h1>
+          <p className="text-sm text-neutral-500 mb-2 max-w-md">
+            Your subscription is now active. AnyHook will connect to your source
+            and start delivering data to your webhook endpoint.
+          </p>
+          <code className="text-xs bg-neutral-100 dark:bg-neutral-900 px-3 py-1.5 rounded-lg font-mono text-neutral-600 dark:text-neutral-400 mb-8">
+            {success}
+          </code>
+          <div className="flex gap-3">
+            <Link
+              href={`/subscriptions/${success}`}
+              className="rounded-lg bg-indigo-600 text-white px-5 py-2.5 text-sm font-medium hover:bg-indigo-700 transition-colors shadow-sm"
+            >
+              View Subscription
+            </Link>
+            <Link
+              href="/"
+              className="rounded-lg border border-neutral-200 dark:border-neutral-800 px-5 py-2.5 text-sm font-medium hover:bg-neutral-50 dark:hover:bg-neutral-900 transition-colors"
+            >
+              Back to Dashboard
+            </Link>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
-    <div className="p-6 lg:p-8 max-w-2xl mx-auto">
+    <div className="p-6 lg:p-8 max-w-3xl mx-auto">
+      {/* Back link */}
       <Link
         href="/"
         className="inline-flex items-center gap-2 text-sm text-neutral-500 hover:text-neutral-700 dark:hover:text-neutral-300 mb-6"
@@ -91,197 +197,123 @@ export default function NewSubscriptionPage() {
       <h1 className="text-2xl font-bold tracking-tight mb-1">
         New Subscription
       </h1>
-      <p className="text-sm text-neutral-500 mb-8">
-        Connect a real-time data source to a webhook endpoint.
+      <p className="text-sm text-neutral-500 mb-6">
+        Connect a real-time data source to a webhook endpoint in 4 easy steps.
       </p>
 
-      {error && (
+      {/* Stepper */}
+      <WizardStepper steps={WIZARD_STEPS} currentStep={step} />
+
+      {/* Error banner */}
+      {submitError && (
         <div className="mb-6 flex items-center gap-3 rounded-lg border border-red-200 dark:border-red-900 bg-red-50 dark:bg-red-950 px-4 py-3 text-sm text-red-700 dark:text-red-400">
           <AlertCircle className="h-4 w-4 flex-shrink-0" />
-          {error}
+          {submitError}
         </div>
       )}
 
-      {success && (
-        <div className="mb-6 flex items-center gap-3 rounded-lg border border-emerald-200 dark:border-emerald-900 bg-emerald-50 dark:bg-emerald-950 px-4 py-3 text-sm text-emerald-700 dark:text-emerald-400">
-          <CheckCircle2 className="h-4 w-4 flex-shrink-0" />
-          {success}
-        </div>
-      )}
-
-      <form onSubmit={handleSubmit} className="space-y-6">
-        {/* Connection Type */}
-        <div>
-          <label className="block text-sm font-medium mb-2">
-            Connection Type
-          </label>
-          <div className="flex gap-3">
-            {(["graphql", "websocket"] as const).map((type) => (
-              <button
-                key={type}
-                type="button"
-                onClick={() => setConnectionType(type)}
-                className={cn(
-                  "flex-1 rounded-lg border-2 px-4 py-3 text-sm font-medium transition-colors text-center",
-                  connectionType === type
-                    ? "border-indigo-600 bg-indigo-50 text-indigo-700 dark:bg-indigo-950 dark:text-indigo-300 dark:border-indigo-500"
-                    : "border-neutral-200 dark:border-neutral-800 hover:border-neutral-300 dark:hover:border-neutral-700 text-neutral-600 dark:text-neutral-400"
-                )}
-              >
-                {type === "graphql" ? "GraphQL" : "WebSocket"}
-              </button>
-            ))}
-          </div>
-        </div>
-
-        {/* Source Endpoint */}
-        <div>
-          <label
-            htmlFor="endpoint_url"
-            className="block text-sm font-medium mb-1.5"
-          >
-            Source Endpoint URL <span className="text-red-500">*</span>
-          </label>
-          <input
-            id="endpoint_url"
-            type="url"
-            value={endpointUrl}
-            onChange={(e) => setEndpointUrl(e.target.value)}
-            placeholder={
-              connectionType === "graphql"
-                ? "wss://api.example.com/graphql"
-                : "wss://stream.example.com/ws"
-            }
-            className="w-full rounded-lg border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-950 px-4 py-2.5 text-sm placeholder:text-neutral-400 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+      {/* Step Content */}
+      <div className="rounded-xl border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-950 p-6 shadow-sm">
+        {step === 1 && (
+          <StepConnectionType
+            value={connectionType}
+            onChange={setConnectionType}
           />
-          <p className="mt-1 text-xs text-neutral-500">
-            The URL of the{" "}
-            {connectionType === "graphql"
-              ? "GraphQL endpoint to subscribe to"
-              : "WebSocket server to connect to"}
-          </p>
-        </div>
-
-        {/* GraphQL Query */}
-        {connectionType === "graphql" && (
-          <div>
-            <label htmlFor="query" className="block text-sm font-medium mb-1.5">
-              Subscription Query <span className="text-red-500">*</span>
-            </label>
-            <textarea
-              id="query"
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              rows={5}
-              placeholder={`subscription {\n  onNewMessage {\n    id\n    content\n  }\n}`}
-              className="w-full rounded-lg border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-950 px-4 py-2.5 text-sm font-mono placeholder:text-neutral-400 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
-            />
-          </div>
         )}
 
-        {/* WebSocket fields */}
-        {connectionType === "websocket" && (
-          <>
-            <div>
-              <label
-                htmlFor="message"
-                className="block text-sm font-medium mb-1.5"
-              >
-                Initial Message (optional)
-              </label>
-              <textarea
-                id="message"
-                value={message}
-                onChange={(e) => setMessage(e.target.value)}
-                rows={3}
-                placeholder='{"action": "subscribe", "channel": "updates"}'
-                className="w-full rounded-lg border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-950 px-4 py-2.5 text-sm font-mono placeholder:text-neutral-400 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
-              />
-              <p className="mt-1 text-xs text-neutral-500">
-                Message to send upon connection (JSON or text)
-              </p>
-            </div>
-            <div>
-              <label
-                htmlFor="event_type"
-                className="block text-sm font-medium mb-1.5"
-              >
-                Event Type Filter (optional)
-              </label>
-              <input
-                id="event_type"
-                type="text"
-                value={eventType}
-                onChange={(e) => setEventType(e.target.value)}
-                placeholder="message"
-                className="w-full rounded-lg border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-950 px-4 py-2.5 text-sm placeholder:text-neutral-400 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
-              />
-              <p className="mt-1 text-xs text-neutral-500">
-                Only forward messages matching this event type
-              </p>
-            </div>
-          </>
+        {step === 2 && (
+          <StepSourceConfig
+            connectionType={connectionType}
+            endpointUrl={endpointUrl}
+            onEndpointUrlChange={setEndpointUrl}
+            query={query}
+            onQueryChange={setQuery}
+            message={message}
+            onMessageChange={setMessage}
+            eventType={eventType}
+            onEventTypeChange={setEventType}
+            headers={headers}
+            onHeadersChange={setHeaders}
+            errors={errors}
+          />
         )}
 
-        {/* Webhook URL */}
-        <div>
-          <label
-            htmlFor="webhook_url"
-            className="block text-sm font-medium mb-1.5"
-          >
-            Webhook URL <span className="text-red-500">*</span>
-          </label>
-          <input
-            id="webhook_url"
-            type="url"
-            value={webhookUrl}
-            onChange={(e) => setWebhookUrl(e.target.value)}
-            placeholder="https://your-app.com/webhooks/anyhook"
-            className="w-full rounded-lg border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-950 px-4 py-2.5 text-sm placeholder:text-neutral-400 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
+        {step === 3 && (
+          <StepWebhook
+            webhookUrl={webhookUrl}
+            onWebhookUrlChange={setWebhookUrl}
+            errors={errors}
           />
-          <p className="mt-1 text-xs text-neutral-500">
-            Where received data will be forwarded via POST requests
-          </p>
+        )}
+
+        {step === 4 && (
+          <StepReview
+            connectionType={connectionType}
+            endpointUrl={endpointUrl}
+            webhookUrl={webhookUrl}
+            query={query}
+            message={message}
+            eventType={eventType}
+            headers={headers}
+          />
+        )}
+      </div>
+
+      {/* Navigation Buttons */}
+      <div className="flex items-center justify-between mt-6">
+        <div>
+          {step > 1 && (
+            <button
+              type="button"
+              onClick={goBack}
+              disabled={loading}
+              className="inline-flex items-center gap-2 rounded-lg border border-neutral-200 dark:border-neutral-800 px-4 py-2.5 text-sm font-medium hover:bg-neutral-50 dark:hover:bg-neutral-900 transition-colors disabled:opacity-50"
+            >
+              <ArrowLeft className="h-4 w-4" />
+              Back
+            </button>
+          )}
         </div>
 
-        {/* Headers */}
-        <div>
-          <label
-            htmlFor="headers"
-            className="block text-sm font-medium mb-1.5"
-          >
-            Headers (optional)
-          </label>
-          <textarea
-            id="headers"
-            value={headers}
-            onChange={(e) => setHeaders(e.target.value)}
-            rows={3}
-            placeholder='{"Authorization": "Bearer your-token"}'
-            className="w-full rounded-lg border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-950 px-4 py-2.5 text-sm font-mono placeholder:text-neutral-400 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent"
-          />
-          <p className="mt-1 text-xs text-neutral-500">
-            Custom headers sent with the source connection (JSON format)
-          </p>
-        </div>
-
-        {/* Submit */}
-        <div className="flex items-center gap-3 pt-2">
-          <button
-            type="submit"
-            disabled={loading}
-            className="rounded-lg bg-indigo-600 text-white px-6 py-2.5 text-sm font-medium hover:bg-indigo-700 disabled:opacity-60 transition-colors shadow-sm"
-          >
-            {loading ? "Creating..." : "Create Subscription"}
-          </button>
+        <div className="flex items-center gap-3">
           <Link
             href="/"
-            className="rounded-lg border border-neutral-200 dark:border-neutral-800 px-4 py-2.5 text-sm font-medium hover:bg-neutral-50 dark:hover:bg-neutral-900 transition-colors"
+            className={cn(
+              "rounded-lg px-4 py-2.5 text-sm font-medium text-neutral-500 hover:text-neutral-700 dark:hover:text-neutral-300 transition-colors",
+              loading && "pointer-events-none opacity-50"
+            )}
           >
             Cancel
           </Link>
+
+          {step < 4 ? (
+            <button
+              type="button"
+              onClick={goNext}
+              className="inline-flex items-center gap-2 rounded-lg bg-indigo-600 text-white px-5 py-2.5 text-sm font-medium hover:bg-indigo-700 transition-colors shadow-sm"
+            >
+              Continue
+              <ArrowRight className="h-4 w-4" />
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={handleCreate}
+              disabled={loading}
+              className="inline-flex items-center gap-2 rounded-lg bg-indigo-600 text-white px-5 py-2.5 text-sm font-medium hover:bg-indigo-700 transition-colors shadow-sm disabled:opacity-60"
+            >
+              {loading ? (
+                <>
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  Creating...
+                </>
+              ) : (
+                "Create Subscription"
+              )}
+            </button>
+          )}
         </div>
-      </form>
+      </div>
     </div>
   );
 }

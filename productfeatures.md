@@ -86,27 +86,37 @@
 ---
 
 ## 6. Dashboard Analytics & Metrics
-**Status: TODO**
+**Status: DONE**
 
-- [ ] Event delivery counter per subscription (success / failure / retried)
-- [ ] Delivery success rate percentage display
+- [x] Event delivery counter per subscription (success / failure / retried)
+- [x] Delivery success rate percentage display
 - [ ] Mini sparkline charts on stat cards showing trends over time
-- [ ] Latency metrics (average webhook response time)
-- [ ] Time-series chart: events delivered over last 24h / 7d / 30d
-- [ ] Backend: event logging and aggregation endpoints
+- [x] Latency metrics (average webhook response time)
+- [x] Time-range metrics: deliveries in last 24h / 7d displayed on dashboard and detail view
+- [x] Backend: `GET /deliveries/stats` global aggregation endpoint
+- [x] Backend: `GET /subscriptions/:id/deliveries/stats` per-subscription aggregation endpoint
+- [x] Dashboard: 2nd stat card row with Total Deliveries, Success Rate, Avg Latency, Last 7d
+- [x] Detail view: DeliveryStatsCard on Overview tab (success rate, counts, latency, time ranges)
 
 ---
 
 ## 7. Webhook Delivery Logs
-**Status: TODO**
+**Status: DONE**
 
-- [ ] Activity tab: real delivery history table (replaces placeholder)
-- [ ] Per-delivery row: timestamp, HTTP status code, response time, payload size
-- [ ] Retry tracking: which deliveries were retried and how many times
-- [ ] Dead letter queue (DLQ) viewer: failed deliveries after max retries
-- [ ] Payload inspector: expandable JSON viewer for request/response body
-- [ ] Filter by status (success / failed / retrying)
-- [ ] Backend: persist delivery events to Postgres (currently ephemeral)
+- [x] Activity tab: real delivery history table (replaces placeholder)
+- [x] Per-delivery row: timestamp, HTTP status code, response time, payload size
+- [x] Retry tracking: which deliveries were retried and how many times (retry count column)
+- [x] Dead letter queue (DLQ) status: deliveries with `dlq` status shown with purple badge
+- [x] Payload inspector: expandable JSON viewer for request/response body (click row to expand)
+- [x] Filter by status (success / failed / retrying / dlq)
+- [x] Pagination (15 per page)
+- [x] Auto-refresh synced with detail page polling toggle
+- [x] Backend: `delivery_events` Postgres table with indexed columns
+- [x] Backend: `GET /subscriptions/:id/deliveries` paginated + filterable endpoint
+- [x] Backend: webhook-dispatcher instrumented to record every delivery attempt
+- [x] Backend: event_id groups original delivery + all retries
+- [x] Backend: request/response payloads truncated to 10KB to prevent DB bloat
+- [x] Backend: best-effort logging (Postgres failure doesn't block webhook delivery)
 
 ---
 
@@ -208,8 +218,8 @@
 | 3  | Subscription Detail View       | DONE     |
 | 4  | Real-time Status Indicators    | DONE     |
 | 5  | Edit/Update Subscription       | TODO     |
-| 6  | Dashboard Analytics & Metrics  | TODO     |
-| 7  | Webhook Delivery Logs          | TODO     |
+| 6  | Dashboard Analytics & Metrics  | DONE     |
+| 7  | Webhook Delivery Logs          | DONE     |
 | 8  | Notifications & Alerts         | TODO     |
 | 9  | Dark Mode & Theming            | PARTIAL  |
 | 10 | Error Handling & Resilience    | PARTIAL  |
@@ -219,4 +229,4 @@
 | 14 | Performance Optimizations      | TODO     |
 | 15 | Authentication & Authorization | TODO     |
 
-**Completed: 4/15 | Partial: 2/15 | Remaining: 9/15**
+**Completed: 6/15 | Partial: 2/15 | Remaining: 7/15**

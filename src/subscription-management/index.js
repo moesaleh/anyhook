@@ -141,6 +141,129 @@ app.get('/subscriptions/status/all', async (req, res) => {
     }
 });
 
+// Delivery Events: Get delivery history for a subscription (paginated, filterable)
+app.get('/subscriptions/:id/deliveries', async (req, res) => {
+    const { id } = req.params;
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 20));
+    const status = req.query.status || 'all';
+    const offset = (page - 1) * limit;
+
+    try {
+        let whereClause = 'WHERE subscription_id = $1';
+        const params = [id];
+
+        if (status !== 'all') {
+            whereClause += ' AND status = $2';
+            params.push(status);
+        }
+
+        // Get total count for pagination
+        const countResult = await pool.query(
+            `SELECT COUNT(*) FROM delivery_events ${whereClause}`,
+            params
+        );
+        const total = parseInt(countResult.rows[0].count);
+
+        // Get paginated results
+        const dataParams = [...params, limit, offset];
+        const dataResult = await pool.query(
+            `SELECT * FROM delivery_events ${whereClause}
+             ORDER BY created_at DESC
+             LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+            dataParams
+        );
+
+        res.status(200).json({
+            deliveries: dataResult.rows,
+            total,
+            page,
+            pages: Math.ceil(total / limit),
+        });
+    } catch (err) {
+        console.error('Error fetching deliveries:', err);
+        res.status(500).json({ error: 'Failed to fetch delivery history' });
+    }
+});
+
+// Delivery Events: Get aggregated stats for a subscription
+app.get('/subscriptions/:id/deliveries/stats', async (req, res) => {
+    const { id } = req.params;
+
+    try {
+        const result = await pool.query(
+            `SELECT
+                COUNT(*)::int AS total_deliveries,
+                COUNT(*) FILTER (WHERE status = 'success')::int AS successful,
+                COUNT(*) FILTER (WHERE status = 'failed')::int AS failed,
+                COUNT(*) FILTER (WHERE status = 'retrying')::int AS retrying,
+                COUNT(*) FILTER (WHERE status = 'dlq')::int AS dlq,
+                ROUND(
+                    COUNT(*) FILTER (WHERE status = 'success')::numeric
+                    / NULLIF(COUNT(*), 0) * 100, 1
+                ) AS success_rate,
+                ROUND(AVG(response_time_ms) FILTER (WHERE response_time_ms IS NOT NULL))::int AS avg_response_time_ms,
+                MAX(created_at) AS last_delivery_at,
+                COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '24 hours')::int AS deliveries_24h,
+                COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '7 days')::int AS deliveries_7d
+             FROM delivery_events
+             WHERE subscription_id = $1`,
+            [id]
+        );
+
+        const stats = result.rows[0];
+        res.status(200).json({
+            total_deliveries: stats.total_deliveries,
+            successful: stats.successful,
+            failed: stats.failed,
+            retrying: stats.retrying,
+            dlq: stats.dlq,
+            success_rate: parseFloat(stats.success_rate) || 0,
+            avg_response_time_ms: stats.avg_response_time_ms,
+            last_delivery_at: stats.last_delivery_at,
+            deliveries_24h: stats.deliveries_24h,
+            deliveries_7d: stats.deliveries_7d,
+        });
+    } catch (err) {
+        console.error('Error fetching delivery stats:', err);
+        res.status(500).json({ error: 'Failed to fetch delivery stats' });
+    }
+});
+
+// Delivery Events: Get global delivery stats (for dashboard)
+app.get('/deliveries/stats', async (req, res) => {
+    try {
+        const result = await pool.query(
+            `SELECT
+                COUNT(*)::int AS total_deliveries,
+                COUNT(*) FILTER (WHERE status = 'success')::int AS successful,
+                COUNT(*) FILTER (WHERE status = 'failed' OR status = 'dlq')::int AS failed,
+                ROUND(
+                    COUNT(*) FILTER (WHERE status = 'success')::numeric
+                    / NULLIF(COUNT(*), 0) * 100, 1
+                ) AS success_rate,
+                ROUND(AVG(response_time_ms) FILTER (WHERE response_time_ms IS NOT NULL))::int AS avg_response_time_ms,
+                COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '24 hours')::int AS deliveries_24h,
+                COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '7 days')::int AS deliveries_7d
+             FROM delivery_events`
+        );
+
+        const stats = result.rows[0];
+        res.status(200).json({
+            total_deliveries: stats.total_deliveries,
+            successful: stats.successful,
+            failed: stats.failed,
+            success_rate: parseFloat(stats.success_rate) || 0,
+            avg_response_time_ms: stats.avg_response_time_ms,
+            deliveries_24h: stats.deliveries_24h,
+            deliveries_7d: stats.deliveries_7d,
+        });
+    } catch (err) {
+        console.error('Error fetching global delivery stats:', err);
+        res.status(500).json({ error: 'Failed to fetch delivery stats' });
+    }
+});
+
 // PostgreSQL: Get all subscriptions
 app.get('/subscriptions', async (req, res) => {
     try {

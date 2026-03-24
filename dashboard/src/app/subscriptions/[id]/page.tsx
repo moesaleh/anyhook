@@ -22,15 +22,18 @@ import {
 import {
   fetchSubscription,
   fetchSubscriptionStatus,
+  fetchDeliveryStats,
   deleteSubscription,
 } from "@/lib/api";
 import { StatusBadge } from "@/components/status-badge";
 import { ConnectionTypeBadge } from "@/components/connection-type-badge";
 import { ConnectionFlow } from "@/components/connection-flow";
 import { LiveIndicator } from "@/components/live-indicator";
+import { DeliveryStatsCard } from "@/components/delivery-stats";
+import { DeliveryTable } from "@/components/delivery-table";
 import { DeleteDialog } from "@/components/delete-dialog";
 import { cn, formatDate } from "@/lib/utils";
-import type { Subscription, SubscriptionStatus } from "@/lib/api";
+import type { Subscription, SubscriptionStatus, DeliveryStats } from "@/lib/api";
 
 type Tab = "overview" | "configuration" | "activity";
 
@@ -43,6 +46,9 @@ export default function SubscriptionDetailPage() {
 
   const [subscription, setSubscription] = useState<Subscription | null>(null);
   const [status, setStatus] = useState<SubscriptionStatus | null>(null);
+  const [deliveryStats, setDeliveryStats] = useState<DeliveryStats | null>(
+    null
+  );
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState<string | null>(null);
@@ -54,12 +60,14 @@ export default function SubscriptionDetailPage() {
 
   const loadData = useCallback(async () => {
     try {
-      const [subData, statusData] = await Promise.all([
+      const [subData, statusData, dStats] = await Promise.all([
         fetchSubscription(id),
         fetchSubscriptionStatus(id).catch(() => null),
+        fetchDeliveryStats(id).catch(() => null),
       ]);
       setSubscription(subData);
       setStatus(statusData);
+      setDeliveryStats(dStats);
       setLastUpdated(new Date());
       setError(null);
     } catch {
@@ -263,6 +271,7 @@ export default function SubscriptionDetailPage() {
           connected={connected}
           uptime={uptime}
           status={status}
+          deliveryStats={deliveryStats}
           onCopy={handleCopy}
           copied={copied}
         />
@@ -275,7 +284,12 @@ export default function SubscriptionDetailPage() {
         />
       )}
       {activeTab === "activity" && (
-        <ActivityTab connected={connected} status={status} />
+        <ActivityTab
+          subscriptionId={id}
+          connected={connected}
+          status={status}
+          isPolling={isPolling}
+        />
       )}
 
       {/* Delete Dialog */}
@@ -297,6 +311,7 @@ function OverviewTab({
   connected,
   uptime,
   status,
+  deliveryStats,
   onCopy,
   copied,
 }: {
@@ -304,6 +319,7 @@ function OverviewTab({
   connected: boolean;
   uptime: string;
   status: SubscriptionStatus | null;
+  deliveryStats: DeliveryStats | null;
   onCopy: (text: string, key: string) => void;
   copied: string | null;
 }) {
@@ -311,127 +327,135 @@ function OverviewTab({
     subscription.connection_type === "graphql" ? Radio : Wifi;
 
   return (
-    <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
-      {/* Status card */}
-      <div className="rounded-xl border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-950 p-5 shadow-sm">
-        <h3 className="text-xs font-medium text-neutral-400 uppercase tracking-wider mb-4">
-          Connection Status
-        </h3>
-        <div className="space-y-4">
-          <div className="flex items-center justify-between">
-            <span className="text-sm text-neutral-500">State</span>
-            <StatusBadge
-              status={subscription.status}
-              connected={connected}
-            />
-          </div>
-          <div className="flex items-center justify-between">
-            <span className="text-sm text-neutral-500">Redis Cache</span>
-            <span
-              className={cn(
-                "text-sm font-medium",
-                connected
-                  ? "text-emerald-600 dark:text-emerald-400"
-                  : "text-neutral-400"
-              )}
-            >
-              {connected ? "Cached" : "Not cached"}
-            </span>
-          </div>
-          <div className="flex items-center justify-between">
-            <span className="text-sm text-neutral-500">Uptime</span>
-            <span className="text-sm font-medium">{uptime}</span>
-          </div>
-          {status?.checked_at && (
+    <div className="space-y-5">
+      {/* Top row: 3 columns */}
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
+        {/* Status card */}
+        <div className="rounded-xl border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-950 p-5 shadow-sm">
+          <h3 className="text-xs font-medium text-neutral-400 uppercase tracking-wider mb-4">
+            Connection Status
+          </h3>
+          <div className="space-y-4">
             <div className="flex items-center justify-between">
-              <span className="text-sm text-neutral-500">Last Check</span>
-              <span className="text-xs text-neutral-400 font-mono">
-                {new Date(status.checked_at).toLocaleTimeString()}
+              <span className="text-sm text-neutral-500">State</span>
+              <StatusBadge
+                status={subscription.status}
+                connected={connected}
+              />
+            </div>
+            <div className="flex items-center justify-between">
+              <span className="text-sm text-neutral-500">Redis Cache</span>
+              <span
+                className={cn(
+                  "text-sm font-medium",
+                  connected
+                    ? "text-emerald-600 dark:text-emerald-400"
+                    : "text-neutral-400"
+                )}
+              >
+                {connected ? "Cached" : "Not cached"}
               </span>
             </div>
-          )}
-        </div>
-      </div>
-
-      {/* Source card */}
-      <div className="rounded-xl border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-950 p-5 shadow-sm">
-        <h3 className="text-xs font-medium text-neutral-400 uppercase tracking-wider mb-4">
-          Source
-        </h3>
-        <div className="space-y-4">
-          <div>
-            <span className="text-xs text-neutral-500">Type</span>
-            <div className="mt-1 flex items-center gap-2">
-              <SourceIcon className="h-4 w-4 text-neutral-400" />
-              <ConnectionTypeBadge type={subscription.connection_type} />
+            <div className="flex items-center justify-between">
+              <span className="text-sm text-neutral-500">Uptime</span>
+              <span className="text-sm font-medium">{uptime}</span>
             </div>
-          </div>
-          <div>
-            <span className="text-xs text-neutral-500">Endpoint</span>
-            <div className="mt-1 flex items-center gap-1.5">
-              <p className="text-sm font-mono break-all leading-relaxed">
-                {subscription.args.endpoint_url}
-              </p>
-              <button
-                onClick={() =>
-                  onCopy(subscription.args.endpoint_url, "endpoint")
-                }
-                className="text-neutral-400 hover:text-neutral-600 dark:hover:text-neutral-300 flex-shrink-0"
-              >
-                {copied === "endpoint" ? (
-                  <Check className="h-3 w-3 text-emerald-500" />
-                ) : (
-                  <Copy className="h-3 w-3" />
-                )}
-              </button>
-            </div>
-          </div>
-          {subscription.connection_type === "websocket" &&
-            subscription.args.event_type && (
-              <div>
-                <span className="text-xs text-neutral-500">Event Filter</span>
-                <p className="mt-1 text-sm font-mono">
-                  {subscription.args.event_type}
-                </p>
+            {status?.checked_at && (
+              <div className="flex items-center justify-between">
+                <span className="text-sm text-neutral-500">Last Check</span>
+                <span className="text-xs text-neutral-400 font-mono">
+                  {new Date(status.checked_at).toLocaleTimeString()}
+                </span>
               </div>
             )}
+          </div>
+        </div>
+
+        {/* Source card */}
+        <div className="rounded-xl border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-950 p-5 shadow-sm">
+          <h3 className="text-xs font-medium text-neutral-400 uppercase tracking-wider mb-4">
+            Source
+          </h3>
+          <div className="space-y-4">
+            <div>
+              <span className="text-xs text-neutral-500">Type</span>
+              <div className="mt-1 flex items-center gap-2">
+                <SourceIcon className="h-4 w-4 text-neutral-400" />
+                <ConnectionTypeBadge type={subscription.connection_type} />
+              </div>
+            </div>
+            <div>
+              <span className="text-xs text-neutral-500">Endpoint</span>
+              <div className="mt-1 flex items-center gap-1.5">
+                <p className="text-sm font-mono break-all leading-relaxed">
+                  {subscription.args.endpoint_url}
+                </p>
+                <button
+                  onClick={() =>
+                    onCopy(subscription.args.endpoint_url, "endpoint")
+                  }
+                  className="text-neutral-400 hover:text-neutral-600 dark:hover:text-neutral-300 flex-shrink-0"
+                >
+                  {copied === "endpoint" ? (
+                    <Check className="h-3 w-3 text-emerald-500" />
+                  ) : (
+                    <Copy className="h-3 w-3" />
+                  )}
+                </button>
+              </div>
+            </div>
+            {subscription.connection_type === "websocket" &&
+              subscription.args.event_type && (
+                <div>
+                  <span className="text-xs text-neutral-500">
+                    Event Filter
+                  </span>
+                  <p className="mt-1 text-sm font-mono">
+                    {subscription.args.event_type}
+                  </p>
+                </div>
+              )}
+          </div>
+        </div>
+
+        {/* Destination card */}
+        <div className="rounded-xl border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-950 p-5 shadow-sm">
+          <h3 className="text-xs font-medium text-neutral-400 uppercase tracking-wider mb-4">
+            Destination
+          </h3>
+          <div className="space-y-4">
+            <div>
+              <span className="text-xs text-neutral-500">Webhook URL</span>
+              <div className="mt-1 flex items-center gap-1.5">
+                <p className="text-sm font-mono break-all leading-relaxed">
+                  {subscription.webhook_url}
+                </p>
+                <a
+                  href={subscription.webhook_url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-neutral-400 hover:text-neutral-600 dark:hover:text-neutral-300 flex-shrink-0"
+                >
+                  <ExternalLink className="h-3 w-3" />
+                </a>
+              </div>
+            </div>
+            <div>
+              <span className="text-xs text-neutral-500">Method</span>
+              <p className="mt-1 text-sm font-medium">HTTP POST</p>
+            </div>
+            <div>
+              <span className="text-xs text-neutral-500">Retry Policy</span>
+              <p className="mt-1 text-sm">
+                6 retries &middot; up to 24h backoff
+              </p>
+            </div>
+          </div>
         </div>
       </div>
 
-      {/* Destination card */}
-      <div className="rounded-xl border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-950 p-5 shadow-sm">
-        <h3 className="text-xs font-medium text-neutral-400 uppercase tracking-wider mb-4">
-          Destination
-        </h3>
-        <div className="space-y-4">
-          <div>
-            <span className="text-xs text-neutral-500">Webhook URL</span>
-            <div className="mt-1 flex items-center gap-1.5">
-              <p className="text-sm font-mono break-all leading-relaxed">
-                {subscription.webhook_url}
-              </p>
-              <a
-                href={subscription.webhook_url}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="text-neutral-400 hover:text-neutral-600 dark:hover:text-neutral-300 flex-shrink-0"
-              >
-                <ExternalLink className="h-3 w-3" />
-              </a>
-            </div>
-          </div>
-          <div>
-            <span className="text-xs text-neutral-500">Method</span>
-            <p className="mt-1 text-sm font-medium">HTTP POST</p>
-          </div>
-          <div>
-            <span className="text-xs text-neutral-500">Retry Policy</span>
-            <p className="mt-1 text-sm">
-              6 retries &middot; up to 24h backoff
-            </p>
-          </div>
-        </div>
-      </div>
+      {/* Delivery Metrics (full-width below the 3 cards) */}
+      <DeliveryStatsCard stats={deliveryStats} />
     </div>
   );
 }
@@ -558,11 +582,15 @@ function ConfigurationTab({
 /* ── Activity Tab ────────────────────────────────────────────────── */
 
 function ActivityTab({
+  subscriptionId,
   connected,
   status,
+  isPolling,
 }: {
+  subscriptionId: string;
   connected: boolean;
   status: SubscriptionStatus | null;
+  isPolling: boolean;
 }) {
   return (
     <div className="space-y-6">
@@ -585,7 +613,11 @@ function ActivityTab({
                 ? "Source is connected and streaming data through AnyHook to the webhook destination."
                 : "The subscription is registered but no active connection is detected in the Redis cache."
             }
-            timestamp={status?.checked_at ? `Checked at ${new Date(status.checked_at).toLocaleTimeString()}` : undefined}
+            timestamp={
+              status?.checked_at
+                ? `Checked at ${new Date(status.checked_at).toLocaleTimeString()}`
+                : undefined
+            }
           />
 
           {/* Redis cache */}
@@ -604,21 +636,23 @@ function ActivityTab({
             dotColor="bg-neutral-400"
             title="Subscription created"
             description="Subscription was registered in PostgreSQL and an event was published to Kafka."
-            timestamp={status?.cached_at ? formatDate(status.cached_at) : undefined}
+            timestamp={
+              status?.cached_at ? formatDate(status.cached_at) : undefined
+            }
           />
         </div>
       </div>
 
-      {/* Delivery info placeholder */}
-      <div className="rounded-xl border border-dashed border-neutral-300 dark:border-neutral-700 bg-neutral-50 dark:bg-neutral-900/50 p-8 text-center">
-        <Activity className="h-8 w-8 text-neutral-300 dark:text-neutral-700 mx-auto mb-3" />
-        <h3 className="text-sm font-medium text-neutral-500 mb-1">
-          Delivery Logs Coming Soon
+      {/* Delivery History Table */}
+      <div>
+        <h3 className="text-xs font-medium text-neutral-400 uppercase tracking-wider mb-4">
+          Webhook Delivery History
         </h3>
-        <p className="text-xs text-neutral-400 max-w-sm mx-auto">
-          Detailed webhook delivery history with response codes, latency, and
-          retry tracking will be available in a future update.
-        </p>
+        <DeliveryTable
+          subscriptionId={subscriptionId}
+          isPolling={isPolling}
+          pollIntervalMs={10000}
+        />
       </div>
     </div>
   );

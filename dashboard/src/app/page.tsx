@@ -5,11 +5,11 @@ import Link from "next/link";
 import {
   Radio,
   Webhook,
-  Activity,
   AlertCircle,
   Plus,
   Zap,
-  ZapOff,
+  Send,
+  TrendingUp,
 } from "lucide-react";
 import { StatCard } from "@/components/stat-card";
 import { SubscriptionTable } from "@/components/subscription-table";
@@ -20,15 +20,18 @@ import { ServiceHealth } from "@/components/service-health";
 import {
   fetchSubscriptions,
   fetchAllStatuses,
+  fetchGlobalDeliveryStats,
   deleteSubscription,
 } from "@/lib/api";
-import type { Subscription } from "@/lib/api";
+import type { Subscription, GlobalDeliveryStats } from "@/lib/api";
 
 const POLL_INTERVAL = 10000;
 
 export default function DashboardPage() {
   const [subscriptions, setSubscriptions] = useState<Subscription[]>([]);
   const [connectedIds, setConnectedIds] = useState<Set<string>>(new Set());
+  const [deliveryStats, setDeliveryStats] =
+    useState<GlobalDeliveryStats | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [deleting, setDeleting] = useState<string | null>(null);
@@ -38,11 +41,13 @@ export default function DashboardPage() {
   const loadData = useCallback(async () => {
     try {
       setError(null);
-      const [subs, statuses] = await Promise.all([
+      const [subs, statuses, dStats] = await Promise.all([
         fetchSubscriptions(),
         fetchAllStatuses().catch(() => null),
+        fetchGlobalDeliveryStats().catch(() => null),
       ]);
       setSubscriptions(subs);
+      setDeliveryStats(dStats);
       if (statuses) {
         setConnectedIds(
           new Set(
@@ -150,7 +155,7 @@ export default function DashboardPage() {
       )}
 
       {/* Stats */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-4">
         <StatCard
           title="Total Subscriptions"
           value={loading ? "—" : subscriptions.length}
@@ -174,6 +179,50 @@ export default function DashboardPage() {
           value={loading ? "—" : wsCount}
           icon={Webhook}
           description="WebSocket connections"
+        />
+      </div>
+
+      {/* Delivery Stats */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
+        <StatCard
+          title="Total Deliveries"
+          value={loading || !deliveryStats ? "—" : deliveryStats.total_deliveries}
+          icon={Send}
+          description={
+            deliveryStats
+              ? `${deliveryStats.deliveries_24h} in last 24h`
+              : "Webhook delivery attempts"
+          }
+        />
+        <StatCard
+          title="Success Rate"
+          value={
+            loading || !deliveryStats
+              ? "—"
+              : `${deliveryStats.success_rate}%`
+          }
+          icon={TrendingUp}
+          description={
+            deliveryStats
+              ? `${deliveryStats.successful} succeeded, ${deliveryStats.failed} failed`
+              : "Delivery success percentage"
+          }
+        />
+        <StatCard
+          title="Avg Latency"
+          value={
+            loading || !deliveryStats || !deliveryStats.avg_response_time_ms
+              ? "—"
+              : `${deliveryStats.avg_response_time_ms}ms`
+          }
+          icon={Zap}
+          description="Average webhook response time"
+        />
+        <StatCard
+          title="Last 7 Days"
+          value={loading || !deliveryStats ? "—" : deliveryStats.deliveries_7d}
+          icon={Send}
+          description="Deliveries in the past week"
         />
       </div>
 

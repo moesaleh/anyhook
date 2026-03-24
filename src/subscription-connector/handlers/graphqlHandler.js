@@ -3,7 +3,6 @@ const { createClient } = require('graphql-ws'); // New WebSocket client
 const { WebSocket } = require('ws'); // Use ws WebSocket implementation for Node.js
 const gql = require('graphql-tag');
 const BaseHandler = require('./baseHandler');
-const { json } = require('express');
 
 class GraphQLHandler extends BaseHandler {
     constructor(producer, redisClient) {
@@ -20,6 +19,16 @@ class GraphQLHandler extends BaseHandler {
         console.log(`[GraphQLHandler] - Endpoint URL: ${endpoint_url}`);
         console.log(`[GraphQLHandler] - GraphQL Query: ${query}`);
 
+        // Parse headers safely
+        let parsedHeaders = {};
+        if (headers) {
+            try {
+                parsedHeaders = typeof headers === 'object' ? headers : JSON.parse(headers);
+            } catch (err) {
+                console.error(`[GraphQLHandler] - Failed to parse headers for subscription ID: ${subscription_id}`, err);
+            }
+        }
+
         try {
             // Create a WebSocket client using graphql-ws
             const wsClient = createClient({
@@ -27,7 +36,7 @@ class GraphQLHandler extends BaseHandler {
                 webSocketImpl: WebSocket,
                 retryAttempts: 3, // Automatically retry failed connections
                 connectionParams: {
-                    headers: headers ? JSON.parse(headers) : {}
+                    headers: parsedHeaders
                 }
             });
 

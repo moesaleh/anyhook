@@ -110,9 +110,13 @@ export function SubscriptionTable({
   }
 
   async function copyId(id: string) {
-    await navigator.clipboard.writeText(id);
-    setCopiedId(id);
-    setTimeout(() => setCopiedId(null), 2000);
+    try {
+      await navigator.clipboard.writeText(id);
+      setCopiedId(id);
+      setTimeout(() => setCopiedId(null), 2000);
+    } catch {
+      console.error("Clipboard write failed");
+    }
   }
 
   return (
@@ -240,6 +244,7 @@ export function SubscriptionTable({
                           onClick={() => copyId(sub.subscription_id)}
                           className="text-neutral-400 hover:text-neutral-600 dark:hover:text-neutral-300 transition-colors"
                           title="Copy full ID"
+                          aria-label="Copy subscription ID"
                         >
                           {copiedId === sub.subscription_id ? (
                             <Check className="h-3.5 w-3.5 text-emerald-500" />
@@ -273,6 +278,7 @@ export function SubscriptionTable({
                           target="_blank"
                           rel="noopener noreferrer"
                           className="text-neutral-400 hover:text-neutral-600 dark:hover:text-neutral-300"
+                          aria-label="Open webhook URL in new tab"
                         >
                           <ExternalLink className="h-3 w-3" />
                         </a>

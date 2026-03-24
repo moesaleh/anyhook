@@ -11,7 +11,7 @@ export interface Subscription {
     headers?: Record<string, string>;
   };
   webhook_url: string;
-  status: string;
+  status: "active" | "inactive" | "error";
   created_at: string;
 }
 

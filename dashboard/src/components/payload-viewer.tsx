@@ -23,9 +23,13 @@ export function PayloadViewer({
   }
 
   async function handleCopy(text: string, key: string) {
-    await navigator.clipboard.writeText(text);
-    setCopied(key);
-    setTimeout(() => setCopied(null), 2000);
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(key);
+      setTimeout(() => setCopied(null), 2000);
+    } catch {
+      console.error("Clipboard write failed");
+    }
   }
 
   function formatJson(raw: string | null): string {
@@ -83,6 +87,7 @@ export function PayloadViewer({
                   onClick={() => handleCopy(formatted, section.key)}
                   className="absolute top-2 right-2 text-neutral-400 hover:text-neutral-600 dark:hover:text-neutral-300"
                   title="Copy"
+                  aria-label={`Copy ${section.label}`}
                 >
                   {copied === section.key ? (
                     <Check className="h-3.5 w-3.5 text-emerald-500" />

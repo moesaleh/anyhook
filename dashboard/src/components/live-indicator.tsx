@@ -1,20 +1,11 @@
 "use client";
 
-import { cn } from "@/lib/utils";
+import { cn, timeAgo } from "@/lib/utils";
 
 interface LiveIndicatorProps {
   lastUpdated: Date | null;
   isPolling: boolean;
   intervalMs: number;
-}
-
-function timeAgo(date: Date): string {
-  const seconds = Math.floor((Date.now() - date.getTime()) / 1000);
-  if (seconds < 5) return "just now";
-  if (seconds < 60) return `${seconds}s ago`;
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}m ago`;
-  return `${Math.floor(minutes / 60)}h ago`;
 }
 
 export function LiveIndicator({
@@ -23,7 +14,11 @@ export function LiveIndicator({
   intervalMs,
 }: LiveIndicatorProps) {
   return (
-    <div className="inline-flex items-center gap-2 text-xs text-neutral-500">
+    <div
+      className="inline-flex items-center gap-2 text-xs text-neutral-500"
+      aria-live="polite"
+      aria-atomic="true"
+    >
       <span className="relative flex h-2 w-2">
         {isPolling && (
           <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-indigo-400 opacity-75" />

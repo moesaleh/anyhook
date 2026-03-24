@@ -5,7 +5,6 @@ import {
   ChevronDown,
   ChevronRight,
   ChevronLeft,
-  ChevronRight as ChevronRightIcon,
   RefreshCw,
   Clock,
   Hash,
@@ -238,7 +237,7 @@ export function DeliveryTable({
               disabled={page === pages}
               className="inline-flex items-center gap-1 rounded-lg border border-neutral-200 dark:border-neutral-800 px-2.5 py-1 text-xs hover:bg-neutral-50 dark:hover:bg-neutral-900 disabled:opacity-40 disabled:cursor-not-allowed"
             >
-              Next <ChevronRightIcon className="h-3.5 w-3.5" />
+              Next <ChevronRight className="h-3.5 w-3.5" />
             </button>
           </div>
         </div>

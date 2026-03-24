@@ -6,7 +6,6 @@ import {
   Wifi,
   ArrowRight,
   Server,
-  ArrowRight as Arrow2,
   Webhook,
 } from "lucide-react";
 
@@ -110,7 +109,7 @@ export function ConnectionFlow({
                 : "bg-neutral-200 dark:bg-neutral-800"
             )}
           />
-          <Arrow2 className="h-3.5 w-3.5 -ml-1" />
+          <ArrowRight className="h-3.5 w-3.5 -ml-1" />
         </div>
         <p className="text-[10px] text-neutral-400">POST</p>
       </div>

@@ -10,7 +10,12 @@ const kafkaClient = new KafkaClient({ kafkaHost: process.env.KAFKA_HOST });
 const consumer = new Consumer(kafkaClient, [{ topic: 'connection_events' }], { autoCommit: true });
 const producer = new Producer(kafkaClient);
 const redisClient = redis.createClient({ url: process.env.REDIS_URL });
-const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    max: 20,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 5000,
+});
 
 // Connect to Redis
 redisClient.on('error', (err) => console.error('Redis Client Error', err));
@@ -88,7 +93,18 @@ async function recordDelivery({
 consumer.on('message', async (message) => {
     console.log(`Received message from Kafka topic 'connection_events':`, message.value);
 
-    const { subscriptionId, data } = JSON.parse(message.value);
+    let subscriptionId, data;
+    try {
+        ({ subscriptionId, data } = JSON.parse(message.value));
+    } catch (err) {
+        console.error('Failed to parse Kafka message, skipping:', err.message);
+        return;
+    }
+
+    if (!subscriptionId) {
+        console.error('Missing subscriptionId in Kafka message, skipping');
+        return;
+    }
 
     // Generate a unique event ID that groups this delivery + all its retries
     const eventId = uuidv4();
@@ -129,7 +145,7 @@ async function sendWebhook(subscriptionId, webhookUrl, data, eventId, retryCount
     const startTime = Date.now();
 
     try {
-        const response = await axios.post(webhookUrl, { data });
+        const response = await axios.post(webhookUrl, { data }, { timeout: 30000 });
         const responseTimeMs = Date.now() - startTime;
 
         console.log(`Webhook sent successfully for subscription ID: ${subscriptionId} (${responseTimeMs}ms)`);
@@ -237,3 +253,23 @@ async function sendToDLQ(subscriptionId, webhookUrl, data, eventId) {
 consumer.on('error', (err) => {
     console.error('Error in Kafka Consumer:', err);
 });
+
+// Graceful shutdown
+function shutdown(signal) {
+    console.log(`Webhook dispatcher received ${signal}, shutting down gracefully...`);
+    consumer.close(() => {
+        console.log('Kafka consumer closed');
+        redisClient.quit().then(() => {
+            console.log('Redis client closed');
+            pool.end().then(() => {
+                console.log('PostgreSQL pool closed');
+                process.exit(0);
+            });
+        });
+    });
+    // Force exit after 10 seconds
+    setTimeout(() => process.exit(1), 10000);
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));

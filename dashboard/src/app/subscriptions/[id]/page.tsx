@@ -32,7 +32,7 @@ import { LiveIndicator } from "@/components/live-indicator";
 import { DeliveryStatsCard } from "@/components/delivery-stats";
 import { DeliveryTable } from "@/components/delivery-table";
 import { DeleteDialog } from "@/components/delete-dialog";
-import { cn, formatDate } from "@/lib/utils";
+import { cn, formatDate, formatUptime } from "@/lib/utils";
 import type { Subscription, SubscriptionStatus, DeliveryStats } from "@/lib/api";
 
 type Tab = "overview" | "configuration" | "activity";
@@ -88,9 +88,13 @@ export default function SubscriptionDetailPage() {
   }, [isPolling, loadData]);
 
   async function handleCopy(text: string, key: string) {
-    await navigator.clipboard.writeText(text);
-    setCopied(key);
-    setTimeout(() => setCopied(null), 2000);
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(key);
+      setTimeout(() => setCopied(null), 2000);
+    } catch {
+      console.error("Clipboard write failed");
+    }
   }
 
   async function handleDelete() {
@@ -134,7 +138,7 @@ export default function SubscriptionDetailPage() {
   }
 
   const connected = status?.connected ?? false;
-  const uptime = getUptime(subscription.created_at);
+  const uptime = formatUptime(subscription.created_at);
 
   const tabs: { id: Tab; label: string; icon: typeof Eye }[] = [
     { id: "overview", label: "Overview", icon: Eye },
@@ -708,16 +712,3 @@ function TimelineEvent({
   );
 }
 
-/* ── Helpers ─────────────────────────────────────────────────────── */
-
-function getUptime(createdAt: string): string {
-  const ms = Date.now() - new Date(createdAt).getTime();
-  const seconds = Math.floor(ms / 1000);
-  if (seconds < 60) return `${seconds}s`;
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}m`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours}h ${minutes % 60}m`;
-  const days = Math.floor(hours / 24);
-  return `${days}d ${hours % 24}h`;
-}

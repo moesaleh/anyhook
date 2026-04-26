@@ -1,9 +1,16 @@
+require('dotenv').config({ path: './.env' });
 const { SubscriptionClient } = require('subscriptions-transport-ws');
 const WebSocket = require('ws');
 const gql = require('graphql-tag');
 
+if (!process.env.BITQUERY_TOKEN) {
+    console.error('BITQUERY_TOKEN environment variable is required to run this test client.');
+    console.error('Get a token at https://bitquery.io and set it in your .env file.');
+    process.exit(1);
+}
+
 // Define the WebSocket endpoint and subscription query
-const endpoint = 'wss://streaming.bitquery.io/graphql?token=ory_at_P9weJTGfrKcoYil2keWSQ5YfqqySRKIAgmRhUKjhEI8.rlGPL9v8TyTNINqGTGob8ZAPoeCRDr8nEGiMGeJMSJo';
+const endpoint = `wss://streaming.bitquery.io/graphql?token=${encodeURIComponent(process.env.BITQUERY_TOKEN)}`;
 const query = gql`
   subscription {
     EVM(network: eth, trigger_on: head) {

@@ -5,6 +5,19 @@ const redis = require('@redis/client');
 const { KafkaClient, Producer, Admin } = require('kafka-node');
 const { exec } = require('child_process'); // For running migrations
 const { v4: uuidv4 } = require('uuid');
+const crypto = require('crypto');
+
+/**
+ * Strip the per-subscription webhook signing secret before returning
+ * subscription rows to API callers. Secrets are shown ONCE at creation
+ * time (in the POST /subscribe response) and never again.
+ */
+function withoutSecret(row) {
+    if (!row || typeof row !== 'object') return row;
+    // eslint-disable-next-line no-unused-vars
+    const { webhook_secret, ...rest } = row;
+    return rest;
+}
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
@@ -180,8 +193,8 @@ app.get('/health', async (req, res) => {
 app.get('/subscriptions/:id/status', async (req, res) => {
     const { id } = req.params;
     try {
-        // Check PostgreSQL for the subscription record
-        const dbResult = await pool.query('SELECT * FROM subscriptions WHERE subscription_id = $1', [id]);
+        // Check PostgreSQL for the subscription record (status only — never the secret)
+        const dbResult = await pool.query('SELECT subscription_id, status, created_at FROM subscriptions WHERE subscription_id = $1', [id]);
         if (dbResult.rows.length === 0) {
             return errorResponse(res, 404, 'Subscription not found');
         }
@@ -372,7 +385,7 @@ app.get('/deliveries/stats', async (req, res) => {
 app.get('/subscriptions', async (req, res) => {
     try {
         const result = await pool.query('SELECT * FROM subscriptions');
-        res.status(200).json(result.rows);
+        res.status(200).json(result.rows.map(withoutSecret));
     } catch (err) {
         console.error(err);
         errorResponse(res, 500, 'Failed to retrieve subscriptions');
@@ -403,7 +416,7 @@ app.get('/subscriptions/:id', async (req, res) => {
     try {
         const result = await pool.query('SELECT * FROM subscriptions WHERE subscription_id = $1', [id]);
         if (result.rows.length > 0) {
-            res.status(200).json(result.rows[0]);
+            res.status(200).json(withoutSecret(result.rows[0]));
         } else {
             errorResponse(res, 404, 'Subscription not found');
         }
@@ -428,9 +441,20 @@ app.put('/subscriptions/:id', async (req, res) => {
         const result = await pool.query(queryText, values);
 
         if (result.rows.length > 0) {
-            // Update Redis cache as well
+            // Update Redis cache as well (full row WITH secret — internal only)
             await redisClient.set(id, JSON.stringify(result.rows[0]));
-            res.status(200).json(result.rows[0]);
+
+            // Notify the connector to tear down + reopen with the new config.
+            // Without this, the connector keeps the old upstream connection
+            // open with the stale query/headers indefinitely.
+            const payloads = [{ topic: 'update_events', messages: id }];
+            producer.send(payloads, (err) => {
+                if (err) {
+                    console.error(`[Update API] - Error publishing update_events for ${id}`, err);
+                }
+            });
+
+            res.status(200).json(withoutSecret(result.rows[0]));
         } else {
             errorResponse(res, 404, 'Subscription not found');
         }
@@ -449,6 +473,10 @@ app.post('/subscribe', async (req, res) => {
 
     const { connection_type, args, webhook_url } = req.body;
     const subscriptionId = uuidv4();
+    // 32 random bytes -> 64-char hex secret. Generated app-side so the value
+    // is known at INSERT time and can be returned in the response. The DB
+    // column has NOT NULL, no default, so this must be provided.
+    const webhookSecret = crypto.randomBytes(32).toString('hex');
 
     console.log(`[Subscribe API] - Incoming request to create subscription. Connection Type: ${connection_type}, Webhook URL: ${webhook_url}`);
 
@@ -456,13 +484,14 @@ app.post('/subscribe', async (req, res) => {
         console.log(`[Subscribe API] - Saving subscription to PostgreSQL. Subscription ID: ${subscriptionId}`);
 
         // Save subscription to PostgreSQL
-        const queryText = `INSERT INTO subscriptions (subscription_id, connection_type, args, webhook_url) VALUES ($1, $2, $3, $4) RETURNING *`;
-        const values = [subscriptionId, connection_type, args, webhook_url];
+        const queryText = `INSERT INTO subscriptions (subscription_id, connection_type, args, webhook_url, webhook_secret) VALUES ($1, $2, $3, $4, $5) RETURNING *`;
+        const values = [subscriptionId, connection_type, args, webhook_url, webhookSecret];
         const result = await pool.query(queryText, values);
 
-        console.log(`[Subscribe API] - Subscription saved to PostgreSQL. Subscription ID: ${subscriptionId}, Data:`, result.rows[0]);
+        console.log(`[Subscribe API] - Subscription saved to PostgreSQL. Subscription ID: ${subscriptionId}`);
 
-        // Save subscription to Redis
+        // Save subscription to Redis (with secret — connector + dispatcher
+        // need it). Never returned via the public GET endpoints.
         await redisClient.set(subscriptionId, JSON.stringify(result.rows[0]));
         console.log(`[Subscribe API] - Subscription saved to Redis. Subscription ID: ${subscriptionId}`);
 
@@ -472,11 +501,17 @@ app.post('/subscribe', async (req, res) => {
             if (err) {
                 console.error(`[Subscribe API] - Error publishing subscription to Kafka. Subscription ID: ${subscriptionId}`, err);
             } else {
-                console.log(`[Subscribe API] - Subscription published to Kafka successfully. Subscription ID: ${subscriptionId}, Data:`, data);
+                console.log(`[Subscribe API] - Subscription published to Kafka successfully. Subscription ID: ${subscriptionId}`);
             }
         });
 
-        res.status(201).json({ subscriptionId, message: 'Subscription created' });
+        // ONLY place where webhook_secret is exposed to the API caller.
+        // Receivers should store it and use it to verify X-AnyHook-Signature.
+        res.status(201).json({
+            subscriptionId,
+            webhook_secret: webhookSecret,
+            message: 'Subscription created. Save webhook_secret — it is shown only once.',
+        });
     } catch (err) {
         console.error(`[Subscribe API] - Error creating subscription:`, err);
         errorResponse(res, 500, 'Failed to create subscription');
@@ -690,6 +725,11 @@ function createKafkaTopics() {
             },
             {
                 topic: 'connection_events',
+                partitions: 1,
+                replicationFactor: 1,
+            },
+            {
+                topic: 'update_events',
                 partitions: 1,
                 replicationFactor: 1,
             },

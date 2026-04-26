@@ -21,10 +21,14 @@ redisClient.on('error', (err) => console.error('Redis Client Error', err));
     await reloadActiveSubscriptions();
 })();
 
-// Define Kafka consumers to listen to subscription and unsubscription events
+// Define Kafka consumers to listen to subscription, unsubscription, and update events
 const consumer = new Consumer(
     kafkaClient,
-    [{ topic: 'subscription_events' }, { topic: 'unsubscribe_events' }],
+    [
+        { topic: 'subscription_events' },
+        { topic: 'unsubscribe_events' },
+        { topic: 'update_events' },
+    ],
     { autoCommit: true }
 );
 
@@ -83,6 +87,27 @@ consumer.on('message', async (message) => {
             }
         } catch (err) {
             console.error('Error retrieving subscription from Redis', err);
+        }
+    } else if (topic === 'update_events') {
+        // Subscription config changed — tear down the existing connection
+        // and reopen with the new config from Redis.
+        try {
+            const subscriptionDetails = await redisClient.get(subscriptionId);
+            if (!subscriptionDetails) {
+                console.error(`No subscription details found in Redis for update event: ${subscriptionId}`);
+                return;
+            }
+            const subscription = JSON.parse(subscriptionDetails);
+            const handler = connectionHandlers[subscription.connection_type];
+            if (!handler) {
+                console.error(`No handler found for connection type: ${subscription.connection_type}`);
+                return;
+            }
+            console.log(`Reloading subscription ID: ${subscriptionId} (update event)`);
+            handler.disconnect(subscriptionId);
+            handler.connect(subscription);
+        } catch (err) {
+            console.error('Error processing update event:', err);
         }
     } else if (topic === 'unsubscribe_events') {
         try {

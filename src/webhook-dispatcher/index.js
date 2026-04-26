@@ -4,6 +4,7 @@ const redis = require('@redis/client');
 const axios = require('axios');
 const { Pool } = require('pg');
 const { v4: uuidv4 } = require('uuid');
+const crypto = require('crypto');
 
 // Initialize Kafka, Redis, and PostgreSQL clients
 const kafkaClient = new KafkaClient({ kafkaHost: process.env.KAFKA_HOST });
@@ -17,19 +18,22 @@ const pool = new Pool({
     connectionTimeoutMillis: 5000,
 });
 
-// Connect to Redis
+// Connect to Redis + verify PostgreSQL, then recover any in-flight retries
+// that were scheduled with setTimeout in a previous process and lost on
+// restart. Without this, every restart silently drops every pending retry.
 redisClient.on('error', (err) => console.error('Redis Client Error', err));
 (async () => {
     await redisClient.connect();
     console.log('Webhook dispatcher: Redis client connected');
-})();
 
-// Verify PostgreSQL connection
-pool.query('SELECT 1').then(() => {
-    console.log('Webhook dispatcher: PostgreSQL connected');
-}).catch((err) => {
-    console.error('Webhook dispatcher: PostgreSQL connection failed (delivery logging will be unavailable):', err.message);
-});
+    try {
+        await pool.query('SELECT 1');
+        console.log('Webhook dispatcher: PostgreSQL connected');
+        await recoverPendingRetries();
+    } catch (err) {
+        console.error('Webhook dispatcher: PostgreSQL unavailable (recovery + delivery logging disabled):', err.message);
+    }
+})();
 
 // Retry intervals: 15 mins, 1 hour, 2 hours, 6 hours, 12 hours, 24 hours (in minutes)
 const retryIntervals = [15, 60, 120, 360, 720, 1440];
@@ -118,13 +122,13 @@ consumer.on('message', async (message) => {
         }
 
         const subscription = JSON.parse(subscriptionDetails);
-        const { webhook_url: webhookUrl } = subscription;
+        const { webhook_url: webhookUrl, webhook_secret: webhookSecret } = subscription;
 
         try {
-            await sendWebhook(subscriptionId, webhookUrl, data, eventId, 0);
+            await sendWebhook(subscriptionId, webhookUrl, webhookSecret, data, eventId, 0);
         } catch (error) {
             console.error(`Initial webhook request failed for subscription ID: ${subscriptionId}`, error.message);
-            retryWebhook(subscriptionId, webhookUrl, data, eventId, 0);
+            retryWebhook(subscriptionId, webhookUrl, webhookSecret, data, eventId, 0);
         }
     } catch (error) {
         console.error(`Error processing message for subscription ID: ${subscriptionId}`, error);
@@ -132,20 +136,57 @@ consumer.on('message', async (message) => {
 });
 
 /**
+ * Compute the standard webhook signature header value.
+ * Format: `t=<unix_seconds>,v1=<hex_hmac_sha256>` over `<timestamp>.<body>`.
+ * The timestamped scheme prevents replay attacks; receivers should reject
+ * timestamps older than ~5 minutes.
+ */
+function signRequest(secret, timestampSec, rawBody) {
+    const payload = `${timestampSec}.${rawBody}`;
+    const hmac = crypto.createHmac('sha256', secret).update(payload).digest('hex');
+    return { signature: `t=${timestampSec},v1=${hmac}`, hmac };
+}
+
+/**
  * Send a webhook POST and record the outcome.
  * @param {string} subscriptionId - The subscription UUID
  * @param {string} webhookUrl - The destination URL
+ * @param {string} webhookSecret - HMAC secret for signing
  * @param {any} data - The payload from the source
  * @param {string} eventId - Groups this attempt with retries
  * @param {number} retryCount - 0 for first attempt, 1+ for retries
  */
-async function sendWebhook(subscriptionId, webhookUrl, data, eventId, retryCount) {
+async function sendWebhook(subscriptionId, webhookUrl, webhookSecret, data, eventId, retryCount) {
     const requestBody = JSON.stringify({ data });
     const payloadSizeBytes = Buffer.byteLength(requestBody, 'utf8');
     const startTime = Date.now();
 
+    // Build signature headers. If the secret is missing (e.g. a row predating
+    // the migration that somehow escaped backfill), skip signing rather than
+    // crash — the receiver will see no X-AnyHook-Signature and can refuse.
+    const headers = {
+        'Content-Type': 'application/json',
+        'User-Agent': 'AnyHook-Webhook/1.0',
+        'X-AnyHook-Subscription-Id': subscriptionId,
+        'X-AnyHook-Event-Id': eventId,
+        'X-AnyHook-Delivery-Attempt': String(retryCount + 1),
+    };
+    if (webhookSecret) {
+        const timestampSec = Math.floor(Date.now() / 1000);
+        const { signature } = signRequest(webhookSecret, timestampSec, requestBody);
+        headers['X-AnyHook-Timestamp'] = String(timestampSec);
+        headers['X-AnyHook-Signature'] = signature;
+    } else {
+        console.warn(`No webhook_secret for subscription ${subscriptionId}; sending UNSIGNED`);
+    }
+
     try {
-        const response = await axios.post(webhookUrl, { data }, { timeout: 30000 });
+        // Pass the pre-serialized body so the HMAC matches exactly what the
+        // receiver hashes. axios would otherwise re-serialize the object.
+        const response = await axios.post(webhookUrl, requestBody, {
+            timeout: 30000,
+            headers,
+        });
         const responseTimeMs = Date.now() - startTime;
 
         console.log(`Webhook sent successfully for subscription ID: ${subscriptionId} (${responseTimeMs}ms)`);
@@ -194,7 +235,7 @@ async function sendWebhook(subscriptionId, webhookUrl, data, eventId, retryCount
  * Retry webhook delivery with escalating backoff intervals.
  * Intervals: 15m → 1h → 2h → 6h → 12h → 24h → DLQ
  */
-function retryWebhook(subscriptionId, webhookUrl, data, eventId, retryCount) {
+function retryWebhook(subscriptionId, webhookUrl, webhookSecret, data, eventId, retryCount) {
     if (retryCount >= maxRetries) {
         console.log(`Max retries reached for subscription ID: ${subscriptionId}, moving to Dead Letter Queue`);
         sendToDLQ(subscriptionId, webhookUrl, data, eventId);
@@ -206,11 +247,11 @@ function retryWebhook(subscriptionId, webhookUrl, data, eventId, retryCount) {
 
     setTimeout(async () => {
         try {
-            await sendWebhook(subscriptionId, webhookUrl, data, eventId, retryCount + 1);
+            await sendWebhook(subscriptionId, webhookUrl, webhookSecret, data, eventId, retryCount + 1);
             console.log(`Webhook retry ${retryCount + 1} successful for subscription ID: ${subscriptionId}`);
         } catch (error) {
             console.error(`Retry ${retryCount + 1} failed for subscription ID: ${subscriptionId}`, error.message);
-            retryWebhook(subscriptionId, webhookUrl, data, eventId, retryCount + 1);
+            retryWebhook(subscriptionId, webhookUrl, webhookSecret, data, eventId, retryCount + 1);
         }
     }, delay);
 }
@@ -247,6 +288,79 @@ async function sendToDLQ(subscriptionId, webhookUrl, data, eventId) {
             console.log(`Message sent to Dead Letter Queue (DLQ) for subscription ID: ${subscriptionId}`);
         }
     });
+}
+
+/**
+ * On dispatcher startup, scan delivery_events for the most-recent row per
+ * event_id with status='retrying' and re-fire the next attempt for each.
+ * This recovers retries that were scheduled with in-process setTimeout in
+ * a previous process lifetime and lost on restart/deploy/crash.
+ *
+ * Caveats:
+ * - Only looks back 24h. Anything older is treated as abandoned.
+ * - Single-process safe. With multiple dispatcher pods this would
+ *   double-deliver — needs SELECT ... FOR UPDATE SKIP LOCKED + a status
+ *   transition before that's safe to scale horizontally.
+ * - request_body is truncated to 10KB at write time; recovery for payloads
+ *   larger than that will replay a truncated payload.
+ */
+async function recoverPendingRetries() {
+    let result;
+    try {
+        result = await pool.query(`
+            SELECT DISTINCT ON (event_id)
+                event_id, subscription_id, retry_count, request_body, created_at
+            FROM delivery_events
+            WHERE status = 'retrying'
+              AND created_at > NOW() - INTERVAL '24 hours'
+            ORDER BY event_id, created_at DESC
+        `);
+    } catch (err) {
+        console.error('Failed to query delivery_events for recovery:', err.message);
+        return;
+    }
+
+    if (result.rowCount === 0) {
+        console.log('No pending retries to recover');
+        return;
+    }
+    console.log(`Recovering ${result.rowCount} pending webhook retries from delivery_events`);
+
+    for (const row of result.rows) {
+        const subscriptionDetails = await redisClient.get(row.subscription_id);
+        if (!subscriptionDetails) {
+            console.warn(`Skipping recovery for event ${row.event_id}: subscription ${row.subscription_id} no longer in Redis`);
+            continue;
+        }
+        let subscription;
+        try {
+            subscription = JSON.parse(subscriptionDetails);
+        } catch (err) {
+            console.error(`Skipping recovery for event ${row.event_id}: bad Redis payload`, err.message);
+            continue;
+        }
+        const { webhook_url: webhookUrl, webhook_secret: webhookSecret } = subscription;
+
+        let data;
+        try {
+            data = JSON.parse(row.request_body).data;
+        } catch (err) {
+            console.error(`Skipping recovery for event ${row.event_id}: cannot parse request_body (may be truncated)`, err.message);
+            continue;
+        }
+
+        // row.retry_count is the attempt that just failed; the next attempt
+        // is +1. Fire it immediately rather than re-waiting the original
+        // backoff window — that wait already elapsed during the outage.
+        const nextAttempt = row.retry_count + 1;
+        console.log(`Recovering event ${row.event_id} sub ${row.subscription_id} attempt ${nextAttempt}/${maxRetries}`);
+        sendWebhook(row.subscription_id, webhookUrl, webhookSecret, data, row.event_id, nextAttempt)
+            .then(() => console.log(`Recovered delivery succeeded for event ${row.event_id}`))
+            .catch((err) => {
+                console.error(`Recovered delivery failed for event ${row.event_id}:`, err.message);
+                retryWebhook(row.subscription_id, webhookUrl, webhookSecret, data, row.event_id, nextAttempt);
+            });
+    }
 }
 
 // Error handling for Kafka consumer

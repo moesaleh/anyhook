@@ -36,7 +36,10 @@ const TOPICS = [
 ];
 
 function parseBrokers(envValue) {
-  return (envValue || 'localhost:9092').split(',').map((s) => s.trim()).filter(Boolean);
+  return (envValue || 'localhost:9092')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
 }
 
 async function main() {
@@ -53,7 +56,7 @@ async function main() {
 
   let exitCode = 0;
   try {
-    const metadata = await admin.fetchTopicMetadata({ topics: TOPICS }).catch((err) => {
+    const metadata = await admin.fetchTopicMetadata({ topics: TOPICS }).catch(err => {
       // fetchTopicMetadata throws if any requested topic doesn't exist.
       // Fall back to listing-then-checking so missing topics print a
       // useful message instead of a stack trace.

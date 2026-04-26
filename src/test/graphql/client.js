@@ -1,7 +1,8 @@
 require('dotenv').config({ path: './.env' });
-const { SubscriptionClient } = require('subscriptions-transport-ws');
+const { createClient } = require('graphql-ws');
 const WebSocket = require('ws');
 const gql = require('graphql-tag');
+const { print } = require('graphql');
 
 if (!process.env.BITQUERY_TOKEN) {
     console.error('BITQUERY_TOKEN environment variable is required to run this test client.');
@@ -26,54 +27,50 @@ const query = gql`
   }
 `;
 
-// Create a WebSocket client for subscriptions
-const client = new SubscriptionClient(endpoint, {
-    reconnect: true,
-}, WebSocket);
-
-// Log connection events
-client.onConnected(() => {
-    console.log('WebSocket connected');
-});
-
-client.onConnecting(() => {
-    console.log('WebSocket connecting...');
-});
-
-client.onReconnecting(() => {
-    console.log('WebSocket reconnecting...');
-});
-
-client.onReconnected(() => {
-    console.log('WebSocket reconnected');
-});
-
-client.onDisconnected(() => {
-    console.log('WebSocket disconnected');
-});
-
-client.onError((error) => {
-    console.error('WebSocket error:', error);
+// Create a graphql-ws client (replaces deprecated subscriptions-transport-ws)
+const client = createClient({
+    url: endpoint,
+    webSocketImpl: WebSocket,
+    retryAttempts: 5,
+    on: {
+        connecting: () => console.log('WebSocket connecting...'),
+        opened: () => console.log('WebSocket socket opened'),
+        connected: () => console.log('WebSocket connected'),
+        closed: (event) => console.log('WebSocket closed:', event?.code, event?.reason),
+        error: (err) => console.error('WebSocket error:', err),
+    },
 });
 
 // Subscribe to the GraphQL event
-const subscription = client.request({ query }).subscribe({
-    next(data) {
-        console.log('Received data:', JSON.stringify(data, null, 2));
-    },
-    error(err) {
-        console.error('Subscription error:', err);
-    },
-    complete() {
-        console.log('Subscription completed');
-    },
-});
+const dispose = client.subscribe(
+    { query: print(query) },
+    {
+        next: (data) => {
+            console.log('Received data:', JSON.stringify(data, null, 2));
+        },
+        error: (err) => {
+            console.error('Subscription error:', err);
+        },
+        complete: () => {
+            console.log('Subscription completed');
+        },
+    }
+);
 
 // Additional logging for subscription status
 setTimeout(() => {
-    if (!subscription) {
-        console.error('Subscription could not be established');
-    } else {
+    if (typeof dispose === 'function') {
         console.log('Subscription initiated');
+    } else {
+        console.error('Subscription could not be established');
     }
 }, 5000);
+
+// Graceful shutdown so dispose runs and the socket closes cleanly
+function shutdown(signal) {
+    console.log(`Test client received ${signal}, disposing subscription...`);
+    if (typeof dispose === 'function') dispose();
+    client.dispose().finally(() => process.exit(0));
+}
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));

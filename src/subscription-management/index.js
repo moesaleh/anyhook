@@ -1,11 +1,16 @@
 require('dotenv').config({ path: './.env' });
+process.env.KAFKAJS_NO_PARTITIONER_WARNING = '1';
 const express = require('express');
 const { Pool } = require('pg');
 const redis = require('@redis/client');
-const { KafkaClient, Producer, Admin } = require('kafka-node');
+const { Kafka, logLevel } = require('kafkajs');
 const { exec } = require('child_process'); // For running migrations
 const { v4: uuidv4 } = require('uuid');
 const crypto = require('crypto');
+
+function parseBrokers(envValue) {
+    return (envValue || 'localhost:9092').split(',').map((s) => s.trim()).filter(Boolean);
+}
 
 /**
  * Strip the per-subscription webhook signing secret before returning
@@ -58,18 +63,14 @@ redisClient.on('error', (err) => console.error('Redis Client Error', err));
     console.log('Redis client connected');
 })();
 
-// Initialize Kafka client and create topics
-const kafkaClient = new KafkaClient({ kafkaHost: process.env.KAFKA_HOST });
-const producer = new Producer(kafkaClient);
-const admin = new Admin(kafkaClient);  // Kafka Admin for topic management
-
-producer.on('ready', async () => {
-    console.log('Kafka producer ready');
+// Initialize Kafka client (kafkajs)
+const kafka = new Kafka({
+    clientId: 'subscription-management',
+    brokers: parseBrokers(process.env.KAFKA_HOST),
+    logLevel: logLevel.WARN,
 });
-
-producer.on('error', (err) => {
-    console.error('Kafka producer error:', err);
-});
+const producer = kafka.producer({ allowAutoTopicCreation: false });
+const admin = kafka.admin();
 
 // --- Input validation helpers ---
 
@@ -447,12 +448,14 @@ app.put('/subscriptions/:id', async (req, res) => {
             // Notify the connector to tear down + reopen with the new config.
             // Without this, the connector keeps the old upstream connection
             // open with the stale query/headers indefinitely.
-            const payloads = [{ topic: 'update_events', messages: id }];
-            producer.send(payloads, (err) => {
-                if (err) {
-                    console.error(`[Update API] - Error publishing update_events for ${id}`, err);
-                }
-            });
+            try {
+                await producer.send({
+                    topic: 'update_events',
+                    messages: [{ value: id }],
+                });
+            } catch (kafkaErr) {
+                console.error(`[Update API] - Failed to publish update_events for ${id}`, kafkaErr);
+            }
 
             res.status(200).json(withoutSecret(result.rows[0]));
         } else {
@@ -495,15 +498,19 @@ app.post('/subscribe', async (req, res) => {
         await redisClient.set(subscriptionId, JSON.stringify(result.rows[0]));
         console.log(`[Subscribe API] - Subscription saved to Redis. Subscription ID: ${subscriptionId}`);
 
-        // Publish subscription ID to Kafka
-        const payloads = [{ topic: 'subscription_events', messages: subscriptionId }];
-        producer.send(payloads, (err, data) => {
-            if (err) {
-                console.error(`[Subscribe API] - Error publishing subscription to Kafka. Subscription ID: ${subscriptionId}`, err);
-            } else {
-                console.log(`[Subscribe API] - Subscription published to Kafka successfully. Subscription ID: ${subscriptionId}`);
-            }
-        });
+        // Publish subscription ID to Kafka. Awaited so we know the connector
+        // will see it; if Kafka is down, we surface 500 rather than returning
+        // 201 for a subscription the connector will never open.
+        try {
+            await producer.send({
+                topic: 'subscription_events',
+                messages: [{ value: subscriptionId }],
+            });
+            console.log(`[Subscribe API] - Subscription published to Kafka. Subscription ID: ${subscriptionId}`);
+        } catch (kafkaErr) {
+            console.error(`[Subscribe API] - Failed to publish subscription_events for ${subscriptionId}`, kafkaErr);
+            return errorResponse(res, 500, 'Subscription created in DB but Kafka publish failed; connector will not open until reconciled');
+        }
 
         // ONLY place where webhook_secret is exposed to the API caller.
         // Receivers should store it and use it to verify X-AnyHook-Signature.
@@ -533,15 +540,17 @@ app.post('/unsubscribe', async (req, res) => {
         await pool.query(`DELETE FROM subscriptions WHERE subscription_id = $1`, [subscription_id]);
         console.log(`[Unsubscribe API] - Subscription deleted from PostgreSQL. Subscription ID: ${subscription_id}`);
 
-        // Publish subscription ID to Kafka
-        const payloads = [{ topic: 'unsubscribe_events', messages: subscription_id }];
-        producer.send(payloads, (err, data) => {
-            if (err) {
-                console.error(`[Unsubscribe API] - Error publishing unsubscription to Kafka. Subscription ID: ${subscription_id}`, err);
-            } else {
-                console.log(`[Unsubscribe API] - Unsubscription published to Kafka successfully. Subscription ID: ${subscription_id}, Data:`, data);
-            }
-        });
+        // Publish to Kafka so the connector closes the upstream connection.
+        // Best-effort: if Kafka is down we still return 200 (the row is gone
+        // from PG; the connector will eventually reconcile via Redis sweep).
+        try {
+            await producer.send({
+                topic: 'unsubscribe_events',
+                messages: [{ value: subscription_id }],
+            });
+        } catch (kafkaErr) {
+            console.error(`[Unsubscribe API] - Failed to publish unsubscribe_events for ${subscription_id}`, kafkaErr);
+        }
 
         res.status(200).json({ message: 'Unsubscribed successfully' });
     } catch (err) {
@@ -670,27 +679,26 @@ app.post('/redis/reload', requireAdminKey, async (req, res) => {
 });
 
 // Kafka: List all topics
-app.get('/kafka/topics', requireAdminKey, (req, res) => {
-    admin.listTopics((err, data) => {
-        if (err) {
-            errorResponse(res, 500, 'Failed to list Kafka topics');
-        } else {
-            const topics = Object.keys(data[1].metadata);
-            res.status(200).json({ topics });
-        }
-    });
+app.get('/kafka/topics', requireAdminKey, async (req, res) => {
+    try {
+        const topics = await admin.listTopics();
+        res.status(200).json({ topics });
+    } catch (err) {
+        console.error('Failed to list Kafka topics', err);
+        errorResponse(res, 500, 'Failed to list Kafka topics');
+    }
 });
 
 // Kafka: Delete topic
-app.delete('/kafka/topics/:topic', requireAdminKey, (req, res) => {
+app.delete('/kafka/topics/:topic', requireAdminKey, async (req, res) => {
     const { topic } = req.params;
-    admin.delete([topic], (err, data) => {
-        if (err) {
-            errorResponse(res, 500, `Failed to delete Kafka topic ${topic}`);
-        } else {
-            res.status(200).json({ message: `Kafka topic ${topic} deleted` });
-        }
-    });
+    try {
+        await admin.deleteTopics({ topics: [topic] });
+        res.status(200).json({ message: `Kafka topic ${topic} deleted` });
+    } catch (err) {
+        console.error(`Failed to delete Kafka topic ${topic}`, err);
+        errorResponse(res, 500, `Failed to delete Kafka topic ${topic}`);
+    }
 });
 
 // Function to apply database migrations
@@ -709,77 +717,63 @@ function applyMigrations() {
     });
 }
 
-// Function to create Kafka topics
-function createKafkaTopics() {
-    return new Promise((resolve, reject) => {
-        const topicsToCreate = [
-            {
-                topic: 'subscription_events',
-                partitions: 1,
-                replicationFactor: 1,
-            },
-            {
-                topic: 'unsubscribe_events',
-                partitions: 1,
-                replicationFactor: 1,
-            },
-            {
-                topic: 'connection_events',
-                partitions: 1,
-                replicationFactor: 1,
-            },
-            {
-                topic: 'update_events',
-                partitions: 1,
-                replicationFactor: 1,
-            },
-        ];
-
-        admin.createTopics(topicsToCreate, (err, result) => {
-            if (err) {
-                console.error('Error creating Kafka topics:', err);
-                reject(err);
-            } else {
-                console.log('Kafka topics created successfully:', result);
-                resolve();
-            }
-        });
+// Function to create Kafka topics (idempotent — kafkajs returns false if
+// the topic already exists, which is not an error)
+async function createKafkaTopics() {
+    const topicsToCreate = [
+        { topic: 'subscription_events', numPartitions: 1, replicationFactor: 1 },
+        { topic: 'unsubscribe_events',  numPartitions: 1, replicationFactor: 1 },
+        { topic: 'connection_events',   numPartitions: 1, replicationFactor: 1 },
+        { topic: 'update_events',       numPartitions: 1, replicationFactor: 1 },
+        { topic: 'dlq_events',          numPartitions: 1, replicationFactor: 1 },
+    ];
+    const created = await admin.createTopics({
+        topics: topicsToCreate,
+        waitForLeaders: true,
     });
+    console.log(`Kafka topics ready (created=${created}, idempotent)`);
 }
 
-// Run migrations and create Kafka topics before starting the server
+// Run migrations, connect Kafka, create topics, then start the HTTP server.
 let server;
 (async () => {
     try {
         await applyMigrations();
+        await admin.connect();
+        await producer.connect();
         await createKafkaTopics();
 
-        // Start the server after successful migrations and topic creation
         server = app.listen(PORT, () => {
             console.log(`Subscription Management Service listening on port ${PORT}`);
         });
     } catch (err) {
         console.error('Failed to start Subscription Management service:', err);
+        process.exit(1);
     }
 })();
 
-// Graceful shutdown
-function shutdown(signal) {
+// Graceful shutdown — close all clients in parallel, then exit. Use
+// allSettled so a failing close doesn't leave others hanging.
+async function shutdown(signal) {
     console.log(`Subscription management received ${signal}, shutting down gracefully...`);
-    if (server) {
-        server.close(() => {
-            console.log('HTTP server closed');
-            redisClient.quit().then(() => {
-                console.log('Redis client closed');
-                pool.end().then(() => {
-                    console.log('PostgreSQL pool closed');
-                    process.exit(0);
-                });
-            });
-        });
+    const forceExit = setTimeout(() => {
+        console.error('Shutdown timeout exceeded, forcing exit');
+        process.exit(1);
+    }, 10000);
+    try {
+        if (server) await new Promise((resolve) => server.close(resolve));
+        await Promise.allSettled([
+            producer.disconnect(),
+            admin.disconnect(),
+            redisClient.quit(),
+            pool.end(),
+        ]);
+    } catch (err) {
+        console.error('Error during shutdown:', err);
+    } finally {
+        clearTimeout(forceExit);
+        process.exit(0);
     }
-    // Force exit after 10 seconds
-    setTimeout(() => process.exit(1), 10000);
 }
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));

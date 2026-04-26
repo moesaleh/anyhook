@@ -1,60 +1,55 @@
-const { KafkaClient, Producer } = require('kafka-node');
+// Throughput benchmark: send N messages of size K, time it.
+// Run with: node src/test/kafka/stress-test-producer.js
+const { Kafka, CompressionTypes, logLevel } = require('kafkajs');
 const { performance } = require('perf_hooks');
 
-// Kafka client with increased maxRequestSize for handling larger messages
-const kafkaClient = new KafkaClient({
-  kafkaHost: 'localhost:9092',
-  requestTimeout: 600000,  // Optional, increase the request timeout (in ms)
+const kafka = new Kafka({
+    clientId: 'anyhook-stress-test',
+    brokers: (process.env.KAFKA_HOST || 'localhost:9092').split(',').map((s) => s.trim()),
+    logLevel: logLevel.WARN,
+    requestTimeout: 600000,
 });
 
-const producer = new Producer(kafkaClient, {
-  maxRequestSize: 209715200,  // 200 MB limit for requests
-});
+const producer = kafka.producer({ allowAutoTopicCreation: true });
 
 const topic = 'test-topic';
+const numberOfMessages = parseInt(process.env.STRESS_N, 10) || 10000;
+const messageSizeInKB = parseInt(process.env.STRESS_KB, 10) || 2;
+const batchSize = parseInt(process.env.STRESS_BATCH, 10) || 100;
 
-// Function to generate a large message for testing
 function createMessage(sizeInKB) {
-  return {
-    message: 'A'.repeat(sizeInKB * 1024),  // Fill the message with 'x' to simulate a large payload
-  };
+    return JSON.stringify({ message: 'A'.repeat(sizeInKB * 1024) });
 }
 
-// Number of messages to send and their size
-const numberOfMessages = 10000;
-const messageSizeInKB = 2;  // Size of each message in kilobytes
+(async () => {
+    try {
+        await producer.connect();
+        console.log(`Sending ${numberOfMessages} messages of ${messageSizeInKB}KB in batches of ${batchSize}...`);
 
-// Track start time for benchmarking
-let messagesSent = 0;
-const startTime = performance.now();
+        const startTime = performance.now();
 
-producer.on('ready', () => {
-  console.log('Kafka producer ready');
-
-  for (let i = 0; i < numberOfMessages; i++) {
-    const message = createMessage(messageSizeInKB);
-
-    const payloads = [
-      { topic, messages: JSON.stringify(message) },
-    ];
-
-    // Send the message
-    producer.send(payloads, (err) => {
-      if (err) {
-        console.error('Error sending to Kafka:', err);
-      } else {
-        messagesSent++;
-        if (messagesSent === numberOfMessages) {
-          const endTime = performance.now();
-          const duration = (endTime - startTime) / 1000;
-          console.log(`Sent ${numberOfMessages} messages in ${duration.toFixed(2)} seconds`);
-          console.log(`Average throughput: ${(numberOfMessages / duration).toFixed(2)} messages/second`);
+        // Batched sends — kafkajs handles batching internally per-broker but
+        // chunking the submit loop reduces JS event-loop pressure with large N.
+        for (let i = 0; i < numberOfMessages; i += batchSize) {
+            const messages = [];
+            for (let j = 0; j < batchSize && i + j < numberOfMessages; j++) {
+                messages.push({ value: createMessage(messageSizeInKB) });
+            }
+            await producer.send({
+                topic,
+                compression: CompressionTypes.None,
+                messages,
+            });
         }
-      }
-    });
-  }
-});
 
-producer.on('error', (err) => {
-  console.error('Kafka producer error:', err);
-});
+        const duration = (performance.now() - startTime) / 1000;
+        console.log(`Sent ${numberOfMessages} messages in ${duration.toFixed(2)}s`);
+        console.log(`Average throughput: ${(numberOfMessages / duration).toFixed(2)} messages/second`);
+        console.log(`Average bandwidth: ${((numberOfMessages * messageSizeInKB) / duration / 1024).toFixed(2)} MB/s`);
+    } catch (err) {
+        console.error('Stress test failed:', err);
+        process.exitCode = 1;
+    } finally {
+        await producer.disconnect();
+    }
+})();

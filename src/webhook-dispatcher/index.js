@@ -1,15 +1,24 @@
 require('dotenv').config({ path: './.env' });
-const { KafkaClient, Consumer, Producer } = require('kafka-node');
+process.env.KAFKAJS_NO_PARTITIONER_WARNING = '1';
+const { Kafka, logLevel } = require('kafkajs');
 const redis = require('@redis/client');
 const axios = require('axios');
 const { Pool } = require('pg');
 const { v4: uuidv4 } = require('uuid');
 const crypto = require('crypto');
 
-// Initialize Kafka, Redis, and PostgreSQL clients
-const kafkaClient = new KafkaClient({ kafkaHost: process.env.KAFKA_HOST });
-const consumer = new Consumer(kafkaClient, [{ topic: 'connection_events' }], { autoCommit: true });
-const producer = new Producer(kafkaClient);
+function parseBrokers(envValue) {
+    return (envValue || 'localhost:9092').split(',').map((s) => s.trim()).filter(Boolean);
+}
+
+// Initialize Kafka (kafkajs), Redis, and PostgreSQL clients
+const kafka = new Kafka({
+    clientId: 'webhook-dispatcher',
+    brokers: parseBrokers(process.env.KAFKA_HOST),
+    logLevel: logLevel.WARN,
+});
+const consumer = kafka.consumer({ groupId: 'webhook-dispatcher' });
+const producer = kafka.producer({ allowAutoTopicCreation: false });
 const redisClient = redis.createClient({ url: process.env.REDIS_URL });
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
@@ -18,20 +27,38 @@ const pool = new Pool({
     connectionTimeoutMillis: 5000,
 });
 
-// Connect to Redis + verify PostgreSQL, then recover any in-flight retries
-// that were scheduled with setTimeout in a previous process and lost on
-// restart. Without this, every restart silently drops every pending retry.
+// Connect Redis + PG, recover any in-flight retries lost on restart, then
+// connect Kafka producer/consumer and start consuming.
 redisClient.on('error', (err) => console.error('Redis Client Error', err));
 (async () => {
-    await redisClient.connect();
-    console.log('Webhook dispatcher: Redis client connected');
-
     try {
-        await pool.query('SELECT 1');
-        console.log('Webhook dispatcher: PostgreSQL connected');
-        await recoverPendingRetries();
+        await redisClient.connect();
+        console.log('Webhook dispatcher: Redis client connected');
+
+        try {
+            await pool.query('SELECT 1');
+            console.log('Webhook dispatcher: PostgreSQL connected');
+            await recoverPendingRetries();
+        } catch (err) {
+            console.error('Webhook dispatcher: PostgreSQL unavailable (recovery + delivery logging disabled):', err.message);
+        }
+
+        await producer.connect();
+        await consumer.connect();
+        await consumer.subscribe({ topics: ['connection_events'], fromBeginning: false });
+        await consumer.run({
+            eachMessage: async (payload) => {
+                try {
+                    await handleConnectionEvent(payload);
+                } catch (err) {
+                    console.error('Unhandled error in connection_events handler:', err);
+                }
+            },
+        });
+        console.log('Webhook dispatcher ready');
     } catch (err) {
-        console.error('Webhook dispatcher: PostgreSQL unavailable (recovery + delivery logging disabled):', err.message);
+        console.error('Failed to start webhook-dispatcher:', err);
+        process.exit(1);
     }
 })();
 
@@ -93,13 +120,17 @@ async function recordDelivery({
     }
 }
 
-// Handle messages from the 'connection_events' topic
-consumer.on('message', async (message) => {
-    console.log(`Received message from Kafka topic 'connection_events':`, message.value);
+// Handle a single message from 'connection_events'.
+async function handleConnectionEvent({ message }) {
+    const raw = message.value ? message.value.toString() : null;
+    if (!raw) {
+        console.error('Received empty message on connection_events, skipping');
+        return;
+    }
 
     let subscriptionId, data;
     try {
-        ({ subscriptionId, data } = JSON.parse(message.value));
+        ({ subscriptionId, data } = JSON.parse(raw));
     } catch (err) {
         console.error('Failed to parse Kafka message, skipping:', err.message);
         return;
@@ -133,7 +164,7 @@ consumer.on('message', async (message) => {
     } catch (error) {
         console.error(`Error processing message for subscription ID: ${subscriptionId}`, error);
     }
-});
+}
 
 /**
  * Compute the standard webhook signature header value.
@@ -274,20 +305,15 @@ async function sendToDLQ(subscriptionId, webhookUrl, data, eventId) {
         errorMessage: 'Max retries exceeded, moved to Dead Letter Queue',
     });
 
-    const payloads = [
-        {
+    try {
+        await producer.send({
             topic: 'dlq_events',
-            messages: JSON.stringify({ subscriptionId, webhookUrl, data }),
-        },
-    ];
-
-    producer.send(payloads, (err) => {
-        if (err) {
-            console.error('Error sending to Dead Letter Queue (DLQ)', err);
-        } else {
-            console.log(`Message sent to Dead Letter Queue (DLQ) for subscription ID: ${subscriptionId}`);
-        }
-    });
+            messages: [{ value: JSON.stringify({ subscriptionId, webhookUrl, data }) }],
+        });
+        console.log(`Message sent to Dead Letter Queue (DLQ) for subscription ID: ${subscriptionId}`);
+    } catch (err) {
+        console.error('Error sending to Dead Letter Queue (DLQ)', err);
+    }
 }
 
 /**
@@ -363,26 +389,26 @@ async function recoverPendingRetries() {
     }
 }
 
-// Error handling for Kafka consumer
-consumer.on('error', (err) => {
-    console.error('Error in Kafka Consumer:', err);
-});
-
-// Graceful shutdown
-function shutdown(signal) {
+// Graceful shutdown — disconnect kafkajs clients, close Redis + PG, exit.
+async function shutdown(signal) {
     console.log(`Webhook dispatcher received ${signal}, shutting down gracefully...`);
-    consumer.close(() => {
-        console.log('Kafka consumer closed');
-        redisClient.quit().then(() => {
-            console.log('Redis client closed');
-            pool.end().then(() => {
-                console.log('PostgreSQL pool closed');
-                process.exit(0);
-            });
-        });
-    });
-    // Force exit after 10 seconds
-    setTimeout(() => process.exit(1), 10000);
+    const forceExit = setTimeout(() => {
+        console.error('Shutdown timeout exceeded, forcing exit');
+        process.exit(1);
+    }, 10000);
+    try {
+        await Promise.allSettled([
+            consumer.disconnect(),
+            producer.disconnect(),
+            redisClient.quit(),
+            pool.end(),
+        ]);
+    } catch (err) {
+        console.error('Error during shutdown:', err);
+    } finally {
+        clearTimeout(forceExit);
+        process.exit(0);
+    }
 }
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));

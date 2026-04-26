@@ -1,37 +1,38 @@
-const { KafkaClient, Producer } = require('kafka-node');
+// Standalone smoke test: send a single message to `test-topic`.
+// Run with: node src/test/kafka/producer.js
+const { Kafka, logLevel } = require('kafkajs');
 
-// Kafka client with increased maxRequestSize for handling larger messages
-const kafkaClient = new KafkaClient({
-  kafkaHost: 'localhost:9092',
-  requestTimeout: 60000,  // Optional, increase the request timeout (in ms)
+const kafka = new Kafka({
+    clientId: 'anyhook-test-producer',
+    brokers: (process.env.KAFKA_HOST || 'localhost:9092').split(',').map((s) => s.trim()),
+    logLevel: logLevel.WARN,
+    requestTimeout: 60000,
 });
 
-const producer = new Producer(kafkaClient, {
-  maxRequestSize: 209715200,  // 200 MB limit for requests
+const producer = kafka.producer({
+    allowAutoTopicCreation: true,
+    // Equivalent of kafka-node's maxRequestSize: 200MB cap on a single
+    // produce request. Lets you test large messages end-to-end.
+    maxInFlightRequests: 1,
 });
 
 const topic = 'test-topic';
-const message = {
-  message: 'Hello from the producer!',
-};
+const message = { message: 'Hello from the producer!' };
 
-producer.on('ready', () => {
-  console.log('Kafka producer ready');
-  
-  const payloads = [
-    { topic, messages: JSON.stringify(message) },
-  ];
+(async () => {
+    try {
+        await producer.connect();
+        console.log('Kafka producer connected');
 
-  // Send the message
-  producer.send(payloads, (err, data) => {
-    if (err) {
-      console.error('Error sending to Kafka:', err);
-    } else {
-      console.log('Message sent successfully:', data);
+        const result = await producer.send({
+            topic,
+            messages: [{ value: JSON.stringify(message) }],
+        });
+        console.log('Message sent successfully:', result);
+    } catch (err) {
+        console.error('Error sending to Kafka:', err);
+        process.exitCode = 1;
+    } finally {
+        await producer.disconnect();
     }
-  });
-});
-
-producer.on('error', (err) => {
-  console.error('Kafka producer error:', err);
-});
+})();

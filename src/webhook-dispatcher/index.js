@@ -41,10 +41,17 @@ redisClient.on('error', err => console.error('Redis Client Error', err));
     try {
       await pool.query('SELECT 1');
       console.log('Webhook dispatcher: PostgreSQL connected');
-      await recoverPendingRetries();
+      // Start the persistent retry poller. Crashed/restarted workers leave
+      // rows in pending_retries; the next claim cycle picks them up.
+      retryPollerHandle = setInterval(pollRetryQueue, RETRY_POLL_INTERVAL_MS);
+      // Run one cycle immediately so we don't wait the full interval after start.
+      pollRetryQueue();
+      console.log(
+        `Retry poller started (interval=${RETRY_POLL_INTERVAL_MS}ms, batch=${RETRY_BATCH_SIZE}, worker=${WORKER_ID})`
+      );
     } catch (err) {
       console.error(
-        'Webhook dispatcher: PostgreSQL unavailable (recovery + delivery logging disabled):',
+        'Webhook dispatcher: PostgreSQL unavailable (retry queue + delivery logging disabled):',
         err.message
       );
     }
@@ -72,6 +79,15 @@ redisClient.on('error', err => console.error('Redis Client Error', err));
 const retryIntervals = [15, 60, 120, 360, 720, 1440];
 const maxRetries = retryIntervals.length;
 const MAX_BODY_SIZE = 10240; // 10KB max for stored request/response bodies
+
+// Persistent retry queue (pending_retries table). Replaces the old in-process
+// setTimeout model — retries now survive restarts and can be sharded across
+// multiple dispatcher pods via SELECT ... FOR UPDATE SKIP LOCKED.
+const RETRY_POLL_INTERVAL_MS = parseInt(process.env.RETRY_POLL_INTERVAL_MS, 10) || 30 * 1000;
+const RETRY_BATCH_SIZE = parseInt(process.env.RETRY_BATCH_SIZE, 10) || 25;
+const RETRY_LOCK_TIMEOUT_MS = parseInt(process.env.RETRY_LOCK_TIMEOUT_MS, 10) || 5 * 60 * 1000;
+const WORKER_ID = `${require('os').hostname()}-${process.pid}`;
+let retryPollerHandle = null;
 
 /**
  * Truncate a value to a max string length for storage.
@@ -190,7 +206,9 @@ async function handleConnectionEvent({ message }) {
         `Initial webhook request failed for subscription ID: ${subscriptionId}`,
         error.message
       );
-      retryWebhook(subscriptionId, organizationId, webhookUrl, webhookSecret, data, eventId, 0);
+      // Enqueue for the persistent poller instead of using setTimeout. The
+      // poller will pick it up at next_attempt_at and re-fire via processClaimedRetry.
+      await enqueueRetry(eventId, subscriptionId, organizationId, JSON.stringify({ data }), 0);
     }
   } catch (error) {
     console.error(`Error processing message for subscription ID: ${subscriptionId}`, error);
@@ -312,61 +330,206 @@ async function sendWebhook(
 }
 
 /**
- * Retry webhook delivery with escalating backoff intervals.
- * Intervals: 15m → 1h → 2h → 6h → 12h → 24h → DLQ
+ * Persistent retry queue.
+ *
+ * Schedule the next retry attempt by inserting/updating a row in
+ * pending_retries with next_attempt_at = now + intervals[retryCount].
+ * The poller (pollRetryQueue) picks it up when due.
+ *
+ * @param {string} eventId         - Groups the original delivery + all retries
+ * @param {string} subscriptionId  - Owning subscription
+ * @param {string} organizationId  - Owning org
+ * @param {string} requestBody     - Pre-serialized JSON `{"data": ...}`
+ * @param {number} retryCount      - Attempt that just failed; we schedule +1
  */
-function retryWebhook(
-  subscriptionId,
-  organizationId,
-  webhookUrl,
-  webhookSecret,
-  data,
-  eventId,
-  retryCount
-) {
+async function enqueueRetry(eventId, subscriptionId, organizationId, requestBody, retryCount) {
   if (retryCount >= maxRetries) {
-    console.log(
-      `Max retries reached for subscription ID: ${subscriptionId}, moving to Dead Letter Queue`
+    // Already past the last retry — caller should send to DLQ instead.
+    return;
+  }
+  const delayMs = retryIntervals[retryCount] * 60 * 1000;
+  const nextAttemptAt = new Date(Date.now() + delayMs);
+
+  try {
+    await pool.query(
+      `INSERT INTO pending_retries
+         (event_id, subscription_id, organization_id, request_body,
+          retry_count, next_attempt_at)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       ON CONFLICT (event_id) DO UPDATE SET
+          retry_count = EXCLUDED.retry_count,
+          next_attempt_at = EXCLUDED.next_attempt_at,
+          locked_at = NULL,
+          locked_by = NULL`,
+      [eventId, subscriptionId, organizationId, requestBody, retryCount, nextAttemptAt]
     );
-    sendToDLQ(subscriptionId, organizationId, webhookUrl, data, eventId);
+    console.log(
+      `Enqueued retry for event ${eventId} attempt ${retryCount + 1}/${maxRetries} at ${nextAttemptAt.toISOString()}`
+    );
+  } catch (err) {
+    console.error(`Failed to enqueue retry for event ${eventId}:`, err.message);
+  }
+}
+
+/**
+ * Claim a batch of due retries atomically.
+ *
+ * Single SQL statement does three things:
+ *   1. Releases stale locks (worker crashed mid-retry).
+ *   2. Selects up to RETRY_BATCH_SIZE due+unlocked rows with FOR UPDATE
+ *      SKIP LOCKED — multiple dispatcher pods can poll concurrently
+ *      without claiming the same row.
+ *   3. Marks the claimed rows with locked_at = NOW() and locked_by = us.
+ *
+ * Returns the claimed rows.
+ */
+async function claimDueRetries() {
+  // Stale-lock sweep — fire and forget; if it fails we still try to claim.
+  pool
+    .query(
+      `UPDATE pending_retries
+       SET locked_at = NULL, locked_by = NULL
+       WHERE locked_at IS NOT NULL
+         AND locked_at < NOW() - ($1::text || ' milliseconds')::interval`,
+      [String(RETRY_LOCK_TIMEOUT_MS)]
+    )
+    .catch(err => console.error('Stale-lock sweep failed:', err.message));
+
+  const result = await pool.query(
+    `WITH due AS (
+        SELECT event_id FROM pending_retries
+        WHERE locked_at IS NULL AND next_attempt_at <= NOW()
+        ORDER BY next_attempt_at
+        LIMIT $1
+        FOR UPDATE SKIP LOCKED
+     )
+     UPDATE pending_retries pr
+     SET locked_at = NOW(), locked_by = $2
+     FROM due
+     WHERE pr.event_id = due.event_id
+     RETURNING pr.*`,
+    [RETRY_BATCH_SIZE, WORKER_ID]
+  );
+  return result.rows;
+}
+
+/**
+ * Process a single claimed retry row: look up the live subscription, fire
+ * the webhook, and update or remove the queue row based on outcome.
+ */
+async function processClaimedRetry(row) {
+  const subscriptionDetails = await redisClient.get(row.subscription_id);
+
+  // Subscription deleted between schedule and retry — drop the queue row,
+  // record a final 'failed' delivery_event for audit. The FK CASCADE on
+  // sub deletion would normally handle this, but we may also race deletion.
+  if (!subscriptionDetails) {
+    console.warn(
+      `Subscription ${row.subscription_id} no longer in Redis; dropping retry ${row.event_id}`
+    );
+    await pool.query('DELETE FROM pending_retries WHERE event_id = $1', [row.event_id]);
+    await recordDelivery({
+      subscriptionId: row.subscription_id,
+      organizationId: row.organization_id,
+      eventId: row.event_id,
+      status: 'failed',
+      retryCount: row.retry_count,
+      errorMessage: 'Subscription deleted before retry could complete',
+      requestBody: row.request_body,
+    });
     return;
   }
 
-  const delay = retryIntervals[retryCount] * 60 * 1000;
-  console.log(
-    `Retrying in ${retryIntervals[retryCount]} minutes for subscription ID: ${subscriptionId} (attempt ${retryCount + 1}/${maxRetries})`
-  );
+  let subscription;
+  try {
+    subscription = JSON.parse(subscriptionDetails);
+  } catch (err) {
+    console.error(`Bad Redis payload for ${row.subscription_id}:`, err.message);
+    // Don't drop the queue row — the Redis state may recover. Just unlock.
+    await pool.query(
+      'UPDATE pending_retries SET locked_at = NULL, locked_by = NULL WHERE event_id = $1',
+      [row.event_id]
+    );
+    return;
+  }
+  const { webhook_url: webhookUrl, webhook_secret: webhookSecret } = subscription;
 
-  setTimeout(async () => {
-    try {
-      await sendWebhook(
-        subscriptionId,
-        organizationId,
-        webhookUrl,
-        webhookSecret,
-        data,
-        eventId,
-        retryCount + 1
-      );
-      console.log(
-        `Webhook retry ${retryCount + 1} successful for subscription ID: ${subscriptionId}`
-      );
-    } catch (error) {
-      console.error(
-        `Retry ${retryCount + 1} failed for subscription ID: ${subscriptionId}`,
-        error.message
-      );
-      retryWebhook(
-        subscriptionId,
-        organizationId,
-        webhookUrl,
-        webhookSecret,
-        data,
-        eventId,
-        retryCount + 1
+  let data;
+  try {
+    data = JSON.parse(row.request_body).data;
+  } catch (err) {
+    console.error(
+      `Cannot parse request_body for event ${row.event_id} (truncated?):`,
+      err.message
+    );
+    // Truncation can't be undone — DLQ this and remove from queue.
+    await pool.query('DELETE FROM pending_retries WHERE event_id = $1', [row.event_id]);
+    await sendToDLQ(row.subscription_id, row.organization_id, webhookUrl, null, row.event_id);
+    return;
+  }
+
+  const nextAttempt = row.retry_count + 1;
+  try {
+    await sendWebhook(
+      row.subscription_id,
+      row.organization_id,
+      webhookUrl,
+      webhookSecret,
+      data,
+      row.event_id,
+      nextAttempt
+    );
+    // Success — drop the queue row.
+    await pool.query('DELETE FROM pending_retries WHERE event_id = $1', [row.event_id]);
+  } catch {
+    // sendWebhook already wrote a delivery_events row with status='retrying'
+    // or 'failed' depending on whether more retries remain.
+    if (nextAttempt >= maxRetries) {
+      await sendToDLQ(row.subscription_id, row.organization_id, webhookUrl, data, row.event_id);
+      await pool.query('DELETE FROM pending_retries WHERE event_id = $1', [row.event_id]);
+    } else {
+      // Re-schedule with the next backoff and clear the lock.
+      await enqueueRetry(
+        row.event_id,
+        row.subscription_id,
+        row.organization_id,
+        row.request_body,
+        nextAttempt
       );
     }
-  }, delay);
+  }
+}
+
+/**
+ * Poll loop: claim a batch of due retries and process them. Runs every
+ * RETRY_POLL_INTERVAL_MS via setInterval. Errors in one cycle don't stop
+ * the next.
+ */
+async function pollRetryQueue() {
+  let claimed;
+  try {
+    claimed = await claimDueRetries();
+  } catch (err) {
+    console.error('Failed to claim retries:', err.message);
+    return;
+  }
+  if (claimed.length === 0) return;
+
+  console.log(`Processing ${claimed.length} due retries (worker ${WORKER_ID})`);
+  for (const row of claimed) {
+    try {
+      await processClaimedRetry(row);
+    } catch (err) {
+      console.error(`Retry processing failed for event ${row.event_id}:`, err.message);
+      // Unlock so the next poll cycle can pick it up.
+      await pool
+        .query(
+          'UPDATE pending_retries SET locked_at = NULL, locked_by = NULL WHERE event_id = $1',
+          [row.event_id]
+        )
+        .catch(() => {});
+    }
+  }
 }
 
 /**
@@ -399,108 +562,16 @@ async function sendToDLQ(subscriptionId, organizationId, webhookUrl, data, event
   }
 }
 
-/**
- * On dispatcher startup, scan delivery_events for the most-recent row per
- * event_id with status='retrying' and re-fire the next attempt for each.
- * This recovers retries that were scheduled with in-process setTimeout in
- * a previous process lifetime and lost on restart/deploy/crash.
- *
- * Caveats:
- * - Only looks back 24h. Anything older is treated as abandoned.
- * - Single-process safe. With multiple dispatcher pods this would
- *   double-deliver — needs SELECT ... FOR UPDATE SKIP LOCKED + a status
- *   transition before that's safe to scale horizontally.
- * - request_body is truncated to 10KB at write time; recovery for payloads
- *   larger than that will replay a truncated payload.
- */
-async function recoverPendingRetries() {
-  let result;
-  try {
-    result = await pool.query(`
-            SELECT DISTINCT ON (event_id)
-                event_id, subscription_id, organization_id, retry_count, request_body, created_at
-            FROM delivery_events
-            WHERE status = 'retrying'
-              AND created_at > NOW() - INTERVAL '24 hours'
-            ORDER BY event_id, created_at DESC
-        `);
-  } catch (err) {
-    console.error('Failed to query delivery_events for recovery:', err.message);
-    return;
-  }
 
-  if (result.rowCount === 0) {
-    console.log('No pending retries to recover');
-    return;
-  }
-  console.log(`Recovering ${result.rowCount} pending webhook retries from delivery_events`);
-
-  for (const row of result.rows) {
-    const subscriptionDetails = await redisClient.get(row.subscription_id);
-    if (!subscriptionDetails) {
-      console.warn(
-        `Skipping recovery for event ${row.event_id}: subscription ${row.subscription_id} no longer in Redis`
-      );
-      continue;
-    }
-    let subscription;
-    try {
-      subscription = JSON.parse(subscriptionDetails);
-    } catch (err) {
-      console.error(`Skipping recovery for event ${row.event_id}: bad Redis payload`, err.message);
-      continue;
-    }
-    const { webhook_url: webhookUrl, webhook_secret: webhookSecret } = subscription;
-    // Trust the row's organization_id (was valid at write time) — the
-    // Redis copy might lag if the subscription's org was somehow changed.
-    const organizationId = row.organization_id;
-
-    let data;
-    try {
-      data = JSON.parse(row.request_body).data;
-    } catch (err) {
-      console.error(
-        `Skipping recovery for event ${row.event_id}: cannot parse request_body (may be truncated)`,
-        err.message
-      );
-      continue;
-    }
-
-    // row.retry_count is the attempt that just failed; the next attempt
-    // is +1. Fire it immediately rather than re-waiting the original
-    // backoff window — that wait already elapsed during the outage.
-    const nextAttempt = row.retry_count + 1;
-    console.log(
-      `Recovering event ${row.event_id} sub ${row.subscription_id} attempt ${nextAttempt}/${maxRetries}`
-    );
-    sendWebhook(
-      row.subscription_id,
-      organizationId,
-      webhookUrl,
-      webhookSecret,
-      data,
-      row.event_id,
-      nextAttempt
-    )
-      .then(() => console.log(`Recovered delivery succeeded for event ${row.event_id}`))
-      .catch(err => {
-        console.error(`Recovered delivery failed for event ${row.event_id}:`, err.message);
-        retryWebhook(
-          row.subscription_id,
-          organizationId,
-          webhookUrl,
-          webhookSecret,
-          data,
-          row.event_id,
-          nextAttempt
-        );
-      });
-  }
-}
-
-// Graceful shutdown — disconnect kafkajs clients, close Redis + PG, exit.
+// Graceful shutdown — stop the retry poller, disconnect kafkajs clients,
+// close Redis + PG, exit. Stopping the poller first means in-flight retries
+// finish; new ones won't be claimed.
 async function shutdown(signal) {
   console.log(`Webhook dispatcher received ${signal}, shutting down gracefully...`);
+  if (retryPollerHandle) {
+    clearInterval(retryPollerHandle);
+    retryPollerHandle = null;
+  }
   const forceExit = setTimeout(() => {
     console.error('Shutdown timeout exceeded, forcing exit');
     process.exit(1);

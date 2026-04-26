@@ -1,7 +1,70 @@
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:3001";
 
+// Default fetch options. credentials: "include" sends the session cookie
+// cross-origin (dashboard:3000 -> api:3001). Backend CORS sets
+// Access-Control-Allow-Credentials: true to allow this.
+const DEFAULT_FETCH_INIT: RequestInit = {
+  credentials: "include",
+  cache: "no-store",
+};
+
+async function apiFetch(path: string, init?: RequestInit): Promise<Response> {
+  return fetch(`${API_BASE}${path}`, {
+    ...DEFAULT_FETCH_INIT,
+    ...init,
+    headers: { ...(init?.headers || {}) },
+  });
+}
+
+// --- Auth + tenancy types ---
+
+export interface User {
+  id: string;
+  email: string;
+  name: string | null;
+}
+
+export interface Organization {
+  id: string;
+  name: string;
+  slug: string;
+  role?: "owner" | "admin" | "member";
+}
+
+export interface SessionResponse {
+  user: User | null;
+  organization: Organization | null;
+  organizations: Organization[];
+  via?: "cookie" | "api_key";
+}
+
+export interface OrganizationMember {
+  id: string;
+  email: string;
+  name: string | null;
+  role: "owner" | "admin" | "member";
+  created_at: string;
+}
+
+export interface ApiKey {
+  id: string;
+  name: string;
+  key_prefix: string;
+  last_used_at: string | null;
+  expires_at: string | null;
+  revoked_at: string | null;
+  created_at: string;
+}
+
+export interface CreatedApiKey extends ApiKey {
+  // Raw key value, returned ONCE on creation only
+  key: string;
+  message: string;
+}
+
 export interface Subscription {
   subscription_id: string;
+  organization_id: string;
   connection_type: "graphql" | "websocket";
   args: {
     query?: string;
@@ -86,22 +149,178 @@ export interface GlobalDeliveryStats {
   deliveries_7d: number;
 }
 
+// --- Auth API ---
+
+export class AuthError extends Error {
+  status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "AuthError";
+    this.status = status;
+  }
+}
+
+function checkAuth(res: Response): void {
+  if (res.status === 401 || res.status === 403) {
+    throw new AuthError("Not authenticated", res.status);
+  }
+}
+
+export async function fetchMe(): Promise<SessionResponse> {
+  const res = await apiFetch("/auth/me");
+  checkAuth(res);
+  if (!res.ok) throw new Error("Failed to load session");
+  return res.json();
+}
+
+export async function login(
+  email: string,
+  password: string
+): Promise<SessionResponse> {
+  const res = await apiFetch("/auth/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password }),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || "Login failed");
+  }
+  return res.json();
+}
+
+export async function registerUser(data: {
+  email: string;
+  password: string;
+  name?: string;
+  organization_name?: string;
+}): Promise<SessionResponse> {
+  const res = await apiFetch("/auth/register", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || "Registration failed");
+  }
+  return res.json();
+}
+
+export async function logout(): Promise<void> {
+  await apiFetch("/auth/logout", { method: "POST" });
+}
+
+export async function switchOrganization(
+  organizationId: string
+): Promise<{ organization_id: string }> {
+  const res = await apiFetch("/auth/switch-org", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ organization_id: organizationId }),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || "Failed to switch organization");
+  }
+  return res.json();
+}
+
+export async function createOrganization(name: string): Promise<Organization> {
+  const res = await apiFetch("/organizations", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name }),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || "Failed to create organization");
+  }
+  return res.json();
+}
+
+export async function fetchOrgMembers(): Promise<OrganizationMember[]> {
+  const res = await apiFetch("/organizations/current/members");
+  checkAuth(res);
+  if (!res.ok) throw new Error("Failed to load members");
+  return res.json();
+}
+
+export async function addOrgMember(
+  email: string,
+  role: "owner" | "admin" | "member" = "member"
+): Promise<{ user_id: string; role: string }> {
+  const res = await apiFetch("/organizations/current/members", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, role }),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || "Failed to add member");
+  }
+  return res.json();
+}
+
+export async function removeOrgMember(userId: string): Promise<void> {
+  const res = await apiFetch(
+    `/organizations/current/members/${userId}`,
+    { method: "DELETE" }
+  );
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || "Failed to remove member");
+  }
+}
+
+export async function fetchApiKeys(): Promise<ApiKey[]> {
+  const res = await apiFetch("/organizations/current/api-keys");
+  checkAuth(res);
+  if (!res.ok) throw new Error("Failed to load API keys");
+  return res.json();
+}
+
+export async function createApiKey(data: {
+  name: string;
+  expires_in_days?: number;
+}): Promise<CreatedApiKey> {
+  const res = await apiFetch("/organizations/current/api-keys", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || "Failed to create API key");
+  }
+  return res.json();
+}
+
+export async function revokeApiKey(id: string): Promise<void> {
+  const res = await apiFetch(`/organizations/current/api-keys/${id}`, {
+    method: "DELETE",
+  });
+  if (!res.ok) throw new Error("Failed to revoke API key");
+}
+
+// --- Existing endpoints (now scoped to caller's org via cookie/api key) ---
+
 export async function fetchHealth(): Promise<HealthResponse> {
-  const res = await fetch(`${API_BASE}/health`, { cache: "no-store" });
+  const res = await apiFetch("/health");
   if (!res.ok) throw new Error("Health check failed");
   return res.json();
 }
 
 export async function fetchSubscriptions(): Promise<Subscription[]> {
-  const res = await fetch(`${API_BASE}/subscriptions`, { cache: "no-store" });
+  const res = await apiFetch("/subscriptions");
+  checkAuth(res);
   if (!res.ok) throw new Error("Failed to fetch subscriptions");
   return res.json();
 }
 
 export async function fetchSubscription(id: string): Promise<Subscription> {
-  const res = await fetch(`${API_BASE}/subscriptions/${id}`, {
-    cache: "no-store",
-  });
+  const res = await apiFetch(`/subscriptions/${id}`);
+  checkAuth(res);
   if (!res.ok) throw new Error("Subscription not found");
   return res.json();
 }
@@ -109,17 +328,15 @@ export async function fetchSubscription(id: string): Promise<Subscription> {
 export async function fetchSubscriptionStatus(
   id: string
 ): Promise<SubscriptionStatus> {
-  const res = await fetch(`${API_BASE}/subscriptions/${id}/status`, {
-    cache: "no-store",
-  });
+  const res = await apiFetch(`/subscriptions/${id}/status`);
+  checkAuth(res);
   if (!res.ok) throw new Error("Failed to fetch status");
   return res.json();
 }
 
 export async function fetchAllStatuses(): Promise<BulkStatusResponse> {
-  const res = await fetch(`${API_BASE}/subscriptions/status/all`, {
-    cache: "no-store",
-  });
+  const res = await apiFetch("/subscriptions/status/all");
+  checkAuth(res);
   if (!res.ok) throw new Error("Failed to fetch statuses");
   return res.json();
 }
@@ -135,29 +352,22 @@ export async function fetchDeliveries(
     limit: String(limit),
     status,
   });
-  const res = await fetch(
-    `${API_BASE}/subscriptions/${id}/deliveries?${params}`,
-    { cache: "no-store" }
-  );
+  const res = await apiFetch(`/subscriptions/${id}/deliveries?${params}`);
+  checkAuth(res);
   if (!res.ok) throw new Error("Failed to fetch deliveries");
   return res.json();
 }
 
-export async function fetchDeliveryStats(
-  id: string
-): Promise<DeliveryStats> {
-  const res = await fetch(
-    `${API_BASE}/subscriptions/${id}/deliveries/stats`,
-    { cache: "no-store" }
-  );
+export async function fetchDeliveryStats(id: string): Promise<DeliveryStats> {
+  const res = await apiFetch(`/subscriptions/${id}/deliveries/stats`);
+  checkAuth(res);
   if (!res.ok) throw new Error("Failed to fetch delivery stats");
   return res.json();
 }
 
 export async function fetchGlobalDeliveryStats(): Promise<GlobalDeliveryStats> {
-  const res = await fetch(`${API_BASE}/deliveries/stats`, {
-    cache: "no-store",
-  });
+  const res = await apiFetch("/deliveries/stats");
+  checkAuth(res);
   if (!res.ok) throw new Error("Failed to fetch global delivery stats");
   return res.json();
 }
@@ -175,12 +385,15 @@ export async function createSubscription(data: {
   args: Record<string, unknown>;
   webhook_url: string;
 }): Promise<CreateSubscriptionResponse> {
-  const res = await fetch(`${API_BASE}/subscribe`, {
+  const res = await apiFetch("/subscribe", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(data),
   });
-  if (!res.ok) throw new Error("Failed to create subscription");
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || "Failed to create subscription");
+  }
   return res.json();
 }
 
@@ -192,20 +405,26 @@ export async function updateSubscription(
     webhook_url: string;
   }
 ): Promise<Subscription> {
-  const res = await fetch(`${API_BASE}/subscriptions/${id}`, {
+  const res = await apiFetch(`/subscriptions/${id}`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(data),
   });
-  if (!res.ok) throw new Error("Failed to update subscription");
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || "Failed to update subscription");
+  }
   return res.json();
 }
 
 export async function deleteSubscription(id: string): Promise<void> {
-  const res = await fetch(`${API_BASE}/unsubscribe`, {
+  const res = await apiFetch("/unsubscribe", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ subscription_id: id }),
   });
-  if (!res.ok) throw new Error("Failed to delete subscription");
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || "Failed to delete subscription");
+  }
 }

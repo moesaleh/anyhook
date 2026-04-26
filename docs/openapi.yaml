@@ -1,0 +1,951 @@
+openapi: 3.1.0
+info:
+  title: AnyHook API
+  description: |
+    Subscription-proxy API — connects GraphQL/WebSocket sources to outbound
+    webhook URLs. All user-facing endpoints are scoped to the caller's
+    organization, resolved from the session cookie or `Authorization: Bearer`
+    API key.
+  version: 1.0.0
+  license:
+    name: MIT
+
+servers:
+  - url: http://localhost:3001
+    description: Local dev
+  - url: https://api.anyhook.example
+    description: Production (placeholder)
+
+# ---- Auth schemes ------------------------------------------------------------
+
+components:
+  securitySchemes:
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: anyhook_session
+      description: Set by /auth/login + /auth/register. JWT, httpOnly, 7-day expiry.
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: ak_<base64url(32)>
+      description: Long-lived API key. Created via /organizations/current/api-keys.
+    adminKey:
+      type: apiKey
+      in: header
+      name: X-Admin-Key
+      description: Super-admin shared secret (ADMIN_API_KEY env). Operational tools only.
+
+  # ---- Reusable schemas ------------------------------------------------------
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error: { type: string }
+
+    User:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        email: { type: string, format: email }
+        name: { type: string, nullable: true }
+
+    Organization:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        slug: { type: string }
+        role: { type: string, enum: [owner, admin, member] }
+
+    Member:
+      allOf:
+        - $ref: '#/components/schemas/User'
+        - type: object
+          properties:
+            role: { type: string, enum: [owner, admin, member] }
+            created_at: { type: string, format: date-time }
+
+    ApiKeyMetadata:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        key_prefix: { type: string, description: First 11 chars of the raw key (ak_ + 8) }
+        last_used_at: { type: string, format: date-time, nullable: true }
+        expires_at: { type: string, format: date-time, nullable: true }
+        revoked_at: { type: string, format: date-time, nullable: true }
+        created_at: { type: string, format: date-time }
+
+    CreatedApiKey:
+      allOf:
+        - $ref: '#/components/schemas/ApiKeyMetadata'
+        - type: object
+          properties:
+            key: { type: string, description: Raw key value, returned ONCE. }
+            message: { type: string }
+
+    Invitation:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        email: { type: string, format: email }
+        role: { type: string, enum: [owner, admin, member] }
+        expires_at: { type: string, format: date-time }
+        accepted_at: { type: string, format: date-time, nullable: true }
+        revoked_at: { type: string, format: date-time, nullable: true }
+        created_at: { type: string, format: date-time }
+
+    Subscription:
+      type: object
+      properties:
+        subscription_id: { type: string, format: uuid }
+        organization_id: { type: string, format: uuid }
+        connection_type: { type: string, enum: [graphql, websocket] }
+        args:
+          type: object
+          properties:
+            endpoint_url: { type: string, format: uri }
+            query: { type: string, description: GraphQL only }
+            message: { type: string, description: WebSocket initial message }
+            event_type: { type: string, description: WebSocket filter }
+            headers:
+              type: object
+              additionalProperties: { type: string }
+        webhook_url: { type: string, format: uri }
+        status: { type: string, enum: [active, inactive, error] }
+        created_at: { type: string, format: date-time }
+
+    DeliveryEvent:
+      type: object
+      properties:
+        delivery_id: { type: string, format: uuid }
+        subscription_id: { type: string, format: uuid }
+        event_id: { type: string, format: uuid, description: Groups original delivery + retries }
+        status: { type: string, enum: [success, failed, retrying, dlq] }
+        http_status_code: { type: integer, nullable: true }
+        response_time_ms: { type: integer, nullable: true }
+        payload_size_bytes: { type: integer, nullable: true }
+        request_body: { type: string, nullable: true }
+        response_body: { type: string, nullable: true }
+        retry_count: { type: integer }
+        error_message: { type: string, nullable: true }
+        created_at: { type: string, format: date-time }
+
+    Quota:
+      type: object
+      properties:
+        used: { type: integer }
+        limit: { type: integer }
+
+  # ---- Reusable responses ----------------------------------------------------
+  responses:
+    Unauthorized:
+      description: Missing / invalid credentials
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Forbidden:
+      description: Authenticated but not allowed
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: Resource not found (or not visible to caller's org)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    BadRequest:
+      description: Validation failed
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    RateLimited:
+      description: Rate limit or quota exceeded
+      headers:
+        X-RateLimit-Limit: { schema: { type: integer } }
+        X-RateLimit-Remaining: { schema: { type: integer } }
+        X-RateLimit-Reset: { schema: { type: integer } }
+        Retry-After: { schema: { type: integer } }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+# Default security: most endpoints accept either auth scheme.
+security:
+  - cookieAuth: []
+  - bearerAuth: []
+
+# ---- Paths -------------------------------------------------------------------
+
+paths:
+  # ---- Service ---------------------------------------------------------------
+  /health:
+    get:
+      summary: Liveness + dependency check
+      security: []
+      responses:
+        '200':
+          description: All dependencies up
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [ok, degraded] }
+                  timestamp: { type: string, format: date-time }
+                  services:
+                    type: object
+                    properties:
+                      postgres: { type: string, enum: [connected, disconnected] }
+                      redis: { type: string, enum: [connected, disconnected] }
+        '503': { description: Postgres or Redis unreachable }
+
+  /metrics:
+    get:
+      summary: Prometheus exposition (text format)
+      security: []
+      responses:
+        '200':
+          description: Prometheus metrics in text/plain
+          content:
+            text/plain: {}
+
+  # ---- Auth ------------------------------------------------------------------
+  /auth/register:
+    post:
+      tags: [Auth]
+      summary: Create user + first organization
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string, minLength: 8 }
+                name: { type: string }
+                organization_name: { type: string }
+      responses:
+        '201':
+          description: Created. Sets anyhook_session cookie.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user: { $ref: '#/components/schemas/User' }
+                  organization: { $ref: '#/components/schemas/Organization' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { description: Email already registered }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Sign in with email + password
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string }
+      responses:
+        '200':
+          description: Authenticated. Sets anyhook_session cookie.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user: { $ref: '#/components/schemas/User' }
+                  organization: { $ref: '#/components/schemas/Organization' }
+                  organizations:
+                    type: array
+                    items: { $ref: '#/components/schemas/Organization' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /auth/logout:
+    post:
+      tags: [Auth]
+      summary: Clear session cookie
+      security: []
+      responses:
+        '200': { description: Logged out }
+
+  /auth/me:
+    get:
+      tags: [Auth]
+      summary: Current user + active org + all memberships
+      responses:
+        '200':
+          description: Session context
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user: { $ref: '#/components/schemas/User', nullable: true }
+                  organization: { $ref: '#/components/schemas/Organization' }
+                  organizations:
+                    type: array
+                    items: { $ref: '#/components/schemas/Organization' }
+                  via: { type: string, enum: [cookie, api_key] }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /auth/switch-org:
+    post:
+      tags: [Auth]
+      summary: Switch the active organization (cookie sessions only)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [organization_id]
+              properties:
+                organization_id: { type: string, format: uuid }
+      responses:
+        '200':
+          description: New cookie issued
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /auth/password/change:
+    post:
+      tags: [Auth]
+      summary: Rotate password (requires current password; cookie sessions only)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [current_password, new_password]
+              properties:
+                current_password: { type: string }
+                new_password: { type: string, minLength: 8 }
+      responses:
+        '200': { description: Password changed }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /auth/password/reset-request:
+    post:
+      tags: [Auth]
+      summary: Generate a reset token for the given email (no leak)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string, format: email }
+      responses:
+        '200':
+          description: Always 200 — token field present iff email matched a real user
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { type: string }
+                  token: { type: string, description: Dev-only convenience; production should email this }
+                  expires_at: { type: string, format: date-time }
+
+  /auth/password/reset:
+    post:
+      tags: [Auth]
+      summary: Consume a reset token + set new password
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token, new_password]
+              properties:
+                token: { type: string }
+                new_password: { type: string, minLength: 8 }
+      responses:
+        '200': { description: Password reset }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { description: Unknown token }
+        '410': { description: Token revoked / used / expired }
+
+  /auth/accept-invite:
+    post:
+      tags: [Auth, Organizations]
+      summary: Redeem an invitation token + create a user
+      description: New users only. Existing users should be added via /organizations/current/members.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token, password]
+              properties:
+                token: { type: string, description: 'inv_<base64url>' }
+                password: { type: string, minLength: 8 }
+                name: { type: string }
+      responses:
+        '201':
+          description: Account created + signed in
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { description: Unknown token }
+        '409': { description: A user with the invite's email already exists }
+        '410': { description: Token revoked / used / expired }
+
+  # ---- Organizations ---------------------------------------------------------
+  /organizations:
+    post:
+      tags: [Organizations]
+      summary: Create a new organization (caller becomes owner)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Organization' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /organizations/current/quotas:
+    get:
+      tags: [Organizations]
+      summary: Current usage + effective limits for the active org
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  subscriptions: { $ref: '#/components/schemas/Quota' }
+                  api_keys: { $ref: '#/components/schemas/Quota' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /organizations/current/members:
+    get:
+      tags: [Organizations]
+      summary: List members of the active org
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Member' }
+    post:
+      tags: [Organizations]
+      summary: Add an existing user to the active org by email
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string, format: email }
+                role: { type: string, enum: [owner, admin, member], default: member }
+      responses:
+        '201': { description: Added }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { description: No user with that email }
+
+  /organizations/current/members/{userId}:
+    parameters:
+      - in: path
+        name: userId
+        required: true
+        schema: { type: string, format: uuid }
+    delete:
+      tags: [Organizations]
+      summary: Remove a member from the active org (owner/admin only)
+      responses:
+        '200': { description: Removed }
+        '400': { description: Cannot remove yourself }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /organizations/current/api-keys:
+    get:
+      tags: [API Keys]
+      summary: List the active org's API keys
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ApiKeyMetadata' }
+    post:
+      tags: [API Keys]
+      summary: Create a new API key (raw value returned ONCE)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+                expires_in_days: { type: integer }
+      responses:
+        '201':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CreatedApiKey' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /organizations/current/api-keys/{id}:
+    parameters:
+      - in: path
+        name: id
+        required: true
+        schema: { type: string, format: uuid }
+    delete:
+      tags: [API Keys]
+      summary: Revoke an API key (soft delete)
+      responses:
+        '200': { description: Revoked }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /organizations/current/invitations:
+    get:
+      tags: [Invitations]
+      summary: List the active org's invitations (no tokens)
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Invitation' }
+    post:
+      tags: [Invitations]
+      summary: Create an invitation (raw token returned ONCE)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string, format: email }
+                role: { type: string, enum: [owner, admin, member], default: member }
+                expires_in_days: { type: integer, default: 7 }
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Invitation'
+                  - type: object
+                    properties:
+                      token: { type: string }
+                      message: { type: string }
+
+  /organizations/current/invitations/{id}:
+    parameters:
+      - in: path
+        name: id
+        required: true
+        schema: { type: string, format: uuid }
+    delete:
+      tags: [Invitations]
+      summary: Revoke a pending invitation
+      responses:
+        '200': { description: Revoked }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /invitations/{token}:
+    parameters:
+      - in: path
+        name: token
+        required: true
+        schema: { type: string }
+    get:
+      tags: [Invitations]
+      summary: Anonymous lookup of an invitation (for the registration page)
+      security: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  email: { type: string, format: email }
+                  role: { type: string, enum: [owner, admin, member] }
+                  organization_name: { type: string }
+                  expires_at: { type: string, format: date-time }
+        '404': { description: Unknown token }
+        '410': { description: Revoked / used / expired }
+
+  # ---- Subscriptions ---------------------------------------------------------
+  /subscribe:
+    post:
+      tags: [Subscriptions]
+      summary: Create a subscription (returns webhook_secret ONCE)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [connection_type, args, webhook_url]
+              properties:
+                connection_type: { type: string, enum: [graphql, websocket] }
+                args:
+                  type: object
+                  properties:
+                    endpoint_url: { type: string, format: uri }
+                    query: { type: string }
+                    message: { type: string }
+                    event_type: { type: string }
+                    headers:
+                      type: object
+                      additionalProperties: { type: string }
+                webhook_url: { type: string, format: uri }
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  subscriptionId: { type: string, format: uuid }
+                  webhook_secret: { type: string, description: 64-char hex; HMAC key for X-AnyHook-Signature. Shown ONCE. }
+                  message: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '500': { description: Created in DB but Kafka publish failed; reconcile manually }
+
+  /unsubscribe:
+    post:
+      tags: [Subscriptions]
+      summary: Delete a subscription (org-scoped)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [subscription_id]
+              properties:
+                subscription_id: { type: string, format: uuid }
+      responses:
+        '200': { description: Unsubscribed }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /subscriptions:
+    get:
+      tags: [Subscriptions]
+      summary: List the active org's subscriptions (webhook_secret stripped)
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Subscription' }
+    delete:
+      tags: [Admin]
+      summary: Wipe ALL subscriptions across all orgs (super-admin only)
+      security:
+        - adminKey: []
+      responses:
+        '200': { description: All subscriptions deleted }
+        '503': { description: ADMIN_API_KEY not configured }
+        '403': { description: Wrong admin key }
+
+  /subscriptions/{id}:
+    parameters:
+      - in: path
+        name: id
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [Subscriptions]
+      summary: Get one subscription (404 if not in caller's org)
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Subscription' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      tags: [Subscriptions]
+      summary: Update a subscription (publishes update_events to Kafka)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [connection_type, args, webhook_url]
+              properties:
+                connection_type: { type: string, enum: [graphql, websocket] }
+                args: { type: object }
+                webhook_url: { type: string, format: uri }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Subscription' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /subscriptions/{id}/status:
+    parameters:
+      - in: path
+        name: id
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [Subscriptions]
+      summary: Live connection state (Redis cache presence + db status)
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  subscription_id: { type: string, format: uuid }
+                  db_status: { type: string }
+                  connected: { type: boolean }
+                  cached_at: { type: string, format: date-time, nullable: true }
+                  checked_at: { type: string, format: date-time }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /subscriptions/status/all:
+    get:
+      tags: [Subscriptions]
+      summary: Bulk live status for all org subscriptions
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  statuses:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        subscription_id: { type: string, format: uuid }
+                        db_status: { type: string }
+                        connected: { type: boolean }
+                  checked_at: { type: string, format: date-time }
+
+  /subscriptions/{id}/deliveries:
+    parameters:
+      - in: path
+        name: id
+        required: true
+        schema: { type: string, format: uuid }
+      - in: query
+        name: page
+        schema: { type: integer, default: 1 }
+      - in: query
+        name: limit
+        schema: { type: integer, default: 20, maximum: 100 }
+      - in: query
+        name: status
+        schema: { type: string, enum: [all, success, failed, retrying, dlq], default: all }
+    get:
+      tags: [Subscriptions, Deliveries]
+      summary: Delivery history for a subscription
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deliveries:
+                    type: array
+                    items: { $ref: '#/components/schemas/DeliveryEvent' }
+                  total: { type: integer }
+                  page: { type: integer }
+                  pages: { type: integer }
+
+  /subscriptions/{id}/deliveries/stats:
+    parameters:
+      - in: path
+        name: id
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [Subscriptions, Deliveries]
+      summary: Aggregated delivery stats for a subscription
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total_deliveries: { type: integer }
+                  successful: { type: integer }
+                  failed: { type: integer }
+                  retrying: { type: integer }
+                  dlq: { type: integer }
+                  success_rate: { type: number }
+                  avg_response_time_ms: { type: integer, nullable: true }
+                  last_delivery_at: { type: string, format: date-time, nullable: true }
+                  deliveries_24h: { type: integer }
+                  deliveries_7d: { type: integer }
+
+  /deliveries/stats:
+    get:
+      tags: [Deliveries]
+      summary: Org-wide aggregated delivery stats
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total_deliveries: { type: integer }
+                  successful: { type: integer }
+                  failed: { type: integer }
+                  success_rate: { type: number }
+                  avg_response_time_ms: { type: integer, nullable: true }
+                  deliveries_24h: { type: integer }
+                  deliveries_7d: { type: integer }
+
+  # ---- Admin (super-admin shared secret) -------------------------------------
+  /redis:
+    get:
+      tags: [Admin]
+      summary: Dump all keys (for debugging)
+      security: [{ adminKey: [] }]
+      responses:
+        '200': { description: Key→value map, JSON-decoded if possible }
+        '503': { description: ADMIN_API_KEY not configured }
+    post:
+      tags: [Admin]
+      summary: SET a key
+      security: [{ adminKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [key, value]
+              properties:
+                key: { type: string }
+                value: {}
+      responses:
+        '200': { description: Set }
+    delete:
+      tags: [Admin]
+      summary: FLUSHALL
+      security: [{ adminKey: [] }]
+      responses:
+        '200': { description: Cache flushed }
+
+  /redis/{key}:
+    parameters:
+      - in: path
+        name: key
+        required: true
+        schema: { type: string }
+    get:
+      tags: [Admin]
+      security: [{ adminKey: [] }]
+      summary: GET one key
+      responses:
+        '200': { description: Found }
+        '404': { description: Key not found }
+    delete:
+      tags: [Admin]
+      security: [{ adminKey: [] }]
+      summary: DEL one key
+      responses:
+        '200': { description: Deleted }
+        '404': { description: Key not found }
+
+  /redis/reload:
+    post:
+      tags: [Admin]
+      security: [{ adminKey: [] }]
+      summary: Reload subscription cache from Postgres
+      responses:
+        '200': { description: Reloaded }
+
+  /kafka/topics:
+    get:
+      tags: [Admin]
+      security: [{ adminKey: [] }]
+      summary: List Kafka topics
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  topics:
+                    type: array
+                    items: { type: string }
+
+  /kafka/topics/{topic}:
+    parameters:
+      - in: path
+        name: topic
+        required: true
+        schema: { type: string }
+    delete:
+      tags: [Admin]
+      security: [{ adminKey: [] }]
+      summary: Delete a Kafka topic
+      responses:
+        '200': { description: Deleted }
+
+tags:
+  - name: Auth
+  - name: Organizations
+  - name: API Keys
+  - name: Invitations
+  - name: Subscriptions
+  - name: Deliveries
+  - name: Admin

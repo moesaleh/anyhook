@@ -16,9 +16,20 @@ const cookieParser = require('cookie-parser');
 const promClient = require('prom-client');
 const { v4: uuidv4 } = require('uuid');
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 const { isValidUrl } = require('../lib/url-validation');
 const { makeSubscriptionQuotaCheck, makeApiKeyQuotaCheck } = require('../lib/quotas');
 const { mountAuthRoutes } = require('./auth');
+
+// Read OpenAPI spec at module load. Errors during read fall back to a
+// stub so the rest of the app still mounts (the spec is non-critical).
+let OPENAPI_YAML = null;
+try {
+  OPENAPI_YAML = fs.readFileSync(path.join(__dirname, '..', '..', 'docs', 'openapi.yaml'), 'utf-8');
+} catch {
+  OPENAPI_YAML = 'openapi: 3.1.0\ninfo: { title: AnyHook, version: 0.0.0 }\npaths: {}\n';
+}
 
 const VALID_CONNECTION_TYPES = ['graphql', 'websocket'];
 
@@ -167,6 +178,14 @@ function createApp({
       subscriptions: parseInt(process.env.ORG_MAX_SUBSCRIPTIONS, 10) || 100,
       apiKeys: parseInt(process.env.ORG_MAX_API_KEYS, 10) || 10,
     },
+  });
+
+  // OpenAPI spec — public, served as both YAML and JSON-from-YAML for
+  // tooling. Use any spec viewer (Swagger UI, Redoc, Stoplight, etc.)
+  // pointed at GET /openapi.yaml.
+  app.get('/openapi.yaml', (req, res) => {
+    res.setHeader('Content-Type', 'application/yaml');
+    res.send(OPENAPI_YAML);
   });
 
   // Prometheus scrape (no auth — only reachable on the API network).

@@ -11,6 +11,7 @@ const { v4: uuidv4 } = require('uuid');
 const crypto = require('crypto');
 const { createLogger } = require('../lib/logger');
 const { isValidUrl } = require('../lib/url-validation');
+const { makeRateLimit } = require('../lib/rate-limit');
 const { mountAuthRoutes } = require('./auth');
 
 const log = createLogger('subscription-management');
@@ -163,10 +164,20 @@ function requireAdminKey(req, res, next) {
   next();
 }
 
+// Per-org rate limit. Tunables via env, defaults to 600 req/min/org.
+// Applied AFTER requireAuth on every user-facing route so we count by
+// organization_id (cookie OR API key both resolve to one).
+const rateLimit = makeRateLimit({
+  redisClient,
+  limit: parseInt(process.env.RATE_LIMIT_REQUESTS, 10) || undefined,
+  windowSec: parseInt(process.env.RATE_LIMIT_WINDOW_SEC, 10) || undefined,
+  logger: log,
+});
+
 // Mount auth + tenancy routes (/auth/*, /organizations/*) and pull
 // requireAuth middleware so the subscription/delivery endpoints below
 // can scope to the caller's org.
-const { requireAuth } = mountAuthRoutes(app, { pool });
+const { requireAuth } = mountAuthRoutes(app, { pool, rateLimit });
 
 // Prometheus scrape endpoint (no auth — but only reachable on the API
 // network; if you expose port 3001 publicly you should put a /metrics
@@ -201,7 +212,7 @@ app.get('/health', async (req, res) => {
 });
 
 // Get subscription status (checks Redis cache for live connection state)
-app.get('/subscriptions/:id/status', requireAuth, async (req, res) => {
+app.get('/subscriptions/:id/status', requireAuth, rateLimit, async (req, res) => {
   const { id } = req.params;
   try {
     // Check PostgreSQL for the subscription record (status only — never the secret)
@@ -241,7 +252,7 @@ app.get('/subscriptions/:id/status', requireAuth, async (req, res) => {
 });
 
 // Get status for all subscriptions (bulk) — uses SCAN instead of KEYS
-app.get('/subscriptions/status/all', requireAuth, async (req, res) => {
+app.get('/subscriptions/status/all', requireAuth, rateLimit, async (req, res) => {
   try {
     const dbResult = await pool.query(
       'SELECT subscription_id, status FROM subscriptions WHERE organization_id = $1',
@@ -276,7 +287,7 @@ app.get('/subscriptions/status/all', requireAuth, async (req, res) => {
 });
 
 // Delivery Events: Get delivery history for a subscription (paginated, filterable)
-app.get('/subscriptions/:id/deliveries', requireAuth, async (req, res) => {
+app.get('/subscriptions/:id/deliveries', requireAuth, rateLimit, async (req, res) => {
   const { id } = req.params;
   const page = Math.max(1, parseInt(req.query.page) || 1);
   const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 20));
@@ -321,7 +332,7 @@ app.get('/subscriptions/:id/deliveries', requireAuth, async (req, res) => {
 });
 
 // Delivery Events: Get aggregated stats for a subscription
-app.get('/subscriptions/:id/deliveries/stats', requireAuth, async (req, res) => {
+app.get('/subscriptions/:id/deliveries/stats', requireAuth, rateLimit, async (req, res) => {
   const { id } = req.params;
 
   try {
@@ -365,7 +376,7 @@ app.get('/subscriptions/:id/deliveries/stats', requireAuth, async (req, res) => 
 });
 
 // Delivery Events: Get aggregated delivery stats for the active organization
-app.get('/deliveries/stats', requireAuth, async (req, res) => {
+app.get('/deliveries/stats', requireAuth, rateLimit, async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT
@@ -401,7 +412,7 @@ app.get('/deliveries/stats', requireAuth, async (req, res) => {
 });
 
 // PostgreSQL: Get all subscriptions for the active organization
-app.get('/subscriptions', requireAuth, async (req, res) => {
+app.get('/subscriptions', requireAuth, rateLimit, async (req, res) => {
   try {
     const result = await pool.query(
       'SELECT * FROM subscriptions WHERE organization_id = $1 ORDER BY created_at DESC',
@@ -435,7 +446,7 @@ app.delete('/subscriptions', requireAdminKey, async (req, res) => {
 });
 
 // PostgreSQL: Get subscription by ID (scoped to caller's org)
-app.get('/subscriptions/:id', requireAuth, async (req, res) => {
+app.get('/subscriptions/:id', requireAuth, rateLimit, async (req, res) => {
   const { id } = req.params;
   try {
     const result = await pool.query(
@@ -454,7 +465,7 @@ app.get('/subscriptions/:id', requireAuth, async (req, res) => {
 });
 
 // PostgreSQL: Update subscription (with validation, scoped to caller's org)
-app.put('/subscriptions/:id', requireAuth, async (req, res) => {
+app.put('/subscriptions/:id', requireAuth, rateLimit, async (req, res) => {
   const { id } = req.params;
   const validationErrors = validateSubscriptionInput(req.body);
   if (validationErrors.length > 0) {
@@ -497,7 +508,7 @@ app.put('/subscriptions/:id', requireAuth, async (req, res) => {
 });
 
 // PostgreSQL: Subscribe (Create Subscription, scoped to caller's org)
-app.post('/subscribe', requireAuth, async (req, res) => {
+app.post('/subscribe', requireAuth, rateLimit, async (req, res) => {
   const validationErrors = validateSubscriptionInput(req.body);
   if (validationErrors.length > 0) {
     return errorResponse(res, 400, validationErrors.join('; '));
@@ -575,7 +586,7 @@ app.post('/subscribe', requireAuth, async (req, res) => {
 });
 
 // PostgreSQL: Unsubscribe (Delete Subscription, scoped to caller's org)
-app.post('/unsubscribe', requireAuth, async (req, res) => {
+app.post('/unsubscribe', requireAuth, rateLimit, async (req, res) => {
   const { subscription_id } = req.body;
 
   if (!subscription_id || typeof subscription_id !== 'string') {

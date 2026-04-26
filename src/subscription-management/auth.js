@@ -133,8 +133,15 @@ function requireRole(...allowedRoles) {
 
 // --- Route mounting ---
 
-function mountAuthRoutes(app, { pool }) {
+// noopMiddleware is used when no rateLimit is provided (e.g. in tests).
+// Keeps every route definition shape identical: requireAuth, rateLimit, ...
+function noopMiddleware(req, res, next) {
+  next();
+}
+
+function mountAuthRoutes(app, { pool, rateLimit }) {
   const requireAuth = makeRequireAuth({ pool });
+  const rl = rateLimit || noopMiddleware;
 
   // POST /auth/register — create user; if no orgName given, create a default
   // org for them. Either way, the user becomes 'owner' of the org they end up in.
@@ -272,7 +279,7 @@ function mountAuthRoutes(app, { pool }) {
   });
 
   // GET /auth/me — full session context for the dashboard
-  app.get('/auth/me', requireAuth, async (req, res) => {
+  app.get('/auth/me', requireAuth, rl, async (req, res) => {
     if (req.auth.via === 'api_key') {
       // No user context for API-key calls; return org info only
       const orgResult = await pool.query('SELECT id, name, slug FROM organizations WHERE id = $1', [
@@ -312,7 +319,7 @@ function mountAuthRoutes(app, { pool }) {
   });
 
   // POST /auth/switch-org — change active organization (must be a member)
-  app.post('/auth/switch-org', requireAuth, async (req, res) => {
+  app.post('/auth/switch-org', requireAuth, rl, async (req, res) => {
     if (req.auth.via !== 'cookie') {
       return res.status(400).json({ error: 'API key sessions cannot switch org' });
     }
@@ -341,6 +348,7 @@ function mountAuthRoutes(app, { pool }) {
   app.post(
     '/organizations',
     requireAuth,
+    rl,
     requireRole('owner', 'admin', 'member'),
     async (req, res) => {
       if (req.auth.via !== 'cookie') {
@@ -385,7 +393,7 @@ function mountAuthRoutes(app, { pool }) {
   );
 
   // GET /organizations/current/members — list members of active org
-  app.get('/organizations/current/members', requireAuth, async (req, res) => {
+  app.get('/organizations/current/members', requireAuth, rl, async (req, res) => {
     try {
       const result = await pool.query(
         `SELECT u.id, u.email, u.name, m.role, m.created_at
@@ -408,6 +416,7 @@ function mountAuthRoutes(app, { pool }) {
   app.post(
     '/organizations/current/members',
     requireAuth,
+    rl,
     requireRole('owner', 'admin'),
     async (req, res) => {
       const { email, role } = req.body || {};
@@ -443,6 +452,7 @@ function mountAuthRoutes(app, { pool }) {
   app.delete(
     '/organizations/current/members/:userId',
     requireAuth,
+    rl,
     requireRole('owner', 'admin'),
     async (req, res) => {
       const { userId } = req.params;
@@ -467,7 +477,7 @@ function mountAuthRoutes(app, { pool }) {
   );
 
   // GET /organizations/current/api-keys — list keys for the active org
-  app.get('/organizations/current/api-keys', requireAuth, async (req, res) => {
+  app.get('/organizations/current/api-keys', requireAuth, rl, async (req, res) => {
     try {
       const result = await pool.query(
         `SELECT id, name, key_prefix, last_used_at, expires_at, revoked_at, created_at
@@ -487,6 +497,7 @@ function mountAuthRoutes(app, { pool }) {
   app.post(
     '/organizations/current/api-keys',
     requireAuth,
+    rl,
     requireRole('owner', 'admin'),
     async (req, res) => {
       const { name, expires_in_days: expiresInDays } = req.body || {};
@@ -523,6 +534,7 @@ function mountAuthRoutes(app, { pool }) {
   app.delete(
     '/organizations/current/api-keys/:id',
     requireAuth,
+    rl,
     requireRole('owner', 'admin'),
     async (req, res) => {
       try {

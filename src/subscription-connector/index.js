@@ -102,7 +102,7 @@ consumer.on('message', async (message) => {
             }
 
             // Delete subscription from Redis
-            redisClient.del(subscriptionId);
+            await redisClient.del(subscriptionId);
         } catch (err) {
             console.error('Error retrieving subscription from Redis', err);
         }
@@ -113,3 +113,20 @@ consumer.on('message', async (message) => {
 consumer.on('error', (err) => {
     console.error('Error in Kafka Consumer:', err);
 });
+
+// Graceful shutdown
+function shutdown(signal) {
+    console.log(`Subscription connector received ${signal}, shutting down gracefully...`);
+    consumer.close(() => {
+        console.log('Kafka consumer closed');
+        redisClient.quit().then(() => {
+            console.log('Redis client closed');
+            process.exit(0);
+        });
+    });
+    // Force exit after 10 seconds
+    setTimeout(() => process.exit(1), 10000);
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));

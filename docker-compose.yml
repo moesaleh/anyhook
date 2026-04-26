@@ -45,6 +45,21 @@ services:
     networks:
       - anyhook
 
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    container_name: anyhook-dashboard
+    restart: unless-stopped
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:3001
+    ports:
+      - "${DASHBOARD_PORT:-3000}:3000"
+    depends_on:
+      - subscription-management
+    networks:
+      - anyhook
+
   postgres:
     image: 'postgres:14.4'
     container_name: postgres

@@ -2,13 +2,38 @@ const WebSocket = require('ws');
 const BaseHandler = require('./baseHandler');
 
 class WebSocketHandler extends BaseHandler {
+    constructor(producer, redisClient) {
+        super(producer, redisClient);
+        this.wsClients = {}; // Track connections per subscription ID
+    }
+
     connect(subscription) {
         const { args, subscription_id } = subscription;
-        const { message, event_type, endpoint_url, headers } = args; // Include 'message' from args if provided
+        const { message, event_type, endpoint_url, headers } = args;
+
+        // Close existing connection for this subscription if any
+        if (this.wsClients[subscription_id]) {
+            try {
+                this.wsClients[subscription_id].close();
+            } catch (err) {
+                console.error(`Error closing existing WebSocket for subscription ID: ${subscription_id}`, err);
+            }
+            delete this.wsClients[subscription_id];
+        }
+
+        // Parse headers safely
+        let parsedHeaders = {};
+        if (headers) {
+            try {
+                parsedHeaders = typeof headers === 'object' ? headers : JSON.parse(headers);
+            } catch (err) {
+                console.error(`Failed to parse headers for subscription ID: ${subscription_id}`, err);
+            }
+        }
 
         // Create WebSocket client using ws
         const wsClient = new WebSocket(endpoint_url, {
-            headers: headers ? JSON.parse(headers) : {}
+            headers: parsedHeaders
         });
 
         wsClient.on('open', () => {
@@ -51,13 +76,14 @@ class WebSocketHandler extends BaseHandler {
             console.error(`WebSocket connection error for subscription ID: ${subscription_id}`, error);
         });
 
-        // Store WebSocket client instance for later disconnect if needed
-        this.wsClient = wsClient;
+        // Store WebSocket client instance per subscription ID for later disconnect
+        this.wsClients[subscription_id] = wsClient;
     }
 
     disconnect(subscriptionId) {
-        if (this.wsClient) {
-            this.wsClient.close();
+        if (this.wsClients[subscriptionId]) {
+            this.wsClients[subscriptionId].close();
+            delete this.wsClients[subscriptionId];
             console.log(`WebSocket connection closed for subscription ID: ${subscriptionId}`);
         }
     }

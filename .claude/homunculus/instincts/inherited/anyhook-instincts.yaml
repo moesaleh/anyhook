@@ -1,0 +1,509 @@
+# Instincts generated from https://github.com/moesaleh/anyhook
+# Generated: 2026-04-26T01:43:51.774Z
+# Version: 2.0
+# NOTE: This file supplements (does not replace) any existing curated instincts.
+# High-confidence manually curated instincts should be preserved alongside these.
+
+---
+id: anyhook-commit-length
+trigger: "when writing a commit message"
+confidence: 0.6
+domain: git
+source: repo-analysis
+source_repo: https://github.com/moesaleh/anyhook
+---
+
+# Anyhook Commit Length
+
+## Action
+
+Write moderate-length commit messages (~57 characters)
+
+## Evidence
+
+- Average commit message length: 57 chars
+- Based on 7 commits
+
+---
+id: anyhook-naming-files
+trigger: "when creating a new file"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/moesaleh/anyhook
+---
+
+# Anyhook Naming Files
+
+## Action
+
+Use camelCase naming convention
+
+## Evidence
+
+- Analyzed file naming patterns in repository
+- Dominant pattern: camelCase
+
+---
+id: anyhook-import-alias
+trigger: "when importing modules"
+confidence: 0.85
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/moesaleh/anyhook
+---
+
+# Anyhook Import Alias
+
+## Action
+
+Use path aliases (@/, ~/) instead of relative imports
+
+## Evidence
+
+- Import analysis shows alias pattern
+- Example: import { x } from '@/lib/x'
+
+---
+id: anyhook-export-style
+trigger: "when exporting from a module"
+confidence: 0.7
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/moesaleh/anyhook
+---
+
+# Anyhook Export Style
+
+## Action
+
+Prefer mixed exports
+
+## Evidence
+
+- Export pattern analysis
+- Dominant style: mixed
+
+---
+id: anyhook-arch-type-based
+trigger: "when adding new code"
+confidence: 0.8
+domain: architecture
+source: repo-analysis
+source_repo: https://github.com/moesaleh/anyhook
+---
+
+# Anyhook Arch Type Based
+
+## Action
+
+Place code in the appropriate type folder (components/, services/, utils/, etc.)
+
+## Evidence
+
+- Type-based module organization detected
+- Folders: subscription-connector, subscription-management, webhook-dispatcher
+
+---
+id: anyhook-test-separate
+trigger: "when writing tests"
+confidence: 0.8
+domain: testing
+source: repo-analysis
+source_repo: https://github.com/moesaleh/anyhook
+---
+
+# Anyhook Test Separate
+
+## Action
+
+Place tests in the tests/ or __tests__/ directory, mirroring src structure
+
+## Evidence
+
+- Separate test directory pattern detected
+- Tests live in dedicated test folders
+
+---
+id: anyhook-workflow-feature-development
+trigger: "when implementing a new feature"
+confidence: 0.9
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/moesaleh/anyhook
+---
+
+# Anyhook Workflow Feature Development
+
+## Action
+
+Follow the feature-development workflow:
+1. Add feature implementation
+2. Add tests for feature
+3. Update documentation
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~30x per month
+- Files: dashboard/*, dashboard/src/app/*, dashboard/src/app/subscriptions/[id]/*
+
+---
+id: anyhook-workflow-feature-development-with-dashboard-integration
+trigger: "when doing feature development with dashboard integration"
+confidence: 0.6
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/moesaleh/anyhook
+---
+
+# Anyhook Workflow Feature Development With Dashboard Integration
+
+## Action
+
+Follow the feature-development-with-dashboard-integration workflow:
+1. Create or update backend API endpoints in src/subscription-management/index.js (and sometimes src/webhook-dispatcher/index.js)
+2. Add or update frontend dashboard pages in dashboard/src/app/ (e.g., page.tsx, subscriptions/[id]/page.tsx, subscriptions/new/page.tsx)
+3. Add new or update existing React components in dashboard/src/components/
+4. Update dashboard/src/lib/api.ts for new API calls
+5. Update dashboard/src/lib/utils.ts if new utilities are needed
+6. Update docker-compose.yml or dashboard service config if needed
+7. Optionally update productfeatures.md to track feature status
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~2x per month
+- Files: dashboard/src/app/page.tsx, dashboard/src/app/subscriptions/[id]/page.tsx, dashboard/src/app/subscriptions/new/page.tsx
+
+---
+id: anyhook-workflow-database-table-addition-with-migration-and-api
+trigger: "when doing database table addition with migration and api"
+confidence: 0.55
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/moesaleh/anyhook
+---
+
+# Anyhook Workflow Database Table Addition With Migration And Api
+
+## Action
+
+Follow the database-table-addition-with-migration-and-api workflow:
+1. Create a new migration file in migrations/ (e.g., migrations/YYYYMMDD_create_table.sql)
+2. Update backend logic in src/subscription-management/index.js and/or src/webhook-dispatcher/index.js to use the new table
+3. Add or update API endpoints to expose the new data
+4. Update frontend dashboard components and pages to display or interact with the new data
+5. Update dashboard/src/lib/api.ts for new API calls
+6. Optionally update productfeatures.md to track feature status
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~1x per month
+- Files: migrations/*.sql, src/subscription-management/index.js, src/webhook-dispatcher/index.js
+
+---
+id: anyhook-workflow-comprehensive-bugfix-and-hardening-sweep
+trigger: "when doing comprehensive bugfix and hardening sweep"
+confidence: 0.55
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/moesaleh/anyhook
+---
+
+# Anyhook Workflow Comprehensive Bugfix And Hardening Sweep
+
+## Action
+
+Follow the comprehensive-bugfix-and-hardening-sweep workflow:
+1. Fix backend bugs and add input validation in src/subscription-management/index.js, src/webhook-dispatcher/index.js, and src/subscription-connector/handlers/
+2. Update frontend components for error handling, accessibility, and deduplication in dashboard/src/components/
+3. Update dashboard/src/lib/utils.ts for shared utilities
+4. Update .env.example for new or clarified environment variables
+5. Remove dead code and improve error responses
+6. Add graceful shutdown and connection pool limits
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~1x per month
+- Files: src/subscription-management/index.js, src/webhook-dispatcher/index.js, src/subscription-connector/handlers/*.js
+
+---
+id: anyhook-camelcase-files
+trigger: "When creating or renaming a file in the codebase"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: moesaleh/anyhook
+---
+
+# Anyhook Camelcase Files
+
+## Action
+
+Name the file using camelCase (e.g., subscriptionConnector.ts)
+
+## Evidence
+
+- Pattern in codeStyle.namingConventions.files
+- dashboard/src/app/subscriptions/new/page.tsx
+
+---
+id: anyhook-camelcase-functions
+trigger: "When defining a function"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: moesaleh/anyhook
+---
+
+# Anyhook Camelcase Functions
+
+## Action
+
+Name the function using camelCase (e.g., handleWebhookEvent)
+
+## Evidence
+
+- Pattern in codeStyle.namingConventions.functions
+- dashboard/src/lib/api.ts
+
+---
+id: anyhook-pascalcase-classes
+trigger: "When defining a class"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: moesaleh/anyhook
+---
+
+# Anyhook Pascalcase Classes
+
+## Action
+
+Name the class using PascalCase (e.g., SubscriptionManager)
+
+## Evidence
+
+- Pattern in codeStyle.namingConventions.classes
+
+---
+id: anyhook-screaming-constants
+trigger: "When defining a constant"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: moesaleh/anyhook
+---
+
+# Anyhook Screaming Constants
+
+## Action
+
+Name the constant using SCREAMING_SNAKE_CASE (e.g., MAX_RETRY_COUNT)
+
+## Evidence
+
+- Pattern in codeStyle.namingConventions.constants
+
+---
+id: anyhook-alias-imports
+trigger: "When importing modules"
+confidence: 0.7
+domain: code-style
+source: repo-analysis
+source_repo: moesaleh/anyhook
+---
+
+# Anyhook Alias Imports
+
+## Action
+
+Use import aliases instead of relative paths where possible
+
+## Evidence
+
+- Pattern in codeStyle.importStyle
+- dashboard/src/lib/api.ts
+
+---
+id: anyhook-mixed-exports
+trigger: "When exporting from a module"
+confidence: 0.7
+domain: code-style
+source: repo-analysis
+source_repo: moesaleh/anyhook
+---
+
+# Anyhook Mixed Exports
+
+## Action
+
+Use mixed export style (both named and default exports as appropriate)
+
+## Evidence
+
+- Pattern in codeStyle.exportStyle
+
+---
+id: anyhook-error-boundaries
+trigger: "When handling errors in frontend React components"
+confidence: 0.85
+domain: architecture
+source: repo-analysis
+source_repo: moesaleh/anyhook
+---
+
+# Anyhook Error Boundaries
+
+## Action
+
+Implement error boundaries to catch and display errors gracefully
+
+## Evidence
+
+- Pattern in errorHandling.errorBoundaries
+- dashboard/src/components/*.tsx
+
+---
+id: anyhook-test-location-separate
+trigger: "When adding tests for a feature"
+confidence: 0.7
+domain: testing
+source: repo-analysis
+source_repo: moesaleh/anyhook
+---
+
+# Anyhook Test Location Separate
+
+## Action
+
+Place test files in a separate test directory, not alongside source files
+
+## Evidence
+
+- Pattern in architecture.testLocation
+- feature-development workflow
+
+---
+id: anyhook-test-after-feature
+trigger: "When implementing a new feature"
+confidence: 0.8
+domain: testing
+source: repo-analysis
+source_repo: moesaleh/anyhook
+---
+
+# Anyhook Test After Feature
+
+## Action
+
+Add tests for the feature immediately after implementation
+
+## Evidence
+
+- feature-development.commitSequence
+- Add tests for feature follows Add feature implementation
+
+---
+id: anyhook-commit-freeform
+trigger: "When writing a commit message"
+confidence: 0.9
+domain: git
+source: repo-analysis
+source_repo: moesaleh/anyhook
+---
+
+# Anyhook Commit Freeform
+
+## Action
+
+Use a concise, freeform message describing the change (no strict prefix required)
+
+## Evidence
+
+- commits.type is freeform
+- Examples: Add subscription dashboard frontend with Next.js
+
+---
+id: anyhook-commit-length-brief
+trigger: "When writing a commit message"
+confidence: 0.7
+domain: git
+source: repo-analysis
+source_repo: moesaleh/anyhook
+---
+
+# Anyhook Commit Length Brief
+
+## Action
+
+Keep the commit message brief (average ~57 characters)
+
+## Evidence
+
+- commits.averageLength is 57
+- commit examples
+
+---
+id: anyhook-feature-dashboard-integration
+trigger: "When adding a significant new feature or capability to the subscription dashboard"
+confidence: 0.95
+domain: workflow
+source: repo-analysis
+source_repo: moesaleh/anyhook
+---
+
+# Anyhook Feature Dashboard Integration
+
+## Action
+
+Follow the workflow: update backend API, update frontend dashboard pages, add/update React components, update API utilities, update configs, and optionally update productfeatures.md
+
+## Evidence
+
+- feature-development-with-dashboard-integration workflow
+- commits: Add subscription dashboard frontend with Next.js, Add multi-step subscription creation wizard
+
+---
+id: anyhook-database-table-addition
+trigger: "When adding a new data entity or logging capability to the system"
+confidence: 0.9
+domain: workflow
+source: repo-analysis
+source_repo: moesaleh/anyhook
+---
+
+# Anyhook Database Table Addition
+
+## Action
+
+Create migration, update backend logic, expose new API endpoints, update frontend to use new data, update API utilities, and optionally update productfeatures.md
+
+## Evidence
+
+- database-table-addition-with-migration-and-api workflow
+- commits: Implement P1 Observability & Debugging: delivery logging, analytics, and inspection
+
+---
+id: anyhook-comprehensive-bugfix-sweep
+trigger: "When addressing multiple bugs, security issues, and code quality improvements in one pass"
+confidence: 0.85
+domain: workflow
+source: repo-analysis
+source_repo: moesaleh/anyhook
+---
+
+# Anyhook Comprehensive Bugfix Sweep
+
+## Action
+
+Fix backend bugs, add input validation, update frontend error handling and accessibility, update shared utilities, update environment docs, remove dead code, and improve error responses
+
+## Evidence
+
+- comprehensive-bugfix-and-hardening-sweep workflow
+- commit: Fix 32 audit issues across all layers (critical to low severity)
+

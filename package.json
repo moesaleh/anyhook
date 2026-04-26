@@ -9,6 +9,7 @@
     "lint": "eslint .",
     "format": "prettier --write .",
     "migrate": "node-pg-migrate up",
+    "kafka:alter-partitions": "node scripts/alter-kafka-partitions.js",
     "test": "jest",
     "test:watch": "jest --watch",
     "test:coverage": "jest --coverage"

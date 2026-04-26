@@ -1,0 +1,8 @@
+# Force LF line endings everywhere so cross-platform contributors don't
+# trigger CRLF/LF prettier diffs. Without this, files written on Windows
+# end up with CRLF in the index, which prettier (endOfLine: lf) rejects.
+* text=auto eol=lf
+
+# Lockfiles are generated; mark to suppress diff noise where supported
+package-lock.json linguist-generated=true
+dashboard/package-lock.json linguist-generated=true

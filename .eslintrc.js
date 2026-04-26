@@ -1,8 +1,5 @@
 module.exports = {
-  extends: [
-    'eslint:recommended',
-    'plugin:prettier/recommended',
-  ],
+  extends: ['eslint:recommended', 'plugin:prettier/recommended'],
   env: {
     node: true,
     es6: true,
@@ -16,5 +13,5 @@ module.exports = {
     'prettier/prettier': 'error',
     'no-unused-vars': ['error', { argsIgnorePattern: '^_' }],
   },
-  ignorePatterns: ['dist/', 'node_modules/', 'coverage/'],
-}; 
+  ignorePatterns: ['dist/', 'node_modules/', 'coverage/', 'dashboard/'],
+};

@@ -54,6 +54,7 @@ const admin = kafka.admin();
 
 const rateLimit = makeRateLimit({
   redisClient,
+  pool, // enables per-org override lookup against organizations.rate_limit_*
   limit: parseInt(process.env.RATE_LIMIT_REQUESTS, 10) || undefined,
   windowSec: parseInt(process.env.RATE_LIMIT_WINDOW_SEC, 10) || undefined,
   logger: log,

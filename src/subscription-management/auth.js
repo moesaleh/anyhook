@@ -487,24 +487,33 @@ function mountAuthRoutes(app, { pool, rateLimit, authRateLimit, apiKeyQuota, quo
     }
   );
 
-  // GET /organizations/current/quotas — current usage + limits for active org.
-  // Drives the dashboard's quota indicator. Lighter-weight than scraping
-  // X-Quota-* headers off every other endpoint.
+  // GET /organizations/current/quotas — current usage + EFFECTIVE limits
+  // (per-org override if set, else env default).
   app.get('/organizations/current/quotas', requireAuth, rl, async (req, res) => {
     try {
-      const [subResult, keyResult] = await Promise.all([
-        pool.query('SELECT COUNT(*)::int AS n FROM subscriptions WHERE organization_id = $1', [
-          req.auth.organizationId,
-        ]),
-        pool.query(
-          `SELECT COUNT(*)::int AS n FROM api_keys
-           WHERE organization_id = $1 AND revoked_at IS NULL`,
-          [req.auth.organizationId]
-        ),
-      ]);
+      const r = await pool.query(
+        `SELECT
+            (SELECT COUNT(*)::int FROM subscriptions
+             WHERE organization_id = $1) AS sub_used,
+            (SELECT COUNT(*)::int FROM api_keys
+             WHERE organization_id = $1 AND revoked_at IS NULL) AS key_used,
+            o.max_subscriptions, o.max_api_keys
+         FROM organizations o WHERE o.id = $1`,
+        [req.auth.organizationId]
+      );
+      if (r.rowCount === 0) {
+        return res.status(404).json({ error: 'Organization not found' });
+      }
+      const row = r.rows[0];
       res.status(200).json({
-        subscriptions: { used: subResult.rows[0].n, limit: limits.subscriptions },
-        api_keys: { used: keyResult.rows[0].n, limit: limits.apiKeys },
+        subscriptions: {
+          used: row.sub_used,
+          limit: row.max_subscriptions != null ? row.max_subscriptions : limits.subscriptions,
+        },
+        api_keys: {
+          used: row.key_used,
+          limit: row.max_api_keys != null ? row.max_api_keys : limits.apiKeys,
+        },
       });
     } catch (err) {
       log.error('Failed to load quotas:', err);

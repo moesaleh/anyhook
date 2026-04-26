@@ -5,18 +5,15 @@
  * org can't create unbounded subscriptions or API keys (and saturate the
  * connector's process / Redis / pending_retries queue).
  *
- * These factories are constructed once with a configured limit and used
- * as Express middleware before the relevant CREATE handler. They run a
- * single SELECT COUNT(*) scoped to req.auth.organizationId; on the
- * happy path that's a few microseconds against an indexed column.
+ * The effective limit is per-org override (organizations.max_subscriptions,
+ * .max_api_keys) if set, else the global env default. Both pieces are
+ * fetched in a single query with two scalar subselects.
  *
  * Behavior:
  *   - 429 with X-Quota-Limit / X-Quota-Used headers when at or over limit.
  *   - Fails OPEN on DB error: a transient pool failure shouldn't block
  *     legitimate writes; the underlying handler will likely fail too and
  *     surface the real error.
- *
- * Future: per-org overrides via an organizations.max_subscriptions column.
  */
 
 const DEFAULTS = {
@@ -30,18 +27,21 @@ function makeSubscriptionQuotaCheck({ pool, log, limit = DEFAULTS.subscriptions 
     if (!req.auth || !req.auth.organizationId) return next();
     try {
       const r = await pool.query(
-        'SELECT COUNT(*)::int AS n FROM subscriptions WHERE organization_id = $1',
+        `SELECT
+            (SELECT COUNT(*)::int FROM subscriptions WHERE organization_id = $1) AS used,
+            (SELECT max_subscriptions FROM organizations WHERE id = $1) AS override`,
         [req.auth.organizationId]
       );
-      const used = r.rows[0].n;
-      res.setHeader('X-Quota-Limit', String(limit));
+      const used = r.rows[0].used;
+      const effectiveLimit = r.rows[0].override != null ? r.rows[0].override : limit;
+      res.setHeader('X-Quota-Limit', String(effectiveLimit));
       res.setHeader('X-Quota-Used', String(used));
-      if (used >= limit) {
+      if (used >= effectiveLimit) {
         return res.status(429).json({
           error: 'Subscription quota exceeded for organization',
           quota: 'subscriptions',
           used,
-          limit,
+          limit: effectiveLimit,
         });
       }
       return next();
@@ -57,22 +57,23 @@ function makeApiKeyQuotaCheck({ pool, log, limit = DEFAULTS.apiKeys } = {}) {
   return async function apiKeyQuota(req, res, next) {
     if (!req.auth || !req.auth.organizationId) return next();
     try {
-      // Only count active (not revoked) keys against the cap. Revoked keys
-      // are tombstones for audit; they shouldn't block new key creation.
       const r = await pool.query(
-        `SELECT COUNT(*)::int AS n FROM api_keys
-         WHERE organization_id = $1 AND revoked_at IS NULL`,
+        `SELECT
+            (SELECT COUNT(*)::int FROM api_keys
+             WHERE organization_id = $1 AND revoked_at IS NULL) AS used,
+            (SELECT max_api_keys FROM organizations WHERE id = $1) AS override`,
         [req.auth.organizationId]
       );
-      const used = r.rows[0].n;
-      res.setHeader('X-Quota-Limit', String(limit));
+      const used = r.rows[0].used;
+      const effectiveLimit = r.rows[0].override != null ? r.rows[0].override : limit;
+      res.setHeader('X-Quota-Limit', String(effectiveLimit));
       res.setHeader('X-Quota-Used', String(used));
-      if (used >= limit) {
+      if (used >= effectiveLimit) {
         return res.status(429).json({
           error: 'API key quota exceeded for organization',
           quota: 'api_keys',
           used,
-          limit,
+          limit: effectiveLimit,
         });
       }
       return next();

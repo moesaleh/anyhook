@@ -6,17 +6,18 @@
  * (per-org limit on authenticated routes), but can be ipKeyFn for
  * anonymous endpoints like login/register, or any other extractor.
  *
+ * Per-org overrides: when readOrgOverride is provided, the middleware
+ * looks up organizations.rate_limit_requests / rate_limit_window_sec for
+ * the active org (via req.auth.organizationId) and uses those instead of
+ * the constructor's defaults. NULL columns fall through to the defaults.
+ * Override lookup is best-effort: any DB error falls back to the default
+ * silently (no security cost — the default IS the limit).
+ *
  * Behavior:
  *   - keyFn returning a falsy value => skip (no key context, defer to next).
  *   - Sets standard X-RateLimit-Limit / -Remaining / -Reset headers.
  *   - On Redis failure: fails OPEN. A Redis blip should not block legit
  *     traffic; we'd rather over-serve than under-serve.
- *
- * Apply in the route chain at the right point:
- *   - For authenticated org-scoped routes:
- *       requireAuth, rateLimit (default keyFn reads req.auth.organizationId)
- *   - For anonymous routes (login/register):
- *       authRateLimit (keyFn = ipKeyFn)
  */
 
 const DEFAULTS = {
@@ -25,27 +26,10 @@ const DEFAULTS = {
   prefix: 'ratelimit',
 };
 
-/**
- * Default key extractor: per-organization. Falsy when there's no req.auth,
- * which causes the middleware to skip — that's the right behavior because
- * unauthenticated routes will be rejected by the auth layer instead.
- */
 function defaultKeyFn(req) {
   return req.auth && req.auth.organizationId;
 }
 
-/**
- * IP key extractor for anonymous endpoints.
- *
- * Honors the leftmost X-Forwarded-For when present (typical reverse-proxy
- * setup). Otherwise falls back to req.ip / req.connection.remoteAddress
- * / 'unknown'. Express's req.ip is only correct when `app.set('trust proxy',
- * ...)` is configured; otherwise prefer XFF directly.
- *
- * Returns a string (IP) or 'unknown' so the middleware never receives a
- * falsy key for an anonymous request — we DO want to count anonymous
- * traffic, even when we can't identify the source.
- */
 function ipKeyFn(req) {
   const xff = req.headers && req.headers['x-forwarded-for'];
   if (typeof xff === 'string' && xff.length > 0) {
@@ -58,7 +42,15 @@ function ipKeyFn(req) {
   return 'unknown';
 }
 
-function makeRateLimit({ redisClient, limit, windowSec, prefix, logger, keyFn } = {}) {
+function makeRateLimit({
+  redisClient,
+  limit,
+  windowSec,
+  prefix,
+  logger,
+  keyFn,
+  pool,
+} = {}) {
   if (!redisClient) {
     throw new Error('makeRateLimit: redisClient is required');
   }
@@ -71,42 +63,59 @@ function makeRateLimit({ redisClient, limit, windowSec, prefix, logger, keyFn } 
 
   return async function rateLimitMiddleware(req, res, next) {
     const subject = cfg.keyFn(req);
-    if (!subject) {
-      // No key context — defer to whatever runs after. Don't double-deny.
-      return next();
+    if (!subject) return next();
+
+    // Look up per-org override when (a) we have a pool, (b) the request
+    // resolved an organizationId (i.e. authenticated), and (c) we're using
+    // the default keyFn. ipKeyFn-based limits are pre-auth and don't have
+    // an org to override against.
+    let effectiveLimit = cfg.limit;
+    let effectiveWindow = cfg.windowSec;
+    if (pool && req.auth && req.auth.organizationId && cfg.keyFn === defaultKeyFn) {
+      try {
+        const r = await pool.query(
+          'SELECT rate_limit_requests, rate_limit_window_sec FROM organizations WHERE id = $1',
+          [req.auth.organizationId]
+        );
+        if (r.rowCount > 0) {
+          const row = r.rows[0];
+          if (row.rate_limit_requests != null) effectiveLimit = row.rate_limit_requests;
+          if (row.rate_limit_window_sec != null) effectiveWindow = row.rate_limit_window_sec;
+        }
+      } catch (err) {
+        // Silent fallback to defaults — DB blip shouldn't break rate limit
+        if (logger) logger.warn('Rate limit override lookup failed', { err: err.message });
+      }
     }
 
     const nowSec = Math.floor(Date.now() / 1000);
-    const bucket = Math.floor(nowSec / cfg.windowSec);
+    const bucket = Math.floor(nowSec / effectiveWindow);
     const key = `${cfg.prefix}:${subject}:${bucket}`;
-    const resetAt = (bucket + 1) * cfg.windowSec;
+    const resetAt = (bucket + 1) * effectiveWindow;
 
     let count;
     try {
       count = await redisClient.incr(key);
       if (count === 1) {
-        // 2x window so the key sticks around briefly past the bucket boundary
-        // for debugging — Redis cleans it up naturally.
-        await redisClient.expire(key, cfg.windowSec * 2);
+        await redisClient.expire(key, effectiveWindow * 2);
       }
     } catch (err) {
-      // Fail OPEN on Redis failure. Surface the failure in logs/metrics.
       if (logger) {
         logger.error('Rate limit check failed (failing open)', { err: err.message, subject });
       }
       return next();
     }
 
-    res.setHeader('X-RateLimit-Limit', String(cfg.limit));
-    res.setHeader('X-RateLimit-Remaining', String(Math.max(0, cfg.limit - count)));
+    res.setHeader('X-RateLimit-Limit', String(effectiveLimit));
+    res.setHeader('X-RateLimit-Remaining', String(Math.max(0, effectiveLimit - count)));
     res.setHeader('X-RateLimit-Reset', String(resetAt));
 
-    if (count > cfg.limit) {
+    if (count > effectiveLimit) {
       res.setHeader('Retry-After', String(Math.max(0, resetAt - nowSec)));
       return res.status(429).json({
         error: 'Rate limit exceeded',
-        limit: cfg.limit,
-        windowSec: cfg.windowSec,
+        limit: effectiveLimit,
+        windowSec: effectiveWindow,
         retryAfter: Math.max(0, resetAt - nowSec),
       });
     }

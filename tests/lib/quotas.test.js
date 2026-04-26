@@ -4,10 +4,11 @@ const {
   DEFAULTS,
 } = require('../../src/lib/quotas');
 
-function mockPool(count) {
+function mockPool(count, override = null) {
   return {
     async query() {
-      return { rows: [{ n: count }] };
+      // Matches the new shape: subselects return `used` + `override`.
+      return { rows: [{ used: count, override }] };
     },
   };
 }
@@ -117,6 +118,27 @@ describe('makeSubscriptionQuotaCheck', () => {
     expect(logged.length).toBe(1);
     expect(logged[0].msg).toMatch(/Subscription quota check failed/);
   });
+
+  it('honors per-org override (overrides default limit)', async () => {
+    // Override = 2; default limit = 999. Expect block at 2.
+    const mw = makeSubscriptionQuotaCheck({ pool: mockPool(2, 2), limit: 999 });
+    const res = mockRes();
+    await mw(mockReq(), res, () => {});
+    expect(res.statusCode).toBe(429);
+    expect(res.jsonBody.limit).toBe(2);
+    expect(res.headers['X-Quota-Limit']).toBe('2');
+  });
+
+  it('falls back to default when override is null', async () => {
+    const mw = makeSubscriptionQuotaCheck({ pool: mockPool(0, null), limit: 5 });
+    const res = mockRes();
+    let nextCalled = false;
+    await mw(mockReq(), res, () => {
+      nextCalled = true;
+    });
+    expect(nextCalled).toBe(true);
+    expect(res.headers['X-Quota-Limit']).toBe('5');
+  });
 });
 
 describe('makeApiKeyQuotaCheck', () => {
@@ -167,5 +189,13 @@ describe('makeApiKeyQuotaCheck', () => {
     });
     expect(nextCalled).toBe(true);
     expect(res.statusCode).toBe(200);
+  });
+
+  it('honors per-org api_keys override', async () => {
+    const mw = makeApiKeyQuotaCheck({ pool: mockPool(1, 1), limit: 999 });
+    const res = mockRes();
+    await mw(mockReq(), res, () => {});
+    expect(res.statusCode).toBe(429);
+    expect(res.jsonBody.limit).toBe(1);
   });
 });

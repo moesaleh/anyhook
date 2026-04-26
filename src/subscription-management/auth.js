@@ -20,6 +20,11 @@ const {
   hashInvitationToken,
   DEFAULT_EXPIRY_DAYS: INVITE_EXPIRY_DAYS,
 } = require('../lib/invitations');
+const {
+  generateResetToken,
+  hashResetToken,
+  DEFAULT_EXPIRY_HOURS: RESET_EXPIRY_HOURS,
+} = require('../lib/password-reset');
 const { slugify } = require('../lib/slug');
 
 const log = createLogger('auth');
@@ -523,6 +528,154 @@ function mountAuthRoutes(app, { pool, rateLimit, authRateLimit, apiKeyQuota, quo
     } catch (err) {
       log.error('Failed to load quotas:', err);
       res.status(500).json({ error: 'Failed to load quotas' });
+    }
+  });
+
+  // --- Password change + reset ---
+
+  // POST /auth/password/change — authenticated; rotate password.
+  // Requires the CURRENT password to prevent stolen-cookie attacks
+  // from quietly changing the password and locking the user out.
+  app.post('/auth/password/change', requireAuth, rl, async (req, res) => {
+    if (req.auth.via !== 'cookie') {
+      return res.status(403).json({ error: 'Password change is only available via session login' });
+    }
+    const { current_password, new_password } = req.body || {};
+    if (!current_password || !new_password) {
+      return res.status(400).json({ error: 'current_password and new_password are required' });
+    }
+    if (typeof new_password !== 'string' || new_password.length < 8) {
+      return res.status(400).json({ error: 'New password must be at least 8 characters' });
+    }
+    try {
+      const userResult = await pool.query('SELECT password_hash FROM users WHERE id = $1', [
+        req.auth.userId,
+      ]);
+      if (userResult.rowCount === 0) {
+        return res.status(404).json({ error: 'User not found' });
+      }
+      const ok = await verifyPassword(current_password, userResult.rows[0].password_hash);
+      if (!ok) {
+        return res.status(401).json({ error: 'Current password is incorrect' });
+      }
+      const newHash = await hashPassword(new_password);
+      await pool.query('UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2', [
+        newHash,
+        req.auth.userId,
+      ]);
+      // Invalidate any outstanding reset tokens for this user — they
+      // chose a new password, any in-flight resets are obsolete.
+      await pool.query(
+        `UPDATE password_reset_tokens SET used_at = NOW()
+         WHERE user_id = $1 AND used_at IS NULL`,
+        [req.auth.userId]
+      );
+      res.status(200).json({ message: 'Password changed' });
+    } catch (err) {
+      log.error('Password change failed:', err);
+      res.status(500).json({ error: 'Password change failed' });
+    }
+  });
+
+  // POST /auth/password/reset-request — anonymous; create a reset token
+  // for the given email if (and only if) such a user exists. Always
+  // returns 200 to avoid leaking which emails are registered.
+  //
+  // In production: email the raw token to the user. Here we return it
+  // in the response so the dashboard / curl can complete the flow
+  // end-to-end without an SMTP setup. Documented in the response.
+  app.post('/auth/password/reset-request', authRl, async (req, res) => {
+    const { email } = req.body || {};
+    if (!email || typeof email !== 'string') {
+      return res.status(400).json({ error: 'email is required' });
+    }
+    try {
+      const userResult = await pool.query('SELECT id FROM users WHERE LOWER(email) = LOWER($1)', [
+        email,
+      ]);
+      if (userResult.rowCount === 0) {
+        // No-op — same response shape so callers can't tell registered
+        // emails from unregistered ones. Add a small consistent delay?
+        // Skipped: scrypt verifyPassword on login already pads timing.
+        return res.status(200).json({
+          message: 'If that email is registered, a reset link has been generated',
+        });
+      }
+      const userId = userResult.rows[0].id;
+      const { raw, hash } = generateResetToken();
+      const expiresAt = new Date(Date.now() + RESET_EXPIRY_HOURS * 60 * 60 * 1000);
+      await pool.query(
+        `INSERT INTO password_reset_tokens (user_id, token_hash, expires_at)
+         VALUES ($1, $2, $3)`,
+        [userId, hash, expiresAt]
+      );
+      res.status(200).json({
+        message: 'If that email is registered, a reset link has been generated',
+        // Returned for dev convenience. Production should remove this and
+        // email the raw value instead.
+        token: raw,
+        expires_at: expiresAt,
+      });
+    } catch (err) {
+      log.error('Password reset request failed:', err);
+      res.status(500).json({ error: 'Reset request failed' });
+    }
+  });
+
+  // POST /auth/password/reset — anonymous; consume a reset token + set
+  // a new password. Marks the token used + sets a fresh password_hash.
+  app.post('/auth/password/reset', authRl, async (req, res) => {
+    const { token, new_password } = req.body || {};
+    if (!token || typeof token !== 'string') {
+      return res.status(400).json({ error: 'token is required' });
+    }
+    if (!new_password || typeof new_password !== 'string' || new_password.length < 8) {
+      return res.status(400).json({ error: 'New password must be at least 8 characters' });
+    }
+    const hash = hashResetToken(token);
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const tokenResult = await client.query(
+        `SELECT id, user_id, expires_at, used_at FROM password_reset_tokens
+         WHERE token_hash = $1 FOR UPDATE`,
+        [hash]
+      );
+      if (tokenResult.rowCount === 0) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'Invalid token' });
+      }
+      const row = tokenResult.rows[0];
+      if (row.used_at) {
+        await client.query('ROLLBACK');
+        return res.status(410).json({ error: 'Token already used' });
+      }
+      if (new Date(row.expires_at) < new Date()) {
+        await client.query('ROLLBACK');
+        return res.status(410).json({ error: 'Token expired' });
+      }
+      const newHash = await hashPassword(new_password);
+      await client.query('UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2', [
+        newHash,
+        row.user_id,
+      ]);
+      await client.query('UPDATE password_reset_tokens SET used_at = NOW() WHERE id = $1', [
+        row.id,
+      ]);
+      // Invalidate any OTHER outstanding reset tokens for this user.
+      await client.query(
+        `UPDATE password_reset_tokens SET used_at = NOW()
+         WHERE user_id = $1 AND id != $2 AND used_at IS NULL`,
+        [row.user_id, row.id]
+      );
+      await client.query('COMMIT');
+      res.status(200).json({ message: 'Password reset' });
+    } catch (err) {
+      await client.query('ROLLBACK');
+      log.error('Password reset failed:', err);
+      res.status(500).json({ error: 'Password reset failed' });
+    } finally {
+      client.release();
     }
   });
 

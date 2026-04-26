@@ -573,7 +573,12 @@ async function sendToDLQ(subscriptionId, organizationId, webhookUrl, data, event
   try {
     await producer.send({
       topic: 'dlq_events',
-      messages: [{ value: JSON.stringify({ subscriptionId, organizationId, webhookUrl, data }) }],
+      messages: [
+        {
+          key: subscriptionId,
+          value: JSON.stringify({ subscriptionId, organizationId, webhookUrl, data }),
+        },
+      ],
     });
     log.info(`Message sent to Dead Letter Queue (DLQ) for subscription ID: ${subscriptionId}`);
     webhookDeliveries.inc({ status: 'dlq' });

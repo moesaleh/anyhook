@@ -25,10 +25,13 @@ class BaseHandler {
    * fails. Caller (handler subclass) shouldn't block on this.
    */
   raiseConnectionEvent(subscriptionId, data) {
+    // key=subscriptionId pins all events for one subscription to a single
+    // partition → same dispatcher pod handles them in order, preserving
+    // delivery sequence for any given source.
     this.producer
       .send({
         topic: 'connection_events',
-        messages: [{ value: JSON.stringify({ subscriptionId, data }) }],
+        messages: [{ key: subscriptionId, value: JSON.stringify({ subscriptionId, data }) }],
       })
       .catch(err => {
         log.error(`Error sending to connection_events topic for ${subscriptionId}`, err.message);

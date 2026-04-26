@@ -453,9 +453,11 @@ function createApp({
       }
       await redisClient.set(id, JSON.stringify(result.rows[0]));
       try {
+        // key=id so all events for this subscription land on the same
+        // partition → the same connector pod handles them in order.
         await producer.send({
           topic: 'update_events',
-          messages: [{ value: id }],
+          messages: [{ key: id, value: id }],
         });
       } catch (kafkaErr) {
         log.error(`[Update API] - Failed to publish update_events for ${id}`, kafkaErr);
@@ -498,7 +500,7 @@ function createApp({
       try {
         await producer.send({
           topic: 'subscription_events',
-          messages: [{ value: subscriptionId }],
+          messages: [{ key: subscriptionId, value: subscriptionId }],
         });
         log.info(
           `[Subscribe API] - Subscription published to Kafka. Subscription ID: ${subscriptionId}`
@@ -549,7 +551,7 @@ function createApp({
       try {
         await producer.send({
           topic: 'unsubscribe_events',
-          messages: [{ value: subscription_id }],
+          messages: [{ key: subscription_id, value: subscription_id }],
         });
       } catch (kafkaErr) {
         log.error(

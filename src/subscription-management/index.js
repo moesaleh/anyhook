@@ -112,18 +112,31 @@ function applyMigrations() {
 }
 
 async function createKafkaTopics() {
+  // numPartitions controls horizontal scaling. With N partitions, up to N
+  // connector / dispatcher pods can run in parallel — Kafka assigns each
+  // partition to exactly one consumer per group. Producers set
+  // key=subscriptionId so the same subscription always lands on the
+  // same partition (preserves event ordering for that sub).
+  //
+  // KAFKA_PARTITIONS env tunable — default 8. NOTE: increasing this for an
+  // existing topic requires `kafka-topics.sh --alter --partitions N`;
+  // createTopics is a no-op if the topic already exists.
+  const numPartitions = parseInt(process.env.KAFKA_PARTITIONS, 10) || 8;
+  const replicationFactor = parseInt(process.env.KAFKA_REPLICATION_FACTOR, 10) || 1;
   const topicsToCreate = [
-    { topic: 'subscription_events', numPartitions: 1, replicationFactor: 1 },
-    { topic: 'unsubscribe_events', numPartitions: 1, replicationFactor: 1 },
-    { topic: 'connection_events', numPartitions: 1, replicationFactor: 1 },
-    { topic: 'update_events', numPartitions: 1, replicationFactor: 1 },
-    { topic: 'dlq_events', numPartitions: 1, replicationFactor: 1 },
+    { topic: 'subscription_events', numPartitions, replicationFactor },
+    { topic: 'unsubscribe_events', numPartitions, replicationFactor },
+    { topic: 'connection_events', numPartitions, replicationFactor },
+    { topic: 'update_events', numPartitions, replicationFactor },
+    { topic: 'dlq_events', numPartitions, replicationFactor },
   ];
   const created = await admin.createTopics({
     topics: topicsToCreate,
     waitForLeaders: true,
   });
-  log.info(`Kafka topics ready (created=${created}, idempotent)`);
+  log.info(
+    `Kafka topics ready (created=${created}, partitions=${numPartitions}, replication=${replicationFactor})`
+  );
 }
 
 let server;

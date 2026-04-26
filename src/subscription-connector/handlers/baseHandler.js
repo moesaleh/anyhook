@@ -1,3 +1,7 @@
+const { createLogger } = require('../../lib/logger');
+
+const log = createLogger('connector-base');
+
 class BaseHandler {
   constructor(producer, redisClient) {
     this.producer = producer;
@@ -10,7 +14,7 @@ class BaseHandler {
   }
 
   disconnect(subscriptionId) {
-    console.log(`Disconnected subscription ${subscriptionId}`);
+    log.info(`Disconnected subscription ${subscriptionId}`);
   }
 
   /**
@@ -27,10 +31,7 @@ class BaseHandler {
         messages: [{ value: JSON.stringify({ subscriptionId, data }) }],
       })
       .catch(err => {
-        console.error(
-          `Error sending to connection_events topic for ${subscriptionId}`,
-          err.message
-        );
+        log.error(`Error sending to connection_events topic for ${subscriptionId}`, err.message);
       });
   }
 }

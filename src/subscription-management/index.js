@@ -5,10 +5,22 @@ const cookieParser = require('cookie-parser');
 const { Pool } = require('pg');
 const redis = require('@redis/client');
 const { Kafka, logLevel } = require('kafkajs');
+const promClient = require('prom-client');
 const { exec } = require('child_process'); // For running migrations
 const { v4: uuidv4 } = require('uuid');
 const crypto = require('crypto');
+const { createLogger } = require('../lib/logger');
 const { mountAuthRoutes } = require('./auth');
+
+const log = createLogger('subscription-management');
+promClient.collectDefaultMetrics();
+
+const httpRequestDuration = new promClient.Histogram({
+  name: 'http_request_duration_seconds',
+  help: 'HTTP request duration in seconds',
+  labelNames: ['method', 'route', 'status_code'],
+  buckets: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5],
+});
 
 function parseBrokers(envValue) {
   return (envValue || 'localhost:9092')
@@ -32,6 +44,21 @@ function withoutSecret(row) {
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 app.use(cookieParser());
+
+// HTTP request duration histogram. Records on response 'finish' so we
+// capture the actual latency including handler + DB time.
+app.use((req, res, next) => {
+  const start = process.hrtime.bigint();
+  res.on('finish', () => {
+    const seconds = Number(process.hrtime.bigint() - start) / 1e9;
+    const route = req.route?.path || req.path || 'unknown';
+    httpRequestDuration.observe(
+      { method: req.method, route, status_code: res.statusCode },
+      seconds
+    );
+  });
+  next();
+});
 
 // Enable CORS for the dashboard frontend. Credentials enabled so the
 // session cookie travels — Access-Control-Allow-Origin therefore CANNOT
@@ -66,11 +93,11 @@ const redisClient = redis.createClient({
 });
 
 // Connect Redis client
-redisClient.on('error', err => console.error('Redis Client Error', err));
+redisClient.on('error', err => log.error('Redis Client Error', err));
 
 (async () => {
   await redisClient.connect(); // Ensure Redis client is connected
-  console.log('Redis client connected');
+  log.info('Redis client connected');
 })();
 
 // Initialize Kafka client (kafkajs)
@@ -189,6 +216,18 @@ function requireAdminKey(req, res, next) {
 // can scope to the caller's org.
 const { requireAuth } = mountAuthRoutes(app, { pool });
 
+// Prometheus scrape endpoint (no auth — but only reachable on the API
+// network; if you expose port 3001 publicly you should put a /metrics
+// rewrite/deny in your reverse proxy).
+app.get('/metrics', async (req, res) => {
+  try {
+    res.setHeader('Content-Type', promClient.register.contentType);
+    res.end(await promClient.register.metrics());
+  } catch (err) {
+    res.status(500).end(String(err && err.message));
+  }
+});
+
 // Health check endpoint
 app.get('/health', async (req, res) => {
   const health = { status: 'ok', timestamp: new Date().toISOString(), services: {} };
@@ -244,7 +283,7 @@ app.get('/subscriptions/:id/status', requireAuth, async (req, res) => {
       checked_at: new Date().toISOString(),
     });
   } catch (err) {
-    console.error('Error checking subscription status:', err);
+    log.error('Error checking subscription status:', err);
     errorResponse(res, 500, 'Failed to check subscription status');
   }
 });
@@ -279,7 +318,7 @@ app.get('/subscriptions/status/all', requireAuth, async (req, res) => {
       checked_at: new Date().toISOString(),
     });
   } catch (err) {
-    console.error('Error checking statuses:', err);
+    log.error('Error checking statuses:', err);
     errorResponse(res, 500, 'Failed to check subscription statuses');
   }
 });
@@ -324,7 +363,7 @@ app.get('/subscriptions/:id/deliveries', requireAuth, async (req, res) => {
       pages: Math.ceil(total / limit),
     });
   } catch (err) {
-    console.error('Error fetching deliveries:', err);
+    log.error('Error fetching deliveries:', err);
     errorResponse(res, 500, 'Failed to fetch delivery history');
   }
 });
@@ -368,7 +407,7 @@ app.get('/subscriptions/:id/deliveries/stats', requireAuth, async (req, res) => 
       deliveries_7d: stats.deliveries_7d,
     });
   } catch (err) {
-    console.error('Error fetching delivery stats:', err);
+    log.error('Error fetching delivery stats:', err);
     errorResponse(res, 500, 'Failed to fetch delivery stats');
   }
 });
@@ -404,7 +443,7 @@ app.get('/deliveries/stats', requireAuth, async (req, res) => {
       deliveries_7d: stats.deliveries_7d,
     });
   } catch (err) {
-    console.error('Error fetching global delivery stats:', err);
+    log.error('Error fetching global delivery stats:', err);
     errorResponse(res, 500, 'Failed to fetch delivery stats');
   }
 });
@@ -418,7 +457,7 @@ app.get('/subscriptions', requireAuth, async (req, res) => {
     );
     res.status(200).json(result.rows.map(withoutSecret));
   } catch (err) {
-    console.error(err);
+    log.error(err);
     errorResponse(res, 500, 'Failed to retrieve subscriptions');
   }
 });
@@ -430,7 +469,7 @@ app.delete('/subscriptions', requireAdminKey, async (req, res) => {
     const result = await pool.query('DELETE FROM subscriptions RETURNING *');
 
     if (result.rowCount > 0) {
-      console.log(`All subscriptions deleted successfully. Deleted rows: ${result.rowCount}`);
+      log.info(`All subscriptions deleted successfully. Deleted rows: ${result.rowCount}`);
       res
         .status(200)
         .json({ message: 'All subscriptions deleted successfully', deleted: result.rowCount });
@@ -438,7 +477,7 @@ app.delete('/subscriptions', requireAdminKey, async (req, res) => {
       errorResponse(res, 404, 'No subscriptions found to delete');
     }
   } catch (err) {
-    console.error('Error deleting all subscriptions:', err);
+    log.error('Error deleting all subscriptions:', err);
     errorResponse(res, 500, 'Failed to delete subscriptions');
   }
 });
@@ -457,7 +496,7 @@ app.get('/subscriptions/:id', requireAuth, async (req, res) => {
       errorResponse(res, 404, 'Subscription not found');
     }
   } catch (err) {
-    console.error(err);
+    log.error(err);
     errorResponse(res, 500, 'Failed to retrieve subscription');
   }
 });
@@ -492,7 +531,7 @@ app.put('/subscriptions/:id', requireAuth, async (req, res) => {
           messages: [{ value: id }],
         });
       } catch (kafkaErr) {
-        console.error(`[Update API] - Failed to publish update_events for ${id}`, kafkaErr);
+        log.error(`[Update API] - Failed to publish update_events for ${id}`, kafkaErr);
       }
 
       res.status(200).json(withoutSecret(result.rows[0]));
@@ -500,7 +539,7 @@ app.put('/subscriptions/:id', requireAuth, async (req, res) => {
       errorResponse(res, 404, 'Subscription not found');
     }
   } catch (err) {
-    console.error(err);
+    log.error(err);
     errorResponse(res, 500, 'Failed to update subscription');
   }
 });
@@ -519,7 +558,7 @@ app.post('/subscribe', requireAuth, async (req, res) => {
   // column has NOT NULL, no default, so this must be provided.
   const webhookSecret = crypto.randomBytes(32).toString('hex');
 
-  console.log(
+  log.info(
     `[Subscribe API] - Incoming request to create subscription. Connection Type: ${connection_type}, Webhook URL: ${webhook_url}, Org: ${req.auth.organizationId}`
   );
 
@@ -538,16 +577,14 @@ app.post('/subscribe', requireAuth, async (req, res) => {
     ];
     const result = await pool.query(queryText, values);
 
-    console.log(
+    log.info(
       `[Subscribe API] - Subscription saved to PostgreSQL. Subscription ID: ${subscriptionId}`
     );
 
     // Save subscription to Redis (with secret — connector + dispatcher
     // need it). Never returned via the public GET endpoints.
     await redisClient.set(subscriptionId, JSON.stringify(result.rows[0]));
-    console.log(
-      `[Subscribe API] - Subscription saved to Redis. Subscription ID: ${subscriptionId}`
-    );
+    log.info(`[Subscribe API] - Subscription saved to Redis. Subscription ID: ${subscriptionId}`);
 
     // Publish subscription ID to Kafka. Awaited so we know the connector
     // will see it; if Kafka is down, we surface 500 rather than returning
@@ -557,11 +594,11 @@ app.post('/subscribe', requireAuth, async (req, res) => {
         topic: 'subscription_events',
         messages: [{ value: subscriptionId }],
       });
-      console.log(
+      log.info(
         `[Subscribe API] - Subscription published to Kafka. Subscription ID: ${subscriptionId}`
       );
     } catch (kafkaErr) {
-      console.error(
+      log.error(
         `[Subscribe API] - Failed to publish subscription_events for ${subscriptionId}`,
         kafkaErr
       );
@@ -580,7 +617,7 @@ app.post('/subscribe', requireAuth, async (req, res) => {
       message: 'Subscription created. Save webhook_secret — it is shown only once.',
     });
   } catch (err) {
-    console.error(`[Subscribe API] - Error creating subscription:`, err);
+    log.error(`[Subscribe API] - Error creating subscription:`, err);
     errorResponse(res, 500, 'Failed to create subscription');
   }
 });
@@ -593,7 +630,7 @@ app.post('/unsubscribe', requireAuth, async (req, res) => {
     return errorResponse(res, 400, 'subscription_id is required');
   }
 
-  console.log(
+  log.info(
     `[Unsubscribe API] - Incoming request to delete subscription. Subscription ID: ${subscription_id}, Org: ${req.auth.organizationId}`
   );
 
@@ -606,7 +643,7 @@ app.post('/unsubscribe', requireAuth, async (req, res) => {
     if (deleteResult.rowCount === 0) {
       return errorResponse(res, 404, 'Subscription not found');
     }
-    console.log(
+    log.info(
       `[Unsubscribe API] - Subscription deleted from PostgreSQL. Subscription ID: ${subscription_id}`
     );
 
@@ -619,7 +656,7 @@ app.post('/unsubscribe', requireAuth, async (req, res) => {
         messages: [{ value: subscription_id }],
       });
     } catch (kafkaErr) {
-      console.error(
+      log.error(
         `[Unsubscribe API] - Failed to publish unsubscribe_events for ${subscription_id}`,
         kafkaErr
       );
@@ -627,7 +664,7 @@ app.post('/unsubscribe', requireAuth, async (req, res) => {
 
     res.status(200).json({ message: 'Unsubscribed successfully' });
   } catch (err) {
-    console.error(`[Unsubscribe API] - Error deleting subscription:`, err);
+    log.error(`[Unsubscribe API] - Error deleting subscription:`, err);
     errorResponse(res, 500, 'Failed to unsubscribe');
   }
 });
@@ -646,7 +683,7 @@ app.post('/redis', requireAdminKey, async (req, res) => {
     await redisClient.set(key, JSON.stringify(value));
     res.status(200).json({ message: `Key '${key}' added to Redis with value`, key, value });
   } catch (err) {
-    console.error('Error adding value to Redis', err);
+    log.error('Error adding value to Redis', err);
     errorResponse(res, 500, 'Failed to add value to Redis');
   }
 });
@@ -682,7 +719,7 @@ app.get('/redis', requireAdminKey, async (req, res) => {
     }, {});
     res.status(200).json(result);
   } catch (err) {
-    console.error('Error retrieving Redis data', err);
+    log.error('Error retrieving Redis data', err);
     errorResponse(res, 500, 'Failed to retrieve data from Redis');
   }
 });
@@ -702,7 +739,7 @@ app.get('/redis/:key', requireAdminKey, async (req, res) => {
       errorResponse(res, 404, 'Key not found');
     }
   } catch (err) {
-    console.error('Error retrieving Redis key', err);
+    log.error('Error retrieving Redis key', err);
     errorResponse(res, 500, 'Failed to retrieve data from Redis');
   }
 });
@@ -718,7 +755,7 @@ app.delete('/redis/:key', requireAdminKey, async (req, res) => {
       errorResponse(res, 404, `Key '${key}' not found in Redis`);
     }
   } catch (err) {
-    console.error('Error deleting Redis key', err);
+    log.error('Error deleting Redis key', err);
     errorResponse(res, 500, 'Failed to delete key from Redis');
   }
 });
@@ -729,7 +766,7 @@ app.delete('/redis', requireAdminKey, async (req, res) => {
     await redisClient.flushAll();
     res.status(200).json({ message: 'Redis cache flushed' });
   } catch (err) {
-    console.error('Error flushing Redis cache', err);
+    log.error('Error flushing Redis cache', err);
     errorResponse(res, 500, 'Failed to flush Redis cache');
   }
 });
@@ -746,7 +783,7 @@ app.post('/redis/reload', requireAdminKey, async (req, res) => {
 
     res.status(200).json({ message: 'Redis cache reloaded from PostgreSQL' });
   } catch (err) {
-    console.error('Error reloading Redis cache', err);
+    log.error('Error reloading Redis cache', err);
     errorResponse(res, 500, 'Failed to reload Redis from PostgreSQL');
   }
 });
@@ -757,7 +794,7 @@ app.get('/kafka/topics', requireAdminKey, async (req, res) => {
     const topics = await admin.listTopics();
     res.status(200).json({ topics });
   } catch (err) {
-    console.error('Failed to list Kafka topics', err);
+    log.error('Failed to list Kafka topics', err);
     errorResponse(res, 500, 'Failed to list Kafka topics');
   }
 });
@@ -769,7 +806,7 @@ app.delete('/kafka/topics/:topic', requireAdminKey, async (req, res) => {
     await admin.deleteTopics({ topics: [topic] });
     res.status(200).json({ message: `Kafka topic ${topic} deleted` });
   } catch (err) {
-    console.error(`Failed to delete Kafka topic ${topic}`, err);
+    log.error(`Failed to delete Kafka topic ${topic}`, err);
     errorResponse(res, 500, `Failed to delete Kafka topic ${topic}`);
   }
 });
@@ -777,13 +814,13 @@ app.delete('/kafka/topics/:topic', requireAdminKey, async (req, res) => {
 // Function to apply database migrations
 function applyMigrations() {
   return new Promise((resolve, reject) => {
-    console.log('Applying database migrations...');
+    log.info('Applying database migrations...');
     exec('npm run migrate', (err, stdout, stderr) => {
       if (err) {
-        console.error('Error applying migrations:', stderr);
+        log.error('Error applying migrations:', stderr);
         reject(err);
       } else {
-        console.log('Migrations applied successfully:', stdout);
+        log.info('Migrations applied successfully:', stdout);
         resolve();
       }
     });
@@ -804,7 +841,7 @@ async function createKafkaTopics() {
     topics: topicsToCreate,
     waitForLeaders: true,
   });
-  console.log(`Kafka topics ready (created=${created}, idempotent)`);
+  log.info(`Kafka topics ready (created=${created}, idempotent)`);
 }
 
 // Run migrations, connect Kafka, create topics, then start the HTTP server.
@@ -817,10 +854,10 @@ let server;
     await createKafkaTopics();
 
     server = app.listen(PORT, () => {
-      console.log(`Subscription Management Service listening on port ${PORT}`);
+      log.info(`Subscription Management Service listening on port ${PORT}`);
     });
   } catch (err) {
-    console.error('Failed to start Subscription Management service:', err);
+    log.error('Failed to start Subscription Management service:', err);
     process.exit(1);
   }
 })();
@@ -828,9 +865,9 @@ let server;
 // Graceful shutdown — close all clients in parallel, then exit. Use
 // allSettled so a failing close doesn't leave others hanging.
 async function shutdown(signal) {
-  console.log(`Subscription management received ${signal}, shutting down gracefully...`);
+  log.info(`Subscription management received ${signal}, shutting down gracefully...`);
   const forceExit = setTimeout(() => {
-    console.error('Shutdown timeout exceeded, forcing exit');
+    log.error('Shutdown timeout exceeded, forcing exit');
     process.exit(1);
   }, 10000);
   try {
@@ -842,7 +879,7 @@ async function shutdown(signal) {
       pool.end(),
     ]);
   } catch (err) {
-    console.error('Error during shutdown:', err);
+    log.error('Error during shutdown:', err);
   } finally {
     clearTimeout(forceExit);
     process.exit(0);

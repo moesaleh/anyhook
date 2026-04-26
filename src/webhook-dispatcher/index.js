@@ -6,6 +6,28 @@ const axios = require('axios');
 const { Pool } = require('pg');
 const { v4: uuidv4 } = require('uuid');
 const crypto = require('crypto');
+const promClient = require('prom-client');
+const { createLogger } = require('../lib/logger');
+const { startMetricsServer } = require('../lib/metrics-server');
+
+const log = createLogger('webhook-dispatcher');
+
+// Service-specific metrics
+const webhookDeliveries = new promClient.Counter({
+  name: 'webhook_deliveries_total',
+  help: 'Total webhook delivery attempts',
+  labelNames: ['status'], // success | retrying | failed | dlq
+});
+const webhookDeliveryDuration = new promClient.Histogram({
+  name: 'webhook_delivery_duration_seconds',
+  help: 'Webhook HTTP request duration (seconds)',
+  labelNames: ['status'],
+  buckets: [0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30],
+});
+const pendingRetriesGauge = new promClient.Gauge({
+  name: 'webhook_pending_retries',
+  help: 'Current size of the pending_retries queue',
+});
 
 function parseBrokers(envValue) {
   return (envValue || 'localhost:9092')
@@ -30,27 +52,29 @@ const pool = new Pool({
   connectionTimeoutMillis: 5000,
 });
 
-// Connect Redis + PG, recover any in-flight retries lost on restart, then
-// connect Kafka producer/consumer and start consuming.
-redisClient.on('error', err => console.error('Redis Client Error', err));
+// Internal HTTP for /metrics + /health on METRICS_PORT (default 9090).
+const metricsServer = startMetricsServer({ logger: log });
+
+// Connect Redis + PG, start the retry poller, then connect Kafka clients.
+redisClient.on('error', err => log.error('Redis Client Error', err));
 (async () => {
   try {
     await redisClient.connect();
-    console.log('Webhook dispatcher: Redis client connected');
+    log.info('Webhook dispatcher: Redis client connected');
 
     try {
       await pool.query('SELECT 1');
-      console.log('Webhook dispatcher: PostgreSQL connected');
+      log.info('Webhook dispatcher: PostgreSQL connected');
       // Start the persistent retry poller. Crashed/restarted workers leave
       // rows in pending_retries; the next claim cycle picks them up.
       retryPollerHandle = setInterval(pollRetryQueue, RETRY_POLL_INTERVAL_MS);
       // Run one cycle immediately so we don't wait the full interval after start.
       pollRetryQueue();
-      console.log(
+      log.info(
         `Retry poller started (interval=${RETRY_POLL_INTERVAL_MS}ms, batch=${RETRY_BATCH_SIZE}, worker=${WORKER_ID})`
       );
     } catch (err) {
-      console.error(
+      log.error(
         'Webhook dispatcher: PostgreSQL unavailable (retry queue + delivery logging disabled):',
         err.message
       );
@@ -64,13 +88,13 @@ redisClient.on('error', err => console.error('Redis Client Error', err));
         try {
           await handleConnectionEvent(payload);
         } catch (err) {
-          console.error('Unhandled error in connection_events handler:', err);
+          log.error('Unhandled error in connection_events handler:', err);
         }
       },
     });
-    console.log('Webhook dispatcher ready');
+    log.info('Webhook dispatcher ready');
   } catch (err) {
-    console.error('Failed to start webhook-dispatcher:', err);
+    log.error('Failed to start webhook-dispatcher:', err);
     process.exit(1);
   }
 })();
@@ -141,7 +165,7 @@ async function recordDelivery({
     );
   } catch (err) {
     // Best-effort: log the failure but don't crash
-    console.error(`Failed to record delivery event for ${subscriptionId}:`, err.message);
+    log.error(`Failed to record delivery event for ${subscriptionId}:`, err.message);
   }
 }
 
@@ -149,7 +173,7 @@ async function recordDelivery({
 async function handleConnectionEvent({ message }) {
   const raw = message.value ? message.value.toString() : null;
   if (!raw) {
-    console.error('Received empty message on connection_events, skipping');
+    log.error('Received empty message on connection_events, skipping');
     return;
   }
 
@@ -157,12 +181,12 @@ async function handleConnectionEvent({ message }) {
   try {
     ({ subscriptionId, data } = JSON.parse(raw));
   } catch (err) {
-    console.error('Failed to parse Kafka message, skipping:', err.message);
+    log.error('Failed to parse Kafka message, skipping:', err.message);
     return;
   }
 
   if (!subscriptionId) {
-    console.error('Missing subscriptionId in Kafka message, skipping');
+    log.error('Missing subscriptionId in Kafka message, skipping');
     return;
   }
 
@@ -173,7 +197,7 @@ async function handleConnectionEvent({ message }) {
     const subscriptionDetails = await redisClient.get(subscriptionId);
 
     if (!subscriptionDetails) {
-      console.error(`No subscription details found for ID: ${subscriptionId}`);
+      log.error(`No subscription details found for ID: ${subscriptionId}`);
       return;
     }
 
@@ -185,9 +209,7 @@ async function handleConnectionEvent({ message }) {
     } = subscription;
 
     if (!organizationId) {
-      console.error(
-        `Subscription ${subscriptionId} has no organization_id; cannot record delivery`
-      );
+      log.error(`Subscription ${subscriptionId} has no organization_id; cannot record delivery`);
       return;
     }
 
@@ -202,7 +224,7 @@ async function handleConnectionEvent({ message }) {
         0
       );
     } catch (error) {
-      console.error(
+      log.error(
         `Initial webhook request failed for subscription ID: ${subscriptionId}`,
         error.message
       );
@@ -211,7 +233,7 @@ async function handleConnectionEvent({ message }) {
       await enqueueRetry(eventId, subscriptionId, organizationId, JSON.stringify({ data }), 0);
     }
   } catch (error) {
-    console.error(`Error processing message for subscription ID: ${subscriptionId}`, error);
+    log.error(`Error processing message for subscription ID: ${subscriptionId}`, error);
   }
 }
 
@@ -266,7 +288,7 @@ async function sendWebhook(
     headers['X-AnyHook-Timestamp'] = String(timestampSec);
     headers['X-AnyHook-Signature'] = signature;
   } else {
-    console.warn(`No webhook_secret for subscription ${subscriptionId}; sending UNSIGNED`);
+    log.warn(`No webhook_secret for subscription ${subscriptionId}; sending UNSIGNED`);
   }
 
   try {
@@ -278,9 +300,12 @@ async function sendWebhook(
     });
     const responseTimeMs = Date.now() - startTime;
 
-    console.log(
+    log.info(
       `Webhook sent successfully for subscription ID: ${subscriptionId} (${responseTimeMs}ms)`
     );
+
+    webhookDeliveries.inc({ status: 'success' });
+    webhookDeliveryDuration.observe({ status: 'success' }, responseTimeMs / 1000);
 
     // Record successful delivery
     await recordDelivery({
@@ -307,6 +332,8 @@ async function sendWebhook(
 
     // Determine status: 'retrying' if more retries available, 'failed' otherwise
     const deliveryStatus = retryCount < maxRetries ? 'retrying' : 'failed';
+    webhookDeliveries.inc({ status: deliveryStatus });
+    webhookDeliveryDuration.observe({ status: deliveryStatus }, responseTimeMs / 1000);
 
     // Record the failed attempt
     await recordDelivery({
@@ -363,11 +390,11 @@ async function enqueueRetry(eventId, subscriptionId, organizationId, requestBody
           locked_by = NULL`,
       [eventId, subscriptionId, organizationId, requestBody, retryCount, nextAttemptAt]
     );
-    console.log(
+    log.info(
       `Enqueued retry for event ${eventId} attempt ${retryCount + 1}/${maxRetries} at ${nextAttemptAt.toISOString()}`
     );
   } catch (err) {
-    console.error(`Failed to enqueue retry for event ${eventId}:`, err.message);
+    log.error(`Failed to enqueue retry for event ${eventId}:`, err.message);
   }
 }
 
@@ -393,7 +420,7 @@ async function claimDueRetries() {
          AND locked_at < NOW() - ($1::text || ' milliseconds')::interval`,
       [String(RETRY_LOCK_TIMEOUT_MS)]
     )
-    .catch(err => console.error('Stale-lock sweep failed:', err.message));
+    .catch(err => log.error('Stale-lock sweep failed:', err.message));
 
   const result = await pool.query(
     `WITH due AS (
@@ -424,7 +451,7 @@ async function processClaimedRetry(row) {
   // record a final 'failed' delivery_event for audit. The FK CASCADE on
   // sub deletion would normally handle this, but we may also race deletion.
   if (!subscriptionDetails) {
-    console.warn(
+    log.warn(
       `Subscription ${row.subscription_id} no longer in Redis; dropping retry ${row.event_id}`
     );
     await pool.query('DELETE FROM pending_retries WHERE event_id = $1', [row.event_id]);
@@ -444,7 +471,7 @@ async function processClaimedRetry(row) {
   try {
     subscription = JSON.parse(subscriptionDetails);
   } catch (err) {
-    console.error(`Bad Redis payload for ${row.subscription_id}:`, err.message);
+    log.error(`Bad Redis payload for ${row.subscription_id}:`, err.message);
     // Don't drop the queue row — the Redis state may recover. Just unlock.
     await pool.query(
       'UPDATE pending_retries SET locked_at = NULL, locked_by = NULL WHERE event_id = $1',
@@ -458,10 +485,7 @@ async function processClaimedRetry(row) {
   try {
     data = JSON.parse(row.request_body).data;
   } catch (err) {
-    console.error(
-      `Cannot parse request_body for event ${row.event_id} (truncated?):`,
-      err.message
-    );
+    log.error(`Cannot parse request_body for event ${row.event_id} (truncated?):`, err.message);
     // Truncation can't be undone — DLQ this and remove from queue.
     await pool.query('DELETE FROM pending_retries WHERE event_id = $1', [row.event_id]);
     await sendToDLQ(row.subscription_id, row.organization_id, webhookUrl, null, row.event_id);
@@ -506,21 +530,28 @@ async function processClaimedRetry(row) {
  * the next.
  */
 async function pollRetryQueue() {
+  // Update queue-depth gauge first; cheap and runs every interval. Single
+  // SELECT, no FOR UPDATE — eventual consistency is fine for the metric.
+  pool
+    .query('SELECT COUNT(*)::int AS n FROM pending_retries')
+    .then(r => pendingRetriesGauge.set(r.rows[0].n))
+    .catch(() => {});
+
   let claimed;
   try {
     claimed = await claimDueRetries();
   } catch (err) {
-    console.error('Failed to claim retries:', err.message);
+    log.error('Failed to claim retries:', err.message);
     return;
   }
   if (claimed.length === 0) return;
 
-  console.log(`Processing ${claimed.length} due retries (worker ${WORKER_ID})`);
+  log.info(`Processing ${claimed.length} due retries (worker ${WORKER_ID})`);
   for (const row of claimed) {
     try {
       await processClaimedRetry(row);
     } catch (err) {
-      console.error(`Retry processing failed for event ${row.event_id}:`, err.message);
+      log.error(`Retry processing failed for event ${row.event_id}:`, err.message);
       // Unlock so the next poll cycle can pick it up.
       await pool
         .query(
@@ -556,35 +587,36 @@ async function sendToDLQ(subscriptionId, organizationId, webhookUrl, data, event
       topic: 'dlq_events',
       messages: [{ value: JSON.stringify({ subscriptionId, organizationId, webhookUrl, data }) }],
     });
-    console.log(`Message sent to Dead Letter Queue (DLQ) for subscription ID: ${subscriptionId}`);
+    log.info(`Message sent to Dead Letter Queue (DLQ) for subscription ID: ${subscriptionId}`);
+    webhookDeliveries.inc({ status: 'dlq' });
   } catch (err) {
-    console.error('Error sending to Dead Letter Queue (DLQ)', err);
+    log.error('Error sending to Dead Letter Queue (DLQ)', err);
   }
 }
-
 
 // Graceful shutdown — stop the retry poller, disconnect kafkajs clients,
 // close Redis + PG, exit. Stopping the poller first means in-flight retries
 // finish; new ones won't be claimed.
 async function shutdown(signal) {
-  console.log(`Webhook dispatcher received ${signal}, shutting down gracefully...`);
+  log.info(`Webhook dispatcher received ${signal}, shutting down gracefully...`);
   if (retryPollerHandle) {
     clearInterval(retryPollerHandle);
     retryPollerHandle = null;
   }
   const forceExit = setTimeout(() => {
-    console.error('Shutdown timeout exceeded, forcing exit');
+    log.error('Shutdown timeout exceeded, forcing exit');
     process.exit(1);
   }, 10000);
   try {
     await Promise.allSettled([
+      new Promise(resolve => metricsServer.close(resolve)),
       consumer.disconnect(),
       producer.disconnect(),
       redisClient.quit(),
       pool.end(),
     ]);
   } catch (err) {
-    console.error('Error during shutdown:', err);
+    log.error('Error during shutdown:', err);
   } finally {
     clearTimeout(forceExit);
     process.exit(0);

@@ -2,6 +2,9 @@ const { createClient } = require('graphql-ws'); // New WebSocket client
 const { WebSocket } = require('ws'); // Use ws WebSocket implementation for Node.js
 const gql = require('graphql-tag');
 const BaseHandler = require('./baseHandler');
+const { createLogger } = require('../../lib/logger');
+
+const log = createLogger('graphql-handler');
 
 class GraphQLHandler extends BaseHandler {
   constructor(producer, redisClient) {
@@ -14,11 +17,9 @@ class GraphQLHandler extends BaseHandler {
     const { args, subscription_id } = subscription;
     const { query, endpoint_url, headers } = args;
 
-    console.log(
-      `[GraphQLHandler] - Connecting to WebSocket for subscription ID: ${subscription_id}`
-    );
-    console.log(`[GraphQLHandler] - Endpoint URL: ${endpoint_url}`);
-    console.log(`[GraphQLHandler] - GraphQL Query: ${query}`);
+    log.info(`[GraphQLHandler] - Connecting to WebSocket for subscription ID: ${subscription_id}`);
+    log.info(`[GraphQLHandler] - Endpoint URL: ${endpoint_url}`);
+    log.info(`[GraphQLHandler] - GraphQL Query: ${query}`);
 
     // Parse headers safely
     let parsedHeaders = {};
@@ -26,7 +27,7 @@ class GraphQLHandler extends BaseHandler {
       try {
         parsedHeaders = typeof headers === 'object' ? headers : JSON.parse(headers);
       } catch (err) {
-        console.error(
+        log.error(
           `[GraphQLHandler] - Failed to parse headers for subscription ID: ${subscription_id}`,
           err
         );
@@ -44,10 +45,10 @@ class GraphQLHandler extends BaseHandler {
         },
       });
 
-      wsClient.on('connecting', () => console.log('WebSocket connecting...'));
-      wsClient.on('connected', () => console.log('WebSocket connected.'));
-      wsClient.on('closed', () => console.log('WebSocket connection closed.'));
-      wsClient.on('error', error => console.error('WebSocket error:', error));
+      wsClient.on('connecting', () => log.info('WebSocket connecting...'));
+      wsClient.on('connected', () => log.info('WebSocket connected.'));
+      wsClient.on('closed', () => log.info('WebSocket connection closed.'));
+      wsClient.on('error', error => log.error('WebSocket error:', error));
 
       // Execute the subscription query
       const subscriptionQuery = gql`
@@ -59,23 +60,23 @@ class GraphQLHandler extends BaseHandler {
         },
         {
           next: data => {
-            console.log(
+            log.info(
               `[GraphQLHandler] - New data received for subscription ID: ${subscription_id}`,
               JSON.stringify(data)
             );
 
             // Raise event for processing
-            console.log(`Processing message for subscription ID: ${subscription_id}`);
+            log.info(`Processing message for subscription ID: ${subscription_id}`);
             this.raiseConnectionEvent(subscription_id, data);
           },
           error: err => {
-            console.error(
+            log.error(
               `[GraphQLHandler] - Subscription error for subscription ID: ${subscription_id}`,
               err
             );
           },
           complete: () => {
-            console.log(
+            log.info(
               `[GraphQLHandler] - Subscription completed for subscription ID: ${subscription_id}`
             );
           },
@@ -86,7 +87,7 @@ class GraphQLHandler extends BaseHandler {
       this.activeSubscriptions[subscription_id] = unsubscribe;
       this.wsClients[subscription_id] = wsClient;
     } catch (err) {
-      console.error(
+      log.error(
         `[GraphQLHandler] - Error connecting WebSocket for subscription ID: ${subscription_id}`,
         err
       );
@@ -94,20 +95,20 @@ class GraphQLHandler extends BaseHandler {
   }
 
   disconnect(subscriptionId) {
-    console.log(`[GraphQLHandler] - Disconnecting subscription for ID: ${subscriptionId}`);
+    log.info(`[GraphQLHandler] - Disconnecting subscription for ID: ${subscriptionId}`);
 
     // Unsubscribe from active subscription
     if (this.activeSubscriptions[subscriptionId]) {
       this.activeSubscriptions[subscriptionId]();
       delete this.activeSubscriptions[subscriptionId];
-      console.log(`[GraphQLHandler] - Unsubscribed from subscription ID: ${subscriptionId}`);
+      log.info(`[GraphQLHandler] - Unsubscribed from subscription ID: ${subscriptionId}`);
     }
 
     // Close WebSocket connection
     if (this.wsClients[subscriptionId]) {
       this.wsClients[subscriptionId].dispose();
       delete this.wsClients[subscriptionId];
-      console.log(
+      log.info(
         `[GraphQLHandler] - WebSocket connection closed for subscription ID: ${subscriptionId}`
       );
     }

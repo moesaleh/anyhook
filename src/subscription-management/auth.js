@@ -14,7 +14,9 @@
 const crypto = require('crypto');
 const { promisify } = require('util');
 const jwt = require('jsonwebtoken');
+const { createLogger } = require('../lib/logger');
 
+const log = createLogger('auth');
 const scrypt = promisify(crypto.scrypt);
 
 const SCRYPT_KEYLEN = 64;
@@ -140,7 +142,7 @@ function makeRequireAuth({ pool }) {
         // Best-effort last_used_at update — fire and forget
         pool
           .query('UPDATE api_keys SET last_used_at = NOW() WHERE id = $1', [row.id])
-          .catch(err => console.error('Failed to update api_keys.last_used_at', err.message));
+          .catch(err => log.error('Failed to update api_keys.last_used_at', err.message));
 
         req.auth = {
           userId: null,
@@ -150,7 +152,7 @@ function makeRequireAuth({ pool }) {
         };
         return next();
       } catch (err) {
-        console.error('API key lookup failed:', err);
+        log.error('API key lookup failed:', err);
         return res.status(500).json({ error: 'Auth failed' });
       }
     }
@@ -181,7 +183,7 @@ function makeRequireAuth({ pool }) {
         };
         return next();
       } catch (err) {
-        console.error('Membership lookup failed:', err);
+        log.error('Membership lookup failed:', err);
         return res.status(500).json({ error: 'Auth failed' });
       }
     }
@@ -283,7 +285,7 @@ function mountAuthRoutes(app, { pool }) {
       });
     } catch (err) {
       await client.query('ROLLBACK');
-      console.error('Registration failed:', err);
+      log.error('Registration failed:', err);
       res.status(500).json({ error: 'Registration failed' });
     } finally {
       client.release();
@@ -335,7 +337,7 @@ function mountAuthRoutes(app, { pool }) {
         organizations: orgs.rows,
       });
     } catch (err) {
-      console.error('Login failed:', err);
+      log.error('Login failed:', err);
       res.status(500).json({ error: 'Login failed' });
     }
   });
@@ -380,7 +382,7 @@ function mountAuthRoutes(app, { pool }) {
         via: 'cookie',
       });
     } catch (err) {
-      console.error('/auth/me failed:', err);
+      log.error('/auth/me failed:', err);
       res.status(500).json({ error: 'Failed to load session' });
     }
   });
@@ -406,7 +408,7 @@ function mountAuthRoutes(app, { pool }) {
       setSessionCookie(res, token);
       res.status(200).json({ organization_id: targetOrgId });
     } catch (err) {
-      console.error('switch-org failed:', err);
+      log.error('switch-org failed:', err);
       res.status(500).json({ error: 'Switch organization failed' });
     }
   });
@@ -450,7 +452,7 @@ function mountAuthRoutes(app, { pool }) {
         res.status(201).json({ ...orgResult.rows[0], role: 'owner' });
       } catch (err) {
         await client.query('ROLLBACK');
-        console.error('Create organization failed:', err);
+        log.error('Create organization failed:', err);
         res.status(500).json({ error: 'Create organization failed' });
       } finally {
         client.release();
@@ -471,7 +473,7 @@ function mountAuthRoutes(app, { pool }) {
       );
       res.status(200).json(result.rows);
     } catch (err) {
-      console.error('List members failed:', err);
+      log.error('List members failed:', err);
       res.status(500).json({ error: 'List members failed' });
     }
   });
@@ -507,7 +509,7 @@ function mountAuthRoutes(app, { pool }) {
         );
         res.status(201).json({ user_id: userResult.rows[0].id, role: targetRole });
       } catch (err) {
-        console.error('Add member failed:', err);
+        log.error('Add member failed:', err);
         res.status(500).json({ error: 'Add member failed' });
       }
     }
@@ -534,7 +536,7 @@ function mountAuthRoutes(app, { pool }) {
         }
         res.status(200).json({ message: 'Member removed' });
       } catch (err) {
-        console.error('Remove member failed:', err);
+        log.error('Remove member failed:', err);
         res.status(500).json({ error: 'Remove member failed' });
       }
     }
@@ -552,7 +554,7 @@ function mountAuthRoutes(app, { pool }) {
       );
       res.status(200).json(result.rows);
     } catch (err) {
-      console.error('List API keys failed:', err);
+      log.error('List API keys failed:', err);
       res.status(500).json({ error: 'List API keys failed' });
     }
   });
@@ -587,7 +589,7 @@ function mountAuthRoutes(app, { pool }) {
           message: 'Save the key value — it is shown only once.',
         });
       } catch (err) {
-        console.error('Create API key failed:', err);
+        log.error('Create API key failed:', err);
         res.status(500).json({ error: 'Create API key failed' });
       }
     }
@@ -611,7 +613,7 @@ function mountAuthRoutes(app, { pool }) {
         }
         res.status(200).json({ message: 'API key revoked' });
       } catch (err) {
-        console.error('Revoke API key failed:', err);
+        log.error('Revoke API key failed:', err);
         res.status(500).json({ error: 'Revoke API key failed' });
       }
     }

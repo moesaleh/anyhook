@@ -11,7 +11,7 @@ const { v4: uuidv4 } = require('uuid');
 const crypto = require('crypto');
 const { createLogger } = require('../lib/logger');
 const { isValidUrl } = require('../lib/url-validation');
-const { makeRateLimit } = require('../lib/rate-limit');
+const { makeRateLimit, ipKeyFn } = require('../lib/rate-limit');
 const { mountAuthRoutes } = require('./auth');
 
 const log = createLogger('subscription-management');
@@ -44,6 +44,16 @@ function withoutSecret(row) {
 }
 
 const app = express();
+
+// trust proxy: when behind a reverse proxy (nginx, ALB, Cloudflare),
+// req.ip will reflect X-Forwarded-For. Set TRUST_PROXY=1 to enable, or
+// TRUST_PROXY=N to trust N hops. Default: false (no proxy assumed).
+const trustProxyEnv = process.env.TRUST_PROXY;
+if (trustProxyEnv) {
+  const n = Number(trustProxyEnv);
+  app.set('trust proxy', Number.isFinite(n) ? n : trustProxyEnv === 'true');
+}
+
 app.use(express.json({ limit: '1mb' }));
 app.use(cookieParser());
 
@@ -164,9 +174,9 @@ function requireAdminKey(req, res, next) {
   next();
 }
 
-// Per-org rate limit. Tunables via env, defaults to 600 req/min/org.
-// Applied AFTER requireAuth on every user-facing route so we count by
-// organization_id (cookie OR API key both resolve to one).
+// Per-org rate limit (default 600 req/min/org). Applied AFTER requireAuth
+// on every user-facing route so we count by organization_id (cookie OR API
+// key both resolve to one).
 const rateLimit = makeRateLimit({
   redisClient,
   limit: parseInt(process.env.RATE_LIMIT_REQUESTS, 10) || undefined,
@@ -174,10 +184,22 @@ const rateLimit = makeRateLimit({
   logger: log,
 });
 
+// Per-IP rate limit for anonymous endpoints (login + register). Stricter
+// (default 10 req/min/IP) to slow credential-stuffing and bulk-account
+// attacks. Cannot key by org because there is no org context yet.
+const authRateLimit = makeRateLimit({
+  redisClient,
+  limit: parseInt(process.env.AUTH_RATE_LIMIT_REQUESTS, 10) || 10,
+  windowSec: parseInt(process.env.AUTH_RATE_LIMIT_WINDOW_SEC, 10) || 60,
+  prefix: 'auth-rl',
+  keyFn: ipKeyFn,
+  logger: log,
+});
+
 // Mount auth + tenancy routes (/auth/*, /organizations/*) and pull
 // requireAuth middleware so the subscription/delivery endpoints below
 // can scope to the caller's org.
-const { requireAuth } = mountAuthRoutes(app, { pool, rateLimit });
+const { requireAuth } = mountAuthRoutes(app, { pool, rateLimit, authRateLimit });
 
 // Prometheus scrape endpoint (no auth — but only reachable on the API
 // network; if you expose port 3001 publicly you should put a /metrics

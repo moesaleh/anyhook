@@ -32,10 +32,27 @@ jobs:
             node --check "$f"
           done
 
-  # Unit tests for the lib/ modules (no PG/Redis/Kafka required).
+  # Unit + integration tests. Integration suite needs a real Postgres;
+  # provisioned as a service container. Redis is mocked in-memory and
+  # Kafka is no-op'd by the integration harness, so we don't need
+  # those services here.
   backend-tests:
     name: Backend tests
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:14.18
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: testpass
+          POSTGRES_DB: anyhook_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -43,11 +60,14 @@ jobs:
           node-version: '22'
           cache: 'npm'
       - run: npm ci
-      - name: Run unit tests with coverage
+      - name: Run all tests with coverage
         run: npm run test:coverage
         env:
           # JWT helpers refuse to run with a short or missing secret.
           JWT_SECRET: ${{ secrets.JWT_SECRET || 'ci-test-jwt-secret-pad-to-32-characters' }}
+          # When set, integration tests run against this PG; when unset,
+          # they're skipped (see tests/integration/setup.js).
+          TEST_DATABASE_URL: postgres://postgres:testpass@localhost:5432/anyhook_test
 
   # Lint + type-check + production build of the dashboard on every push & PR.
   dashboard-build:

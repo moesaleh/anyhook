@@ -62,10 +62,50 @@ producer.on('error', (err) => {
 
 const VALID_CONNECTION_TYPES = ['graphql', 'websocket'];
 
-function isValidUrl(str) {
+// Allow loopback/private targets only when explicitly opted in (dev convenience).
+const ALLOW_PRIVATE_TARGETS = process.env.ALLOW_PRIVATE_WEBHOOK_TARGETS === 'true';
+
+/**
+ * Returns true if the hostname is a loopback, private, link-local, or
+ * cloud-metadata address. Used to block SSRF against internal infra
+ * (Redis, Kafka, the API itself, AWS/GCP IMDS at 169.254.169.254, etc).
+ */
+function isPrivateOrLoopbackHost(hostname) {
+    if (!hostname) return true;
+    const h = hostname.toLowerCase().replace(/^\[|\]$/g, '');
+
+    if (h === 'localhost' || h === 'localhost.localdomain' || h.endsWith('.localhost')) return true;
+
+    // IPv6: loopback, unspecified, link-local (fe80::/10), unique-local (fc00::/7)
+    if (h === '::1' || h === '::') return true;
+    if (h.startsWith('fe80:') || h.startsWith('fc') || h.startsWith('fd')) return true;
+
+    // IPv4-mapped IPv6 → fall through to the v4 check below
+    const v4MappedMatch = h.match(/^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
+    const v4Candidate = v4MappedMatch ? v4MappedMatch[1] : h;
+
+    const ipv4Match = v4Candidate.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+    if (ipv4Match) {
+        const a = Number(ipv4Match[1]);
+        const b = Number(ipv4Match[2]);
+        if (a === 0) return true;                          // 0.0.0.0/8
+        if (a === 10) return true;                         // RFC1918
+        if (a === 127) return true;                        // loopback
+        if (a === 169 && b === 254) return true;           // link-local + IMDS
+        if (a === 172 && b >= 16 && b <= 31) return true;  // RFC1918
+        if (a === 192 && b === 168) return true;           // RFC1918
+        if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT
+    }
+
+    return false;
+}
+
+function isValidUrl(str, { allowedProtocols = ['http:', 'https:', 'ws:', 'wss:'] } = {}) {
     try {
         const url = new URL(str);
-        return ['http:', 'https:', 'ws:', 'wss:'].includes(url.protocol);
+        if (!allowedProtocols.includes(url.protocol)) return false;
+        if (!ALLOW_PRIVATE_TARGETS && isPrivateOrLoopbackHost(url.hostname)) return false;
+        return true;
     } catch {
         return false;
     }
@@ -83,15 +123,15 @@ function validateSubscriptionInput(body) {
         errors.push('args must be a JSON object');
     } else {
         if (!args.endpoint_url || !isValidUrl(args.endpoint_url)) {
-            errors.push('args.endpoint_url must be a valid URL');
+            errors.push('args.endpoint_url must be a valid public URL (private/loopback addresses are blocked)');
         }
         if (connection_type === 'graphql' && (!args.query || typeof args.query !== 'string')) {
             errors.push('args.query is required for graphql subscriptions');
         }
     }
 
-    if (!webhook_url || !isValidUrl(webhook_url)) {
-        errors.push('webhook_url must be a valid URL (http or https)');
+    if (!webhook_url || !isValidUrl(webhook_url, { allowedProtocols: ['http:', 'https:'] })) {
+        errors.push('webhook_url must be a valid public http/https URL (private/loopback addresses are blocked)');
     }
 
     return errors;
@@ -101,6 +141,19 @@ function validateSubscriptionInput(body) {
 
 function errorResponse(res, statusCode, message) {
     return res.status(statusCode).json({ error: message });
+}
+
+// --- Admin-key middleware (fails closed: denies if ADMIN_API_KEY is unset) ---
+
+function requireAdminKey(req, res, next) {
+    const adminKey = process.env.ADMIN_API_KEY;
+    if (!adminKey) {
+        return errorResponse(res, 503, 'Admin endpoints disabled: ADMIN_API_KEY not configured');
+    }
+    if (req.headers['x-admin-key'] !== adminKey) {
+        return errorResponse(res, 403, 'Forbidden: invalid or missing admin key');
+    }
+    next();
 }
 
 // Health check endpoint
@@ -327,12 +380,7 @@ app.get('/subscriptions', async (req, res) => {
 });
 
 // PostgreSQL: Delete all subscriptions (admin-only, requires X-Admin-Key header)
-app.delete('/subscriptions', async (req, res) => {
-    const adminKey = process.env.ADMIN_API_KEY;
-    if (adminKey && req.headers['x-admin-key'] !== adminKey) {
-        return errorResponse(res, 403, 'Forbidden: invalid or missing admin key');
-    }
-
+app.delete('/subscriptions', requireAdminKey, async (req, res) => {
     try {
         // Delete all subscriptions from PostgreSQL
         const result = await pool.query('DELETE FROM subscriptions RETURNING *');
@@ -467,15 +515,7 @@ app.post('/unsubscribe', async (req, res) => {
     }
 });
 
-// --- Admin/Debug endpoints (protected by X-Admin-Key when ADMIN_API_KEY is set) ---
-
-function requireAdminKey(req, res, next) {
-    const adminKey = process.env.ADMIN_API_KEY;
-    if (adminKey && req.headers['x-admin-key'] !== adminKey) {
-        return errorResponse(res, 403, 'Forbidden: invalid or missing admin key');
-    }
-    next();
-}
+// --- Admin/Debug endpoints (require X-Admin-Key; ADMIN_API_KEY must be configured) ---
 
 // Redis: Add value to a key
 app.post('/redis', requireAdminKey, async (req, res) => {

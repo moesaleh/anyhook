@@ -42,15 +42,7 @@ function ipKeyFn(req) {
   return 'unknown';
 }
 
-function makeRateLimit({
-  redisClient,
-  limit,
-  windowSec,
-  prefix,
-  logger,
-  keyFn,
-  pool,
-} = {}) {
+function makeRateLimit({ redisClient, limit, windowSec, prefix, logger, keyFn, pool } = {}) {
   if (!redisClient) {
     throw new Error('makeRateLimit: redisClient is required');
   }

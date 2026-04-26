@@ -15,6 +15,11 @@ const { createLogger } = require('../lib/logger');
 const { hashPassword, verifyPassword } = require('../lib/passwords');
 const { signSession, verifySession } = require('../lib/jwt');
 const { generateApiKey, hashApiKey } = require('../lib/api-keys');
+const {
+  generateInvitationToken,
+  hashInvitationToken,
+  DEFAULT_EXPIRY_DAYS: INVITE_EXPIRY_DAYS,
+} = require('../lib/invitations');
 const { slugify } = require('../lib/slug');
 
 const log = createLogger('auth');
@@ -518,6 +523,234 @@ function mountAuthRoutes(app, { pool, rateLimit, authRateLimit, apiKeyQuota, quo
     } catch (err) {
       log.error('Failed to load quotas:', err);
       res.status(500).json({ error: 'Failed to load quotas' });
+    }
+  });
+
+  // --- Invitations ---
+
+  // POST /organizations/current/invitations — create a new invitation token.
+  // Returns the raw token ONCE; only the SHA-256 hash is stored.
+  app.post(
+    '/organizations/current/invitations',
+    requireAuth,
+    rl,
+    requireRole('owner', 'admin'),
+    async (req, res) => {
+      const { email, role, expires_in_days: expiresInDays } = req.body || {};
+      if (!email || typeof email !== 'string' || !/^.+@.+\..+$/.test(email)) {
+        return res.status(400).json({ error: 'Valid email is required' });
+      }
+      const targetRole = role || 'member';
+      if (!['owner', 'admin', 'member'].includes(targetRole)) {
+        return res.status(400).json({ error: 'role must be owner, admin, or member' });
+      }
+      const days =
+        Number.isFinite(Number(expiresInDays)) && Number(expiresInDays) > 0
+          ? Number(expiresInDays)
+          : INVITE_EXPIRY_DAYS;
+      const expiresAt = new Date(Date.now() + days * 24 * 60 * 60 * 1000);
+
+      const { raw, hash } = generateInvitationToken();
+      try {
+        const result = await pool.query(
+          `INSERT INTO invitations
+             (organization_id, email, role, token_hash, expires_at, created_by_user_id)
+           VALUES ($1, $2, $3, $4, $5, $6)
+           RETURNING id, organization_id, email, role, expires_at, created_at`,
+          [
+            req.auth.organizationId,
+            email.toLowerCase(),
+            targetRole,
+            hash,
+            expiresAt,
+            req.auth.userId,
+          ]
+        );
+        // raw token is returned ONCE — caller forwards it to the invitee
+        // out-of-band (email/Slack/etc.). We don't send email ourselves yet.
+        res.status(201).json({
+          ...result.rows[0],
+          token: raw,
+          message: 'Invitation created. Save the token — it is shown only once.',
+        });
+      } catch (err) {
+        log.error('Create invitation failed:', err);
+        res.status(500).json({ error: 'Create invitation failed' });
+      }
+    }
+  );
+
+  // GET /organizations/current/invitations — list pending (not accepted/
+  // revoked/expired) invitations. No tokens returned.
+  app.get('/organizations/current/invitations', requireAuth, rl, async (req, res) => {
+    try {
+      const result = await pool.query(
+        `SELECT id, email, role, expires_at, created_at, accepted_at, revoked_at
+         FROM invitations
+         WHERE organization_id = $1
+         ORDER BY created_at DESC`,
+        [req.auth.organizationId]
+      );
+      res.status(200).json(result.rows);
+    } catch (err) {
+      log.error('List invitations failed:', err);
+      res.status(500).json({ error: 'List invitations failed' });
+    }
+  });
+
+  // DELETE /organizations/current/invitations/:id — revoke (soft delete)
+  app.delete(
+    '/organizations/current/invitations/:id',
+    requireAuth,
+    rl,
+    requireRole('owner', 'admin'),
+    async (req, res) => {
+      try {
+        const r = await pool.query(
+          `UPDATE invitations SET revoked_at = NOW()
+           WHERE id = $1 AND organization_id = $2
+             AND revoked_at IS NULL AND accepted_at IS NULL
+           RETURNING id`,
+          [req.params.id, req.auth.organizationId]
+        );
+        if (r.rowCount === 0) {
+          return res.status(404).json({ error: 'Invitation not found or already used/revoked' });
+        }
+        res.status(200).json({ message: 'Invitation revoked' });
+      } catch (err) {
+        log.error('Revoke invitation failed:', err);
+        res.status(500).json({ error: 'Revoke invitation failed' });
+      }
+    }
+  );
+
+  // GET /invitations/:token — anonymous lookup so the registration page
+  // can show "Join <org name> as <role>" before the user submits.
+  // Returns minimal metadata; never leaks the token hash or other tokens'
+  // info.
+  app.get('/invitations/:token', authRl, async (req, res) => {
+    const hash = hashInvitationToken(req.params.token);
+    try {
+      const r = await pool.query(
+        `SELECT i.email, i.role, i.expires_at, i.accepted_at, i.revoked_at,
+                o.name AS organization_name
+         FROM invitations i
+         JOIN organizations o ON o.id = i.organization_id
+         WHERE i.token_hash = $1`,
+        [hash]
+      );
+      if (r.rowCount === 0) {
+        return res.status(404).json({ error: 'Invitation not found' });
+      }
+      const inv = r.rows[0];
+      if (inv.revoked_at) return res.status(410).json({ error: 'Invitation revoked' });
+      if (inv.accepted_at) return res.status(410).json({ error: 'Invitation already used' });
+      if (new Date(inv.expires_at) < new Date()) {
+        return res.status(410).json({ error: 'Invitation expired' });
+      }
+      res.status(200).json({
+        email: inv.email,
+        role: inv.role,
+        organization_name: inv.organization_name,
+        expires_at: inv.expires_at,
+      });
+    } catch (err) {
+      log.error('Lookup invitation failed:', err);
+      res.status(500).json({ error: 'Lookup failed' });
+    }
+  });
+
+  // POST /auth/accept-invite — anonymous: registers a new user with the
+  // invitation's email and adds them to the org with the invitation's role.
+  // Issues a session cookie on success (auto-login).
+  //
+  // Existing-user case (joining an additional org while logged in) is NOT
+  // handled here; use POST /organizations/current/members from an
+  // owner/admin's session instead.
+  app.post('/auth/accept-invite', authRl, async (req, res) => {
+    const { token, password, name } = req.body || {};
+    if (!token || typeof token !== 'string') {
+      return res.status(400).json({ error: 'token is required' });
+    }
+    if (!password || typeof password !== 'string' || password.length < 8) {
+      return res.status(400).json({ error: 'Password must be at least 8 characters' });
+    }
+    const hash = hashInvitationToken(token);
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const inviteResult = await client.query(
+        `SELECT id, organization_id, email, role, expires_at, accepted_at, revoked_at
+         FROM invitations WHERE token_hash = $1 FOR UPDATE`,
+        [hash]
+      );
+      if (inviteResult.rowCount === 0) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'Invitation not found' });
+      }
+      const inv = inviteResult.rows[0];
+      if (inv.revoked_at) {
+        await client.query('ROLLBACK');
+        return res.status(410).json({ error: 'Invitation revoked' });
+      }
+      if (inv.accepted_at) {
+        await client.query('ROLLBACK');
+        return res.status(410).json({ error: 'Invitation already used' });
+      }
+      if (new Date(inv.expires_at) < new Date()) {
+        await client.query('ROLLBACK');
+        return res.status(410).json({ error: 'Invitation expired' });
+      }
+
+      // Reject if a user with this email already exists — they must use
+      // the existing-user path. Avoids ambiguity around "is this the
+      // person the inviter meant?".
+      const existing = await client.query('SELECT 1 FROM users WHERE LOWER(email) = LOWER($1)', [
+        inv.email,
+      ]);
+      if (existing.rowCount > 0) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({
+          error:
+            'A user with this email already exists. Please log in and ask an org admin to add you.',
+        });
+      }
+
+      const passwordHash = await hashPassword(password);
+      const userResult = await client.query(
+        `INSERT INTO users (email, password_hash, name)
+         VALUES ($1, $2, $3)
+         RETURNING id, email, name, created_at`,
+        [inv.email, passwordHash, name || null]
+      );
+      const user = userResult.rows[0];
+
+      await client.query(
+        `INSERT INTO memberships (user_id, organization_id, role)
+         VALUES ($1, $2, $3)`,
+        [user.id, inv.organization_id, inv.role]
+      );
+
+      await client.query(`UPDATE invitations SET accepted_at = NOW() WHERE id = $1`, [inv.id]);
+
+      const orgResult = await client.query(
+        'SELECT id, name, slug FROM organizations WHERE id = $1',
+        [inv.organization_id]
+      );
+      await client.query('COMMIT');
+
+      const sessionToken = signSession(user.id, inv.organization_id);
+      setSessionCookie(res, sessionToken);
+      res.status(201).json({
+        user: { id: user.id, email: user.email, name: user.name },
+        organization: { ...orgResult.rows[0], role: inv.role },
+      });
+    } catch (err) {
+      await client.query('ROLLBACK');
+      log.error('Accept invitation failed:', err);
+      res.status(500).json({ error: 'Accept invitation failed' });
+    } finally {
+      client.release();
     }
   });
 

@@ -1,7 +1,17 @@
 import type { NextConfig } from "next";
+import path from "path";
 
 const nextConfig: NextConfig = {
   output: "standalone",
+
+  // Pin the file-tracing/turbopack root to this directory so the standalone
+  // build emits server.js at the top of .next/standalone (not nested under a
+  // monorepo path). The parent repo has its own package-lock.json which would
+  // otherwise be picked as the workspace root.
+  outputFileTracingRoot: path.resolve(__dirname),
+  turbopack: {
+    root: path.resolve(__dirname),
+  },
 
   async headers() {
     return [

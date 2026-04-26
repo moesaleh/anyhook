@@ -62,6 +62,16 @@ export interface CreatedApiKey extends ApiKey {
   message: string;
 }
 
+export interface QuotaUsage {
+  used: number;
+  limit: number;
+}
+
+export interface QuotasResponse {
+  subscriptions: QuotaUsage;
+  api_keys: QuotaUsage;
+}
+
 export interface Subscription {
   subscription_id: string;
   organization_id: string;
@@ -271,6 +281,13 @@ export async function removeOrgMember(userId: string): Promise<void> {
     const body = await res.json().catch(() => ({}));
     throw new Error(body.error || "Failed to remove member");
   }
+}
+
+export async function fetchQuotas(): Promise<QuotasResponse> {
+  const res = await apiFetch("/organizations/current/quotas");
+  checkAuth(res);
+  if (!res.ok) throw new Error("Failed to load quotas");
+  return res.json();
 }
 
 export async function fetchApiKeys(): Promise<ApiKey[]> {

@@ -163,6 +163,67 @@ describeIfPg('per-org quotas (integration)', () => {
     });
   });
 
+  describe('GET /organizations/current/quotas', () => {
+    it('returns zeros for a fresh org', async () => {
+      const res = await request(app).get('/organizations/current/quotas').set('Cookie', cookie);
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({
+        subscriptions: { used: 0, limit: 3 },
+        api_keys: { used: 0, limit: 2 },
+      });
+    });
+
+    it('reflects current usage', async () => {
+      await request(app).post('/subscribe').set('Cookie', cookie).send(validSub);
+      await request(app)
+        .post('/organizations/current/api-keys')
+        .set('Cookie', cookie)
+        .send({ name: 'k1' });
+
+      const res = await request(app).get('/organizations/current/quotas').set('Cookie', cookie);
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({
+        subscriptions: { used: 1, limit: 3 },
+        api_keys: { used: 1, limit: 2 },
+      });
+    });
+
+    it('does not count revoked api keys', async () => {
+      const k = await request(app)
+        .post('/organizations/current/api-keys')
+        .set('Cookie', cookie)
+        .send({ name: 'tmp' });
+      await request(app)
+        .delete(`/organizations/current/api-keys/${k.body.id}`)
+        .set('Cookie', cookie);
+
+      const res = await request(app).get('/organizations/current/quotas').set('Cookie', cookie);
+      expect(res.body.api_keys.used).toBe(0);
+    });
+
+    it('returns 401 without auth', async () => {
+      const res = await request(app).get('/organizations/current/quotas');
+      expect(res.status).toBe(401);
+    });
+
+    it('isolates orgs', async () => {
+      // Fill org A with 2 subs
+      await request(app).post('/subscribe').set('Cookie', cookie).send(validSub);
+      await request(app).post('/subscribe').set('Cookie', cookie).send(validSub);
+
+      // Register org B
+      const reg2 = await request(app)
+        .post('/auth/register')
+        .send({ email: 'q3@example.com', password: 'password123', organization_name: 'C Co' });
+      const cookie2 = getSessionCookie(reg2.headers['set-cookie']);
+
+      const a = await request(app).get('/organizations/current/quotas').set('Cookie', cookie);
+      const b = await request(app).get('/organizations/current/quotas').set('Cookie', cookie2);
+      expect(a.body.subscriptions.used).toBe(2);
+      expect(b.body.subscriptions.used).toBe(0);
+    });
+  });
+
   describe('quota headers on a successful create', () => {
     it('subscription create returns X-Quota-Used reflecting current count', async () => {
       const r1 = await request(app).post('/subscribe').set('Cookie', cookie).send(validSub);

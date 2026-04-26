@@ -163,6 +163,10 @@ function createApp({
     rateLimit,
     authRateLimit,
     apiKeyQuota,
+    quotaLimits: {
+      subscriptions: parseInt(process.env.ORG_MAX_SUBSCRIPTIONS, 10) || 100,
+      apiKeys: parseInt(process.env.ORG_MAX_API_KEYS, 10) || 10,
+    },
   });
 
   // Prometheus scrape (no auth — only reachable on the API network).

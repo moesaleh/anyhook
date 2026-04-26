@@ -139,11 +139,18 @@ function noopMiddleware(req, res, next) {
   next();
 }
 
-function mountAuthRoutes(app, { pool, rateLimit, authRateLimit, apiKeyQuota }) {
+function mountAuthRoutes(app, { pool, rateLimit, authRateLimit, apiKeyQuota, quotaLimits }) {
   const requireAuth = makeRequireAuth({ pool });
   const rl = rateLimit || noopMiddleware;
   const authRl = authRateLimit || noopMiddleware;
   const apiKeyQuotaMw = apiKeyQuota || noopMiddleware;
+  // Limits used by the read-only /quotas endpoint. The middleware-side
+  // limits are baked in at construction time; this echoes them so the
+  // dashboard can show "X/Y used" without scraping headers from every call.
+  const limits = {
+    subscriptions: (quotaLimits && quotaLimits.subscriptions) || 100,
+    apiKeys: (quotaLimits && quotaLimits.apiKeys) || 10,
+  };
 
   // POST /auth/register — create user; if no orgName given, create a default
   // org for them. Either way, the user becomes 'owner' of the org they end up in.
@@ -479,6 +486,31 @@ function mountAuthRoutes(app, { pool, rateLimit, authRateLimit, apiKeyQuota }) {
       }
     }
   );
+
+  // GET /organizations/current/quotas — current usage + limits for active org.
+  // Drives the dashboard's quota indicator. Lighter-weight than scraping
+  // X-Quota-* headers off every other endpoint.
+  app.get('/organizations/current/quotas', requireAuth, rl, async (req, res) => {
+    try {
+      const [subResult, keyResult] = await Promise.all([
+        pool.query('SELECT COUNT(*)::int AS n FROM subscriptions WHERE organization_id = $1', [
+          req.auth.organizationId,
+        ]),
+        pool.query(
+          `SELECT COUNT(*)::int AS n FROM api_keys
+           WHERE organization_id = $1 AND revoked_at IS NULL`,
+          [req.auth.organizationId]
+        ),
+      ]);
+      res.status(200).json({
+        subscriptions: { used: subResult.rows[0].n, limit: limits.subscriptions },
+        api_keys: { used: keyResult.rows[0].n, limit: limits.apiKeys },
+      });
+    } catch (err) {
+      log.error('Failed to load quotas:', err);
+      res.status(500).json({ error: 'Failed to load quotas' });
+    }
+  });
 
   // GET /organizations/current/api-keys — list keys for the active org
   app.get('/organizations/current/api-keys', requireAuth, rl, async (req, res) => {

@@ -16,6 +16,7 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useAuth } from "@/lib/auth-context";
+import { QuotaIndicator } from "./quota-indicator";
 
 const navigation = [
   { name: "Dashboard", href: "/", icon: LayoutDashboard },
@@ -136,6 +137,9 @@ export function Sidebar() {
           </span>
         ))}
       </nav>
+
+      {/* Per-org quota usage */}
+      {organization && <QuotaIndicator />}
 
       {/* User card + logout */}
       <div className="border-t border-neutral-200 dark:border-neutral-800 p-3">

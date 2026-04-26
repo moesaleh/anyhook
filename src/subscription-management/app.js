@@ -17,6 +17,7 @@ const promClient = require('prom-client');
 const { v4: uuidv4 } = require('uuid');
 const crypto = require('crypto');
 const { isValidUrl } = require('../lib/url-validation');
+const { makeSubscriptionQuotaCheck, makeApiKeyQuotaCheck } = require('../lib/quotas');
 const { mountAuthRoutes } = require('./auth');
 
 const VALID_CONNECTION_TYPES = ['graphql', 'websocket'];
@@ -143,7 +144,26 @@ function createApp({
     next();
   });
 
-  const { requireAuth } = mountAuthRoutes(app, { pool, rateLimit, authRateLimit });
+  // Per-org standing quotas. Tunable via env; default 100 subs / 10 active
+  // API keys per org. These run BEFORE the create handler, returning 429
+  // with X-Quota-Limit / X-Quota-Used headers when at the cap.
+  const subscriptionQuota = makeSubscriptionQuotaCheck({
+    pool,
+    log,
+    limit: parseInt(process.env.ORG_MAX_SUBSCRIPTIONS, 10) || undefined,
+  });
+  const apiKeyQuota = makeApiKeyQuotaCheck({
+    pool,
+    log,
+    limit: parseInt(process.env.ORG_MAX_API_KEYS, 10) || undefined,
+  });
+
+  const { requireAuth } = mountAuthRoutes(app, {
+    pool,
+    rateLimit,
+    authRateLimit,
+    apiKeyQuota,
+  });
 
   // Prometheus scrape (no auth — only reachable on the API network).
   app.get('/metrics', async (req, res) => {
@@ -448,7 +468,7 @@ function createApp({
   });
 
   // Create subscription
-  app.post('/subscribe', requireAuth, rateLimit, async (req, res) => {
+  app.post('/subscribe', requireAuth, rateLimit, subscriptionQuota, async (req, res) => {
     const validationErrors = validateSubscriptionInput(req.body);
     if (validationErrors.length > 0) {
       return errorResponse(res, 400, validationErrors.join('; '));

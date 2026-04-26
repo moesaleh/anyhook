@@ -139,13 +139,16 @@ function noopMiddleware(req, res, next) {
   next();
 }
 
-function mountAuthRoutes(app, { pool, rateLimit }) {
+function mountAuthRoutes(app, { pool, rateLimit, authRateLimit, apiKeyQuota }) {
   const requireAuth = makeRequireAuth({ pool });
   const rl = rateLimit || noopMiddleware;
+  const authRl = authRateLimit || noopMiddleware;
+  const apiKeyQuotaMw = apiKeyQuota || noopMiddleware;
 
   // POST /auth/register — create user; if no orgName given, create a default
   // org for them. Either way, the user becomes 'owner' of the org they end up in.
-  app.post('/auth/register', async (req, res) => {
+  // IP-rate-limited to slow bulk-account attacks.
+  app.post('/auth/register', authRl, async (req, res) => {
     const { email, password, name, organization_name: orgName } = req.body || {};
 
     if (!email || typeof email !== 'string' || !/^.+@.+\..+$/.test(email)) {
@@ -226,7 +229,8 @@ function mountAuthRoutes(app, { pool, rateLimit }) {
   // POST /auth/login — returns user + active org; session cookie set.
   // If user belongs to multiple orgs, defaults to the first; client can
   // POST /auth/switch-org afterwards.
-  app.post('/auth/login', async (req, res) => {
+  // IP-rate-limited to slow credential-stuffing.
+  app.post('/auth/login', authRl, async (req, res) => {
     const { email, password } = req.body || {};
     if (!email || !password) {
       return res.status(400).json({ error: 'Email and password are required' });
@@ -499,6 +503,7 @@ function mountAuthRoutes(app, { pool, rateLimit }) {
     requireAuth,
     rl,
     requireRole('owner', 'admin'),
+    apiKeyQuotaMw,
     async (req, res) => {
       const { name, expires_in_days: expiresInDays } = req.body || {};
       if (!name || typeof name !== 'string') {

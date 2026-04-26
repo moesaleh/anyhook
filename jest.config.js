@@ -12,6 +12,10 @@ module.exports = {
   roots: ['<rootDir>/tests'],
   testMatch: ['**/*.test.js'],
 
+  // Run migrations once before any worker starts so parallel test files
+  // don't race on CREATE TABLE / CREATE INDEX / pg_type allocation.
+  globalSetup: '<rootDir>/tests/integration/global-setup.js',
+
   silent: false,
   verbose: false,
 

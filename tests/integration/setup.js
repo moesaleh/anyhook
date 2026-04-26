@@ -13,8 +13,6 @@
  * require a live Postgres instance. CI provisions one as a service.
  */
 
-const fs = require('fs');
-const path = require('path');
 const { Pool } = require('pg');
 const { createApp } = require('../../src/subscription-management/app');
 const { createLogger } = require('../../src/lib/logger');
@@ -114,37 +112,8 @@ function noopAdmin() {
   };
 }
 
-/**
- * Run all .sql migrations in order, idempotently.
- *
- * Each migration is wrapped in a transaction. If the schema is already up
- * (e.g. another test process applied it), the IF NOT EXISTS / ON CONFLICT
- * clauses in our migrations make this safe.
- */
-async function applyMigrations(pool) {
-  const dir = path.join(__dirname, '..', '..', 'migrations');
-  const files = fs
-    .readdirSync(dir)
-    .filter(f => f.endsWith('.sql'))
-    .sort();
-  for (const file of files) {
-    const sql = fs.readFileSync(path.join(dir, file), 'utf-8');
-    try {
-      await pool.query(sql);
-    } catch (err) {
-      // Tolerate "already exists" classes of errors so the suite is
-      // re-runnable. Any other error is fatal.
-      const msg = String(err.message || '');
-      if (
-        !/already exists/i.test(msg) &&
-        !/duplicate object/i.test(msg) &&
-        !/duplicate column/i.test(msg)
-      ) {
-        throw new Error(`Migration ${file} failed: ${err.message}`);
-      }
-    }
-  }
-}
+// Migrations are applied by jest globalSetup (tests/integration/global-setup.js)
+// once before any worker starts, to avoid parallel CREATE-TABLE races.
 
 let pool;
 let app;
@@ -157,7 +126,6 @@ async function setupTestApp() {
   process.env.JWT_SECRET = process.env.JWT_SECRET || 'integration-test-jwt-secret-pad-32+chars';
 
   pool = new Pool({ connectionString: TEST_DATABASE_URL, max: 5 });
-  await applyMigrations(pool);
 
   const log = createLogger('test-app');
   // Generous limits so the suite never trips them by accident

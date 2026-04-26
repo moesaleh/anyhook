@@ -16,6 +16,12 @@ module.exports = {
   // don't race on CREATE TABLE / CREATE INDEX / pg_type allocation.
   globalSetup: '<rootDir>/tests/integration/global-setup.js',
 
+  // Run tests serially. Unit tests are fast (~1s for 117); the integration
+  // suites share a single Postgres database and TRUNCATE between tests, so
+  // parallel files would race on each other's data. Cleanest option here:
+  // single worker. Bumping back to parallel needs per-file DB schemas.
+  maxWorkers: 1,
+
   silent: false,
   verbose: false,
 

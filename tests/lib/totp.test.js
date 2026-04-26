@@ -85,10 +85,13 @@ describe('generateTotp + verifyTotp', () => {
     expect(verifyTotp(secret, ancient)).toBe(false);
   });
 
-  it.each([null, undefined, '', 'abcdef', '12345', '1234567'])('rejects malformed code %p', code => {
-    const secret = generateTotpSecret();
-    expect(verifyTotp(secret, code)).toBe(false);
-  });
+  it.each([null, undefined, '', 'abcdef', '12345', '1234567'])(
+    'rejects malformed code %p',
+    code => {
+      const secret = generateTotpSecret();
+      expect(verifyTotp(secret, code)).toBe(false);
+    }
+  );
 });
 
 describe('otpauthUrl', () => {

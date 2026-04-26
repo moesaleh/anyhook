@@ -3,6 +3,7 @@ module.exports = {
   env: {
     node: true,
     es6: true,
+    es2022: true, // BigInt globals etc — used by lib/totp.js
   },
   parserOptions: {
     // Bumped from 2020 → 2022 so BigInt literals (10n), `??=`, error

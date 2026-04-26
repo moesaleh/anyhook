@@ -9,6 +9,10 @@ import {
   AlertCircle,
   CheckCircle2,
   Loader2,
+  Key,
+  Copy,
+  Check,
+  ShieldAlert,
 } from "lucide-react";
 import { createSubscription } from "@/lib/api";
 import { cn } from "@/lib/utils";
@@ -52,8 +56,9 @@ export default function NewSubscriptionWizard() {
   // UI state
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [submitError, setSubmitError] = useState<string | null>(null);
-  const [success, setSuccess] = useState<string | null>(null);
+  const [success, setSuccess] = useState<{ id: string; secret: string } | null>(null);
   const [loading, setLoading] = useState(false);
+  const [secretCopied, setSecretCopied] = useState(false);
 
   function validateStep(s: number): boolean {
     const errs: Record<string, string> = {};
@@ -137,7 +142,7 @@ export default function NewSubscriptionWizard() {
         args,
         webhook_url: webhookUrl,
       });
-      setSuccess(result.subscriptionId);
+      setSuccess({ id: result.subscriptionId, secret: result.webhook_secret });
     } catch {
       setSubmitError(
         "Failed to create subscription. Make sure the API is running."
@@ -147,7 +152,18 @@ export default function NewSubscriptionWizard() {
     }
   }
 
-  // Success state — full-page confirmation
+  async function copySecret() {
+    if (!success) return;
+    try {
+      await navigator.clipboard.writeText(success.secret);
+      setSecretCopied(true);
+      setTimeout(() => setSecretCopied(false), 2000);
+    } catch {
+      // clipboard API can fail in non-secure contexts; keep silent
+    }
+  }
+
+  // Success state — full-page confirmation with one-time secret display
   if (success) {
     return (
       <div className="p-6 lg:p-8 max-w-2xl mx-auto">
@@ -158,16 +174,65 @@ export default function NewSubscriptionWizard() {
           <h1 className="text-2xl font-bold tracking-tight mb-2">
             Subscription Created
           </h1>
-          <p className="text-sm text-neutral-500 mb-2 max-w-md">
+          <p className="text-sm text-neutral-500 mb-4 max-w-md">
             Your subscription is now active. AnyHook will connect to your source
             and start delivering data to your webhook endpoint.
           </p>
-          <code className="text-xs bg-neutral-100 dark:bg-neutral-900 px-3 py-1.5 rounded-lg font-mono text-neutral-600 dark:text-neutral-400 mb-8">
-            {success}
+          <div className="text-xs text-neutral-400 mb-1">Subscription ID</div>
+          <code className="text-xs bg-neutral-100 dark:bg-neutral-900 px-3 py-1.5 rounded-lg font-mono text-neutral-600 dark:text-neutral-400 mb-6">
+            {success.id}
           </code>
+
+          {/* One-time webhook signing secret */}
+          <div className="w-full max-w-xl rounded-xl border border-amber-300 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/40 p-4 mb-6 text-left">
+            <div className="flex items-start gap-2 mb-2">
+              <ShieldAlert className="h-4 w-4 text-amber-600 dark:text-amber-400 mt-0.5 flex-shrink-0" />
+              <div className="flex-1">
+                <p className="text-sm font-medium text-amber-900 dark:text-amber-200">
+                  Save your webhook signing secret — shown only once
+                </p>
+                <p className="text-xs text-amber-700 dark:text-amber-300 mt-1">
+                  Use this to verify the <code className="font-mono">X-AnyHook-Signature</code>{" "}
+                  header on each delivery (HMAC-SHA256 of{" "}
+                  <code className="font-mono">{`<timestamp>.<body>`}</code>).
+                  We don&apos;t store this anywhere you can retrieve it later.
+                </p>
+              </div>
+            </div>
+            <div className="flex items-center gap-2 mt-3">
+              <div className="flex-1 flex items-center gap-2 rounded-lg border border-amber-200 dark:border-amber-900 bg-white dark:bg-neutral-950 px-3 py-2">
+                <Key className="h-3.5 w-3.5 text-amber-600 dark:text-amber-400 flex-shrink-0" />
+                <code className="text-xs font-mono text-neutral-700 dark:text-neutral-300 break-all flex-1">
+                  {success.secret}
+                </code>
+              </div>
+              <button
+                type="button"
+                onClick={copySecret}
+                className={cn(
+                  "inline-flex items-center gap-1.5 rounded-lg px-3 py-2 text-xs font-medium transition-colors",
+                  secretCopied
+                    ? "bg-emerald-100 dark:bg-emerald-900 text-emerald-700 dark:text-emerald-300"
+                    : "bg-amber-100 dark:bg-amber-900 text-amber-800 dark:text-amber-200 hover:bg-amber-200 dark:hover:bg-amber-800"
+                )}
+                aria-label="Copy webhook secret"
+              >
+                {secretCopied ? (
+                  <>
+                    <Check className="h-3.5 w-3.5" /> Copied
+                  </>
+                ) : (
+                  <>
+                    <Copy className="h-3.5 w-3.5" /> Copy
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+
           <div className="flex gap-3">
             <Link
-              href={`/subscriptions/${success}`}
+              href={`/subscriptions/${success.id}`}
               className="rounded-lg bg-indigo-600 text-white px-5 py-2.5 text-sm font-medium hover:bg-indigo-700 transition-colors shadow-sm"
             >
               View Subscription

@@ -162,11 +162,19 @@ export async function fetchGlobalDeliveryStats(): Promise<GlobalDeliveryStats> {
   return res.json();
 }
 
+export interface CreateSubscriptionResponse {
+  subscriptionId: string;
+  // Returned ONCE on creation. Receivers store this and use it to verify
+  // X-AnyHook-Signature on every delivery. Never returned by GET endpoints.
+  webhook_secret: string;
+  message: string;
+}
+
 export async function createSubscription(data: {
   connection_type: string;
   args: Record<string, unknown>;
   webhook_url: string;
-}): Promise<{ subscriptionId: string; message: string }> {
+}): Promise<CreateSubscriptionResponse> {
   const res = await fetch(`${API_BASE}/subscribe`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },

@@ -2,7 +2,7 @@ version: '3.8'
 
 services:
   subscription-management:
-    image: ghcr.io/swanblocks-inc/anyhook:latest
+    image: ghcr.io/moesaleh/anyhook:latest
     container_name: anyhook-subscription
     restart: unless-stopped
     command: node /app/src/subscription-management/index.js
@@ -11,41 +11,63 @@ services:
     ports:
       - "${PORT:-3001}:3001"
     depends_on:
-      - postgres
-      - redis
-      - kafka
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      # Node 22 has fetch built in. Hits the /health endpoint, exits non-zero
+      # on non-2xx so unhealthy goes to 'degraded' (status 503).
+      test: ["CMD-SHELL", "node -e \"fetch('http://localhost:3001/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
     networks:
       - anyhook
 
   subscription-connector:
-    image: ghcr.io/swanblocks-inc/anyhook:latest
+    image: ghcr.io/moesaleh/anyhook:latest
     container_name: anyhook-connector
     restart: unless-stopped
     command: node /app/src/subscription-connector/index.js
     env_file:
       - ./.env
     depends_on:
-      - postgres
-      - redis
-      - kafka
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      subscription-management:
+        condition: service_healthy
     networks:
       - anyhook
 
   webhook-dispatcher:
-    image: ghcr.io/swanblocks-inc/anyhook:latest
+    image: ghcr.io/moesaleh/anyhook:latest
     container_name: anyhook-dispatcher
     restart: unless-stopped
     command: node /app/src/webhook-dispatcher/index.js
     env_file:
       - ./.env
     depends_on:
-      - postgres
-      - redis
-      - kafka
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      subscription-management:
+        condition: service_healthy
     networks:
       - anyhook
 
   dashboard:
+    image: ghcr.io/moesaleh/anyhook-dashboard:latest
     build:
       context: ./dashboard
       dockerfile: Dockerfile
@@ -56,7 +78,14 @@ services:
     ports:
       - "${DASHBOARD_PORT:-3000}:3000"
     depends_on:
-      - subscription-management
+      subscription-management:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://localhost:3000').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
     networks:
       - anyhook
 
@@ -72,6 +101,12 @@ services:
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     networks:
       - anyhook
 
@@ -83,9 +118,15 @@ services:
       - "${REDIS_PORT:-6379}:6379"
     volumes:
       - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
     networks:
       - anyhook
-      
+
   kafka:
     image: bitnami/kafka:3.9.1
     container_name: kafka
@@ -100,6 +141,14 @@ services:
       - KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER
     volumes:
       - kafka_data:/bitnami/kafka
+    healthcheck:
+      # bitnami kafka ships with kafka-broker-api-versions.sh; non-zero exit
+      # if the broker isn't accepting requests yet.
+      test: ["CMD-SHELL", "kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 45s
     networks:
       - anyhook
 

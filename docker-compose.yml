@@ -61,7 +61,7 @@ services:
       - anyhook
 
   postgres:
-    image: 'postgres:14.4'
+    image: 'postgres:14.18'
     container_name: postgres
     restart: unless-stopped
     environment:
@@ -76,7 +76,7 @@ services:
       - anyhook
 
   redis:
-    image: 'redis:7.0.7'
+    image: 'redis:7.4.5'
     container_name: redis
     restart: unless-stopped
     ports:
@@ -87,7 +87,7 @@ services:
       - anyhook
       
   kafka:
-    image: bitnami/kafka:3.8.0
+    image: bitnami/kafka:3.9.1
     container_name: kafka
     ports:
       - "${KAFKA_PORT:-9092}:9092"

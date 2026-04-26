@@ -1,4 +1,4 @@
-FROM node:18.19-bullseye-slim AS base
+FROM node:20-bookworm-slim AS base
 
 WORKDIR /app
 

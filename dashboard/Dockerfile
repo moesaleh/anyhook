@@ -1,4 +1,4 @@
-FROM node:18-bullseye-slim AS base
+FROM node:20-bookworm-slim AS base
 
 # Install dependencies
 FROM base AS deps

@@ -161,11 +161,23 @@ function noopMiddleware(req, res, next) {
   next();
 }
 
-function mountAuthRoutes(app, { pool, rateLimit, authRateLimit, apiKeyQuota, quotaLimits }) {
+function mountAuthRoutes(
+  app,
+  { pool, rateLimit, authRateLimit, apiKeyQuota, quotaLimits, emailTransport }
+) {
   const requireAuth = makeRequireAuth({ pool });
   const rl = rateLimit || noopMiddleware;
   const authRl = authRateLimit || noopMiddleware;
   const apiKeyQuotaMw = apiKeyQuota || noopMiddleware;
+  // No-op email when SMTP isn't configured (dev / tests).
+  const email = emailTransport || {
+    enabled: false,
+    from: 'noreply@anyhook.local',
+    async send() {
+      return { delivered: false, reason: 'no_transport' };
+    },
+  };
+  const baseUrl = (process.env.DASHBOARD_URL || 'http://localhost:3000').replace(/\/$/, '');
   // Limits used by the read-only /quotas endpoint. The middleware-side
   // limits are baked in at construction time; this echoes them so the
   // dashboard can show "X/Y used" without scraping headers from every call.
@@ -851,13 +863,13 @@ function mountAuthRoutes(app, { pool, rateLimit, authRateLimit, apiKeyQuota, quo
   // in the response so the dashboard / curl can complete the flow
   // end-to-end without an SMTP setup. Documented in the response.
   app.post('/auth/password/reset-request', authRl, async (req, res) => {
-    const { email } = req.body || {};
-    if (!email || typeof email !== 'string') {
+    const { email: email_address } = req.body || {};
+    if (!email_address || typeof email_address !== 'string') {
       return res.status(400).json({ error: 'email is required' });
     }
     try {
       const userResult = await pool.query('SELECT id FROM users WHERE LOWER(email) = LOWER($1)', [
-        email,
+        email_address,
       ]);
       if (userResult.rowCount === 0) {
         // No-op — same response shape so callers can't tell registered
@@ -875,12 +887,28 @@ function mountAuthRoutes(app, { pool, rateLimit, authRateLimit, apiKeyQuota, quo
          VALUES ($1, $2, $3)`,
         [userId, hash, expiresAt]
       );
+
+      // If SMTP is configured, send the email and OMIT the raw token from
+      // the response. Without SMTP, fall back to returning the token so the
+      // dashboard / curl flow still works in dev.
+      const resetUrl = `${baseUrl}/auth/password/reset?token=${encodeURIComponent(raw)}`;
+      let delivery = { delivered: false, reason: 'no_transport' };
+      if (email.enabled) {
+        delivery = await email.send({
+          to: email_address,
+          subject: 'Reset your AnyHook password',
+          text:
+            `Hello,\n\nA password reset was requested for your AnyHook account.\n\n` +
+            `Reset your password: ${resetUrl}\n\n` +
+            `This link expires at ${expiresAt.toISOString()}. ` +
+            `If you didn't request this, ignore this email.`,
+        });
+      }
+
       res.status(200).json({
         message: 'If that email is registered, a reset link has been generated',
-        // Returned for dev convenience. Production should remove this and
-        // email the raw value instead.
-        token: raw,
-        expires_at: expiresAt,
+        ...(delivery.delivered ? {} : { token: raw, expires_at: expiresAt }),
+        email_sent: delivery.delivered,
       });
     } catch (err) {
       log.error('Password reset request failed:', err);
@@ -955,8 +983,9 @@ function mountAuthRoutes(app, { pool, rateLimit, authRateLimit, apiKeyQuota, quo
     rl,
     requireRole('owner', 'admin'),
     async (req, res) => {
-      const { email, role, expires_in_days: expiresInDays } = req.body || {};
-      if (!email || typeof email !== 'string' || !/^.+@.+\..+$/.test(email)) {
+      // Renamed to avoid shadowing the outer `email` (transport).
+      const { email: invite_email, role, expires_in_days: expiresInDays } = req.body || {};
+      if (!invite_email || typeof invite_email !== 'string' || !/^.+@.+\..+$/.test(invite_email)) {
         return res.status(400).json({ error: 'Valid email is required' });
       }
       const targetRole = role || 'member';
@@ -978,19 +1007,36 @@ function mountAuthRoutes(app, { pool, rateLimit, authRateLimit, apiKeyQuota, quo
            RETURNING id, organization_id, email, role, expires_at, created_at`,
           [
             req.auth.organizationId,
-            email.toLowerCase(),
+            invite_email.toLowerCase(),
             targetRole,
             hash,
             expiresAt,
             req.auth.userId,
           ]
         );
-        // raw token is returned ONCE — caller forwards it to the invitee
-        // out-of-band (email/Slack/etc.). We don't send email ourselves yet.
+
+        // Try to email the invitee if SMTP is configured. On success,
+        // omit the raw token from the response (delivered via email).
+        const inviteUrl = `${baseUrl}/invitations/${raw}`;
+        let delivery = { delivered: false, reason: 'no_transport' };
+        if (email.enabled) {
+          delivery = await email.send({
+            to: result.rows[0].email,
+            subject: `You've been invited to join an organization on AnyHook`,
+            text:
+              `Hello,\n\nYou've been invited to join an organization on AnyHook ` +
+              `as a ${targetRole}.\n\nAccept the invitation: ${inviteUrl}\n\n` +
+              `This link expires at ${result.rows[0].expires_at.toISOString()}.`,
+          });
+        }
+
         res.status(201).json({
           ...result.rows[0],
-          token: raw,
-          message: 'Invitation created. Save the token — it is shown only once.',
+          ...(delivery.delivered ? {} : { token: raw }),
+          email_sent: delivery.delivered,
+          message: delivery.delivered
+            ? 'Invitation created and emailed.'
+            : 'Invitation created. Save the token — it is shown only once.',
         });
       } catch (err) {
         log.error('Create invitation failed:', err);

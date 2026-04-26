@@ -20,6 +20,7 @@ const fs = require('fs');
 const path = require('path');
 const { isValidUrl } = require('../lib/url-validation');
 const { makeSubscriptionQuotaCheck, makeApiKeyQuotaCheck } = require('../lib/quotas');
+const { makeEmailTransport } = require('../lib/email');
 const { mountAuthRoutes } = require('./auth');
 
 // Read OpenAPI spec at module load. Errors during read fall back to a
@@ -169,11 +170,15 @@ function createApp({
     limit: parseInt(process.env.ORG_MAX_API_KEYS, 10) || undefined,
   });
 
+  // SMTP transport — no-op when SMTP_HOST unset (dev / tests).
+  const emailTransport = makeEmailTransport({ log });
+
   const { requireAuth } = mountAuthRoutes(app, {
     pool,
     rateLimit,
     authRateLimit,
     apiKeyQuota,
+    emailTransport,
     quotaLimits: {
       subscriptions: parseInt(process.env.ORG_MAX_SUBSCRIPTIONS, 10) || 100,
       apiKeys: parseInt(process.env.ORG_MAX_API_KEYS, 10) || 10,

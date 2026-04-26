@@ -103,7 +103,7 @@ services:
       - anyhook
 
   postgres:
-    image: 'postgres:14.18'
+    image: 'postgres:17.2'
     container_name: postgres
     restart: unless-stopped
     environment:

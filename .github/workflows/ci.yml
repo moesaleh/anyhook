@@ -32,6 +32,23 @@ jobs:
             node --check "$f"
           done
 
+  # Unit tests for the lib/ modules (no PG/Redis/Kafka required).
+  backend-tests:
+    name: Backend tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - run: npm ci
+      - name: Run unit tests with coverage
+        run: npm run test:coverage
+        env:
+          # JWT helpers refuse to run with a short or missing secret.
+          JWT_SECRET: ${{ secrets.JWT_SECRET || 'ci-test-jwt-secret-pad-to-32-characters' }}
+
   # Lint + type-check + production build of the dashboard on every push & PR.
   dashboard-build:
     name: Dashboard lint + build
@@ -63,7 +80,7 @@ jobs:
   publish:
     name: Build & push images
     runs-on: ubuntu-latest
-    needs: [backend-lint, dashboard-build]
+    needs: [backend-lint, backend-tests, dashboard-build]
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v4

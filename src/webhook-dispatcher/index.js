@@ -5,10 +5,10 @@ const redis = require('@redis/client');
 const axios = require('axios');
 const { Pool } = require('pg');
 const { v4: uuidv4 } = require('uuid');
-const crypto = require('crypto');
 const promClient = require('prom-client');
 const { createLogger } = require('../lib/logger');
 const { startMetricsServer } = require('../lib/metrics-server');
+const { signRequest } = require('../lib/webhook-signature');
 
 const log = createLogger('webhook-dispatcher');
 
@@ -235,18 +235,6 @@ async function handleConnectionEvent({ message }) {
   } catch (error) {
     log.error(`Error processing message for subscription ID: ${subscriptionId}`, error);
   }
-}
-
-/**
- * Compute the standard webhook signature header value.
- * Format: `t=<unix_seconds>,v1=<hex_hmac_sha256>` over `<timestamp>.<body>`.
- * The timestamped scheme prevents replay attacks; receivers should reject
- * timestamps older than ~5 minutes.
- */
-function signRequest(secret, timestampSec, rawBody) {
-  const payload = `${timestampSec}.${rawBody}`;
-  const hmac = crypto.createHmac('sha256', secret).update(payload).digest('hex');
-  return { signature: `t=${timestampSec},v1=${hmac}`, hmac };
 }
 
 /**

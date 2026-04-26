@@ -11,65 +11,16 @@
  *   userId is null for API-key-authenticated requests.
  */
 
-const crypto = require('crypto');
-const { promisify } = require('util');
-const jwt = require('jsonwebtoken');
 const { createLogger } = require('../lib/logger');
+const { hashPassword, verifyPassword } = require('../lib/passwords');
+const { signSession, verifySession } = require('../lib/jwt');
+const { generateApiKey, hashApiKey } = require('../lib/api-keys');
+const { slugify } = require('../lib/slug');
 
 const log = createLogger('auth');
-const scrypt = promisify(crypto.scrypt);
 
-const SCRYPT_KEYLEN = 64;
-const SCRYPT_SALT_BYTES = 16;
 const COOKIE_NAME = 'anyhook_session';
 const COOKIE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
-
-function getJwtSecret() {
-  const secret = process.env.JWT_SECRET;
-  if (!secret || secret.length < 32) {
-    throw new Error('JWT_SECRET must be set to a value at least 32 characters long');
-  }
-  return secret;
-}
-
-// --- Password hashing (scrypt — Node built-in, no native deps) ---
-
-async function hashPassword(plain) {
-  if (!plain || typeof plain !== 'string' || plain.length < 8) {
-    throw new Error('Password must be at least 8 characters');
-  }
-  const salt = crypto.randomBytes(SCRYPT_SALT_BYTES);
-  const derived = await scrypt(plain, salt, SCRYPT_KEYLEN);
-  return `scrypt$${salt.toString('hex')}$${derived.toString('hex')}`;
-}
-
-async function verifyPassword(plain, stored) {
-  if (!plain || !stored) return false;
-  const parts = stored.split('$');
-  if (parts.length !== 3 || parts[0] !== 'scrypt') return false;
-  const salt = Buffer.from(parts[1], 'hex');
-  const expected = Buffer.from(parts[2], 'hex');
-  const derived = await scrypt(plain, salt, expected.length);
-  if (derived.length !== expected.length) return false;
-  return crypto.timingSafeEqual(derived, expected);
-}
-
-// --- JWT helpers ---
-
-function signSession(userId, organizationId) {
-  return jwt.sign({ sub: userId, org: organizationId }, getJwtSecret(), {
-    expiresIn: '7d',
-    issuer: 'anyhook',
-  });
-}
-
-function verifySession(token) {
-  try {
-    return jwt.verify(token, getJwtSecret(), { issuer: 'anyhook' });
-  } catch {
-    return null;
-  }
-}
 
 function setSessionCookie(res, token) {
   const isProd = process.env.NODE_ENV === 'production';
@@ -84,33 +35,6 @@ function setSessionCookie(res, token) {
 
 function clearSessionCookie(res) {
   res.clearCookie(COOKIE_NAME, { path: '/' });
-}
-
-// --- API key helpers ---
-
-function generateApiKey() {
-  // ak_ prefix so users can recognize the value at a glance and grep for it.
-  const raw = `ak_${crypto.randomBytes(32).toString('base64url')}`;
-  const hash = crypto.createHash('sha256').update(raw).digest('hex');
-  const prefix = raw.slice(0, 11); // "ak_" + 8 chars
-  return { raw, hash, prefix };
-}
-
-function hashApiKey(raw) {
-  return crypto.createHash('sha256').update(raw).digest('hex');
-}
-
-// --- Slug helpers ---
-
-function slugify(name) {
-  return (
-    String(name || '')
-      .toLowerCase()
-      .trim()
-      .replace(/[^a-z0-9]+/g, '-')
-      .replace(/^-+|-+$/g, '')
-      .slice(0, 64) || 'org'
-  );
 }
 
 // --- Auth middleware ---

@@ -95,6 +95,12 @@ jobs:
           # Build-time inlined into the client bundle. CI has no real backend;
           # pick any string. Real deploys must override this in their env.
           NEXT_PUBLIC_API_URL: http://localhost:3001
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+      - name: E2E tests (Playwright)
+        run: npm run test:e2e
+        env:
+          NEXT_PUBLIC_API_URL: http://localhost:3001
 
   # Build + push images to GHCR. Only runs on push to main (post-merge) and
   # on manual dispatch — never on pull_request events, so unmerged PRs can't

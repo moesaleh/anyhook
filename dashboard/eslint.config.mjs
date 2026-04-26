@@ -12,6 +12,13 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // Playwright artifacts and config (vitest globs cover unit tests, not
+    // these). The e2e tests use Playwright's globals via the @playwright/test
+    // import, not jest globals — separate lint scope.
+    "test-results/**",
+    "playwright-report/**",
+    "e2e/**",
+    "playwright.config.ts",
   ]),
   {
     rules: {

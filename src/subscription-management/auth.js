@@ -13,8 +13,20 @@
 
 const { createLogger } = require('../lib/logger');
 const { hashPassword, verifyPassword } = require('../lib/passwords');
-const { signSession, verifySession } = require('../lib/jwt');
+const {
+  signSession,
+  verifySession,
+  signEphemeralToken,
+  verifyEphemeralToken,
+} = require('../lib/jwt');
 const { generateApiKey, hashApiKey } = require('../lib/api-keys');
+const {
+  generateTotpSecret,
+  verifyTotp,
+  otpauthUrl,
+  generateBackupCodes,
+  hashBackupCode,
+} = require('../lib/totp');
 const {
   generateInvitationToken,
   hashInvitationToken,
@@ -243,9 +255,35 @@ function mountAuthRoutes(app, { pool, rateLimit, authRateLimit, apiKeyQuota, quo
     }
   });
 
+  /**
+   * Build the standard "logged in" payload + set the session cookie.
+   * Reused by /auth/login (no-2FA path) and /auth/2fa/verify-login.
+   */
+  async function completeLogin(res, user) {
+    const orgs = await pool.query(
+      `SELECT o.id, o.name, o.slug, m.role
+       FROM memberships m
+       JOIN organizations o ON o.id = m.organization_id
+       WHERE m.user_id = $1
+       ORDER BY m.created_at ASC`,
+      [user.id]
+    );
+    if (orgs.rowCount === 0) {
+      return res.status(403).json({ error: 'User has no organization memberships' });
+    }
+    const activeOrg = orgs.rows[0];
+    const token = signSession(user.id, activeOrg.id);
+    setSessionCookie(res, token);
+    return res.status(200).json({
+      user: { id: user.id, email: user.email, name: user.name },
+      organization: activeOrg,
+      organizations: orgs.rows,
+    });
+  }
+
   // POST /auth/login — returns user + active org; session cookie set.
-  // If user belongs to multiple orgs, defaults to the first; client can
-  // POST /auth/switch-org afterwards.
+  // If 2FA is enabled, returns { needs_2fa: true, pending_token } instead
+  // and the client must POST /auth/2fa/verify-login to complete.
   // IP-rate-limited to slow credential-stuffing.
   app.post('/auth/login', authRl, async (req, res) => {
     const { email, password } = req.body || {};
@@ -255,11 +293,10 @@ function mountAuthRoutes(app, { pool, rateLimit, authRateLimit, apiKeyQuota, quo
 
     try {
       const userResult = await pool.query(
-        'SELECT id, email, name, password_hash FROM users WHERE LOWER(email) = LOWER($1)',
+        `SELECT id, email, name, password_hash, totp_secret, totp_enabled_at
+         FROM users WHERE LOWER(email) = LOWER($1)`,
         [email]
       );
-      // Constant-time-ish: always do a hash check even if user not found,
-      // so timing doesn't leak account existence.
       const dummyHash = 'scrypt$00000000000000000000000000000000$' + '0'.repeat(128);
       const stored = userResult.rowCount > 0 ? userResult.rows[0].password_hash : dummyHash;
       const ok = await verifyPassword(password, stored);
@@ -268,29 +305,258 @@ function mountAuthRoutes(app, { pool, rateLimit, authRateLimit, apiKeyQuota, quo
       }
 
       const user = userResult.rows[0];
-      const orgs = await pool.query(
-        `SELECT o.id, o.name, o.slug, m.role
-                 FROM memberships m
-                 JOIN organizations o ON o.id = m.organization_id
-                 WHERE m.user_id = $1
-                 ORDER BY m.created_at ASC`,
-        [user.id]
-      );
-      if (orgs.rowCount === 0) {
-        return res.status(403).json({ error: 'User has no organization memberships' });
-      }
-      const activeOrg = orgs.rows[0];
 
-      const token = signSession(user.id, activeOrg.id);
-      setSessionCookie(res, token);
-      res.status(200).json({
-        user: { id: user.id, email: user.email, name: user.name },
-        organization: activeOrg,
-        organizations: orgs.rows,
-      });
+      if (user.totp_enabled_at) {
+        const pendingToken = signEphemeralToken(
+          { sub: user.id, purpose: '2fa-pending' },
+          { expiresIn: '5m' }
+        );
+        return res.status(200).json({ needs_2fa: true, pending_token: pendingToken });
+      }
+
+      return completeLogin(res, user);
     } catch (err) {
       log.error('Login failed:', err);
       res.status(500).json({ error: 'Login failed' });
+    }
+  });
+
+  // POST /auth/2fa/verify-login — second step when 2FA is enabled.
+  // Body: { pending_token, code }   code = 6-digit TOTP OR xxxx-xxxx backup code.
+  app.post('/auth/2fa/verify-login', authRl, async (req, res) => {
+    const { pending_token: pendingToken, code } = req.body || {};
+    if (!pendingToken || !code) {
+      return res.status(400).json({ error: 'pending_token and code are required' });
+    }
+    const claims = verifyEphemeralToken(pendingToken);
+    if (!claims || claims.purpose !== '2fa-pending' || !claims.sub) {
+      return res.status(401).json({ error: 'Invalid or expired pending token' });
+    }
+    try {
+      const userResult = await pool.query(
+        `SELECT id, email, name, totp_secret, totp_enabled_at
+         FROM users WHERE id = $1`,
+        [claims.sub]
+      );
+      if (userResult.rowCount === 0 || !userResult.rows[0].totp_enabled_at) {
+        return res.status(400).json({ error: '2FA is not enabled for this user' });
+      }
+      const user = userResult.rows[0];
+
+      // TOTP attempt (no DB hit, fast path)
+      if (typeof code === 'string' && /^\d{6}$/.test(code) && verifyTotp(user.totp_secret, code)) {
+        return completeLogin(res, user);
+      }
+
+      // Backup code attempt: hash, claim under FOR UPDATE in a tx.
+      if (typeof code === 'string' && /^[0-9a-f]{4}-[0-9a-f]{4}$/.test(code)) {
+        const codeHash = hashBackupCode(code);
+        const client = await pool.connect();
+        try {
+          await client.query('BEGIN');
+          const r = await client.query(
+            `SELECT id FROM backup_codes
+             WHERE user_id = $1 AND code_hash = $2 AND used_at IS NULL
+             FOR UPDATE`,
+            [user.id, codeHash]
+          );
+          if (r.rowCount === 0) {
+            await client.query('ROLLBACK');
+            return res.status(401).json({ error: 'Invalid 2FA code' });
+          }
+          await client.query('UPDATE backup_codes SET used_at = NOW() WHERE id = $1', [
+            r.rows[0].id,
+          ]);
+          await client.query('COMMIT');
+          return completeLogin(res, user);
+        } finally {
+          client.release();
+        }
+      }
+
+      return res.status(401).json({ error: 'Invalid 2FA code' });
+    } catch (err) {
+      log.error('2FA verify-login failed:', err);
+      res.status(500).json({ error: '2FA verification failed' });
+    }
+  });
+
+  // GET /auth/2fa/status — current 2FA state for the logged-in user.
+  app.get('/auth/2fa/status', requireAuth, rl, async (req, res) => {
+    if (req.auth.via !== 'cookie') {
+      return res.status(403).json({ error: '2FA management is only available via session login' });
+    }
+    try {
+      const r = await pool.query(
+        `SELECT
+           totp_enabled_at,
+           totp_secret IS NOT NULL AS has_pending_secret,
+           (SELECT COUNT(*)::int FROM backup_codes
+            WHERE user_id = u.id AND used_at IS NULL) AS unused_backup_codes
+         FROM users u WHERE u.id = $1`,
+        [req.auth.userId]
+      );
+      const row = r.rows[0] || {};
+      res.status(200).json({
+        enabled: !!row.totp_enabled_at,
+        enrollment_pending: !!row.has_pending_secret && !row.totp_enabled_at,
+        unused_backup_codes: row.unused_backup_codes || 0,
+      });
+    } catch (err) {
+      log.error('2FA status failed:', err);
+      res.status(500).json({ error: '2FA status failed' });
+    }
+  });
+
+  // POST /auth/2fa/setup — start enrollment. Generates a secret + returns
+  // it (plus otpauth URL for QR rendering). NOT enabled until verify-setup.
+  // Refuses if already enabled — disable first to rotate.
+  app.post('/auth/2fa/setup', requireAuth, rl, async (req, res) => {
+    if (req.auth.via !== 'cookie') {
+      return res.status(403).json({ error: '2FA management is only available via session login' });
+    }
+    try {
+      const userResult = await pool.query(
+        'SELECT email, totp_enabled_at FROM users WHERE id = $1',
+        [req.auth.userId]
+      );
+      if (userResult.rowCount === 0) return res.status(404).json({ error: 'User not found' });
+      if (userResult.rows[0].totp_enabled_at) {
+        return res.status(409).json({
+          error: '2FA is already enabled — disable it first to enroll a new device',
+        });
+      }
+      const secret = generateTotpSecret();
+      await pool.query('UPDATE users SET totp_secret = $1 WHERE id = $2', [
+        secret,
+        req.auth.userId,
+      ]);
+      res.status(200).json({
+        secret,
+        otpauth_url: otpauthUrl({
+          secret,
+          label: userResult.rows[0].email,
+          issuer: process.env.TOTP_ISSUER || 'AnyHook',
+        }),
+      });
+    } catch (err) {
+      log.error('2FA setup failed:', err);
+      res.status(500).json({ error: '2FA setup failed' });
+    }
+  });
+
+  // POST /auth/2fa/verify-setup — finalize enrollment. Verifies a code
+  // against the pending secret, marks 2FA enabled, generates 10 backup
+  // codes (raw values returned ONCE).
+  app.post('/auth/2fa/verify-setup', requireAuth, rl, async (req, res) => {
+    if (req.auth.via !== 'cookie') {
+      return res.status(403).json({ error: '2FA management is only available via session login' });
+    }
+    const { code } = req.body || {};
+    if (!code || typeof code !== 'string' || !/^\d{6}$/.test(code)) {
+      return res.status(400).json({ error: 'A 6-digit code is required' });
+    }
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const userResult = await client.query(
+        'SELECT totp_secret, totp_enabled_at FROM users WHERE id = $1 FOR UPDATE',
+        [req.auth.userId]
+      );
+      if (userResult.rowCount === 0) {
+        await client.query('ROLLBACK');
+        return res.status(404).json({ error: 'User not found' });
+      }
+      const row = userResult.rows[0];
+      if (row.totp_enabled_at) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ error: '2FA is already enabled' });
+      }
+      if (!row.totp_secret) {
+        await client.query('ROLLBACK');
+        return res
+          .status(400)
+          .json({ error: 'No pending enrollment — call /auth/2fa/setup first' });
+      }
+      if (!verifyTotp(row.totp_secret, code)) {
+        await client.query('ROLLBACK');
+        return res.status(401).json({ error: 'Invalid 2FA code' });
+      }
+      await client.query(
+        'UPDATE users SET totp_enabled_at = NOW(), updated_at = NOW() WHERE id = $1',
+        [req.auth.userId]
+      );
+      await client.query('DELETE FROM backup_codes WHERE user_id = $1', [req.auth.userId]);
+      const codes = generateBackupCodes(10);
+      const valuesSql = codes.map((_c, i) => `($1, $${i + 2})`).join(', ');
+      await client.query(`INSERT INTO backup_codes (user_id, code_hash) VALUES ${valuesSql}`, [
+        req.auth.userId,
+        ...codes.map(c => c.hash),
+      ]);
+      await client.query('COMMIT');
+      res.status(200).json({
+        enabled: true,
+        backup_codes: codes.map(c => c.raw),
+        message: 'Save these backup codes — they are shown only once.',
+      });
+    } catch (err) {
+      await client.query('ROLLBACK');
+      log.error('2FA verify-setup failed:', err);
+      res.status(500).json({ error: '2FA verify-setup failed' });
+    } finally {
+      client.release();
+    }
+  });
+
+  // POST /auth/2fa/disable — turn 2FA off. Requires current_password
+  // AND a current TOTP code (or backup code).
+  app.post('/auth/2fa/disable', requireAuth, rl, async (req, res) => {
+    if (req.auth.via !== 'cookie') {
+      return res.status(403).json({ error: '2FA management is only available via session login' });
+    }
+    const { current_password: currentPassword, code } = req.body || {};
+    if (!currentPassword || !code) {
+      return res.status(400).json({ error: 'current_password and code are required' });
+    }
+    try {
+      const userResult = await pool.query(
+        'SELECT password_hash, totp_secret, totp_enabled_at FROM users WHERE id = $1',
+        [req.auth.userId]
+      );
+      if (userResult.rowCount === 0) return res.status(404).json({ error: 'User not found' });
+      const user = userResult.rows[0];
+      if (!user.totp_enabled_at) return res.status(400).json({ error: '2FA is not enabled' });
+
+      if (!(await verifyPassword(currentPassword, user.password_hash))) {
+        return res.status(401).json({ error: 'Current password is incorrect' });
+      }
+
+      let codeOk = false;
+      if (typeof code === 'string' && /^\d{6}$/.test(code)) {
+        codeOk = verifyTotp(user.totp_secret, code);
+      } else if (typeof code === 'string' && /^[0-9a-f]{4}-[0-9a-f]{4}$/.test(code)) {
+        const r = await pool.query(
+          `SELECT id FROM backup_codes
+           WHERE user_id = $1 AND code_hash = $2 AND used_at IS NULL`,
+          [req.auth.userId, hashBackupCode(code)]
+        );
+        codeOk = r.rowCount > 0;
+        if (codeOk) {
+          await pool.query('UPDATE backup_codes SET used_at = NOW() WHERE id = $1', [r.rows[0].id]);
+        }
+      }
+      if (!codeOk) return res.status(401).json({ error: 'Invalid 2FA code' });
+
+      await pool.query(
+        `UPDATE users SET totp_secret = NULL, totp_enabled_at = NULL, updated_at = NOW()
+         WHERE id = $1`,
+        [req.auth.userId]
+      );
+      await pool.query('DELETE FROM backup_codes WHERE user_id = $1', [req.auth.userId]);
+      res.status(200).json({ enabled: false, message: '2FA disabled' });
+    } catch (err) {
+      log.error('2FA disable failed:', err);
+      res.status(500).json({ error: '2FA disable failed' });
     }
   });
 

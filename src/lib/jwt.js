@@ -38,4 +38,29 @@ function verifySession(token) {
   }
 }
 
-module.exports = { signSession, verifySession, ISSUER, MIN_SECRET_LENGTH };
+/**
+ * Sign a short-lived single-purpose token (e.g. "2FA pending login").
+ * Distinct from session tokens by the `purpose` claim, so a verify
+ * function can refuse to use them as session credentials.
+ */
+function signEphemeralToken(payload, { expiresIn = '5m' } = {}) {
+  return jwt.sign(payload, getJwtSecret(), { expiresIn, issuer: ISSUER });
+}
+
+function verifyEphemeralToken(token) {
+  if (!token) return null;
+  try {
+    return jwt.verify(token, getJwtSecret(), { issuer: ISSUER });
+  } catch {
+    return null;
+  }
+}
+
+module.exports = {
+  signSession,
+  verifySession,
+  signEphemeralToken,
+  verifyEphemeralToken,
+  ISSUER,
+  MIN_SECRET_LENGTH,
+};

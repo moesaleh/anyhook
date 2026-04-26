@@ -5,7 +5,9 @@ module.exports = {
     es6: true,
   },
   parserOptions: {
-    ecmaVersion: 2020,
+    // Bumped from 2020 → 2022 so BigInt literals (10n), `??=`, error
+    // cause-chains, and `at()` are recognized — used in totp.js.
+    ecmaVersion: 2022,
     sourceType: 'module',
   },
   rules: {

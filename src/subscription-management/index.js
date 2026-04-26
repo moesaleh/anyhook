@@ -1,12 +1,14 @@
 require('dotenv').config({ path: './.env' });
 process.env.KAFKAJS_NO_PARTITIONER_WARNING = '1';
 const express = require('express');
+const cookieParser = require('cookie-parser');
 const { Pool } = require('pg');
 const redis = require('@redis/client');
 const { Kafka, logLevel } = require('kafkajs');
 const { exec } = require('child_process'); // For running migrations
 const { v4: uuidv4 } = require('uuid');
 const crypto = require('crypto');
+const { mountAuthRoutes } = require('./auth');
 
 function parseBrokers(envValue) {
     return (envValue || 'localhost:9092').split(',').map((s) => s.trim()).filter(Boolean);
@@ -26,13 +28,18 @@ function withoutSecret(row) {
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
+app.use(cookieParser());
 
-// Enable CORS for the dashboard frontend
+// Enable CORS for the dashboard frontend. Credentials enabled so the
+// session cookie travels — Access-Control-Allow-Origin therefore CANNOT
+// be '*'; the dashboard origin must be set explicitly via DASHBOARD_URL.
 app.use((req, res, next) => {
     const allowedOrigin = process.env.DASHBOARD_URL || 'http://localhost:3000';
     res.header('Access-Control-Allow-Origin', allowedOrigin);
+    res.header('Access-Control-Allow-Credentials', 'true');
+    res.header('Vary', 'Origin');
     res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Admin-Key');
     if (req.method === 'OPTIONS') {
         return res.sendStatus(204);
     }
@@ -170,6 +177,11 @@ function requireAdminKey(req, res, next) {
     next();
 }
 
+// Mount auth + tenancy routes (/auth/*, /organizations/*) and pull
+// requireAuth middleware so the subscription/delivery endpoints below
+// can scope to the caller's org.
+const { requireAuth } = mountAuthRoutes(app, { pool });
+
 // Health check endpoint
 app.get('/health', async (req, res) => {
     const health = { status: 'ok', timestamp: new Date().toISOString(), services: {} };
@@ -191,11 +203,14 @@ app.get('/health', async (req, res) => {
 });
 
 // Get subscription status (checks Redis cache for live connection state)
-app.get('/subscriptions/:id/status', async (req, res) => {
+app.get('/subscriptions/:id/status', requireAuth, async (req, res) => {
     const { id } = req.params;
     try {
         // Check PostgreSQL for the subscription record (status only — never the secret)
-        const dbResult = await pool.query('SELECT subscription_id, status, created_at FROM subscriptions WHERE subscription_id = $1', [id]);
+        const dbResult = await pool.query(
+            'SELECT subscription_id, status, created_at FROM subscriptions WHERE subscription_id = $1 AND organization_id = $2',
+            [id, req.auth.organizationId]
+        );
         if (dbResult.rows.length === 0) {
             return errorResponse(res, 404, 'Subscription not found');
         }
@@ -228,9 +243,12 @@ app.get('/subscriptions/:id/status', async (req, res) => {
 });
 
 // Get status for all subscriptions (bulk) — uses SCAN instead of KEYS
-app.get('/subscriptions/status/all', async (req, res) => {
+app.get('/subscriptions/status/all', requireAuth, async (req, res) => {
     try {
-        const dbResult = await pool.query('SELECT subscription_id, status FROM subscriptions');
+        const dbResult = await pool.query(
+            'SELECT subscription_id, status FROM subscriptions WHERE organization_id = $1',
+            [req.auth.organizationId]
+        );
 
         // Use SCAN for safe iteration instead of KEYS *
         const connectedIds = new Set();
@@ -260,7 +278,7 @@ app.get('/subscriptions/status/all', async (req, res) => {
 });
 
 // Delivery Events: Get delivery history for a subscription (paginated, filterable)
-app.get('/subscriptions/:id/deliveries', async (req, res) => {
+app.get('/subscriptions/:id/deliveries', requireAuth, async (req, res) => {
     const { id } = req.params;
     const page = Math.max(1, parseInt(req.query.page) || 1);
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 20));
@@ -268,11 +286,11 @@ app.get('/subscriptions/:id/deliveries', async (req, res) => {
     const offset = (page - 1) * limit;
 
     try {
-        let whereClause = 'WHERE subscription_id = $1';
-        const params = [id];
+        let whereClause = 'WHERE subscription_id = $1 AND organization_id = $2';
+        const params = [id, req.auth.organizationId];
 
         if (status !== 'all') {
-            whereClause += ' AND status = $2';
+            whereClause += ' AND status = $3';
             params.push(status);
         }
 
@@ -305,7 +323,7 @@ app.get('/subscriptions/:id/deliveries', async (req, res) => {
 });
 
 // Delivery Events: Get aggregated stats for a subscription
-app.get('/subscriptions/:id/deliveries/stats', async (req, res) => {
+app.get('/subscriptions/:id/deliveries/stats', requireAuth, async (req, res) => {
     const { id } = req.params;
 
     try {
@@ -325,8 +343,8 @@ app.get('/subscriptions/:id/deliveries/stats', async (req, res) => {
                 COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '24 hours')::int AS deliveries_24h,
                 COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '7 days')::int AS deliveries_7d
              FROM delivery_events
-             WHERE subscription_id = $1`,
-            [id]
+             WHERE subscription_id = $1 AND organization_id = $2`,
+            [id, req.auth.organizationId]
         );
 
         const stats = result.rows[0];
@@ -348,8 +366,8 @@ app.get('/subscriptions/:id/deliveries/stats', async (req, res) => {
     }
 });
 
-// Delivery Events: Get global delivery stats (for dashboard)
-app.get('/deliveries/stats', async (req, res) => {
+// Delivery Events: Get aggregated delivery stats for the active organization
+app.get('/deliveries/stats', requireAuth, async (req, res) => {
     try {
         const result = await pool.query(
             `SELECT
@@ -363,7 +381,9 @@ app.get('/deliveries/stats', async (req, res) => {
                 ROUND(AVG(response_time_ms) FILTER (WHERE response_time_ms IS NOT NULL))::int AS avg_response_time_ms,
                 COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '24 hours')::int AS deliveries_24h,
                 COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '7 days')::int AS deliveries_7d
-             FROM delivery_events`
+             FROM delivery_events
+             WHERE organization_id = $1`,
+            [req.auth.organizationId]
         );
 
         const stats = result.rows[0];
@@ -382,10 +402,13 @@ app.get('/deliveries/stats', async (req, res) => {
     }
 });
 
-// PostgreSQL: Get all subscriptions
-app.get('/subscriptions', async (req, res) => {
+// PostgreSQL: Get all subscriptions for the active organization
+app.get('/subscriptions', requireAuth, async (req, res) => {
     try {
-        const result = await pool.query('SELECT * FROM subscriptions');
+        const result = await pool.query(
+            'SELECT * FROM subscriptions WHERE organization_id = $1 ORDER BY created_at DESC',
+            [req.auth.organizationId]
+        );
         res.status(200).json(result.rows.map(withoutSecret));
     } catch (err) {
         console.error(err);
@@ -411,11 +434,14 @@ app.delete('/subscriptions', requireAdminKey, async (req, res) => {
     }
 });
 
-// PostgreSQL: Get subscription by ID
-app.get('/subscriptions/:id', async (req, res) => {
+// PostgreSQL: Get subscription by ID (scoped to caller's org)
+app.get('/subscriptions/:id', requireAuth, async (req, res) => {
     const { id } = req.params;
     try {
-        const result = await pool.query('SELECT * FROM subscriptions WHERE subscription_id = $1', [id]);
+        const result = await pool.query(
+            'SELECT * FROM subscriptions WHERE subscription_id = $1 AND organization_id = $2',
+            [id, req.auth.organizationId]
+        );
         if (result.rows.length > 0) {
             res.status(200).json(withoutSecret(result.rows[0]));
         } else {
@@ -427,8 +453,8 @@ app.get('/subscriptions/:id', async (req, res) => {
     }
 });
 
-// PostgreSQL: Update subscription (with validation)
-app.put('/subscriptions/:id', async (req, res) => {
+// PostgreSQL: Update subscription (with validation, scoped to caller's org)
+app.put('/subscriptions/:id', requireAuth, async (req, res) => {
     const { id } = req.params;
     const validationErrors = validateSubscriptionInput(req.body);
     if (validationErrors.length > 0) {
@@ -437,8 +463,11 @@ app.put('/subscriptions/:id', async (req, res) => {
 
     const { connection_type, args, webhook_url } = req.body;
     try {
-        const queryText = `UPDATE subscriptions SET connection_type = $1, args = $2, webhook_url = $3 WHERE subscription_id = $4 RETURNING *`;
-        const values = [connection_type, args, webhook_url, id];
+        const queryText = `UPDATE subscriptions
+                           SET connection_type = $1, args = $2, webhook_url = $3
+                           WHERE subscription_id = $4 AND organization_id = $5
+                           RETURNING *`;
+        const values = [connection_type, args, webhook_url, id, req.auth.organizationId];
         const result = await pool.query(queryText, values);
 
         if (result.rows.length > 0) {
@@ -467,8 +496,8 @@ app.put('/subscriptions/:id', async (req, res) => {
     }
 });
 
-// PostgreSQL: Subscribe (Create Subscription, with validation)
-app.post('/subscribe', async (req, res) => {
+// PostgreSQL: Subscribe (Create Subscription, scoped to caller's org)
+app.post('/subscribe', requireAuth, async (req, res) => {
     const validationErrors = validateSubscriptionInput(req.body);
     if (validationErrors.length > 0) {
         return errorResponse(res, 400, validationErrors.join('; '));
@@ -481,14 +510,14 @@ app.post('/subscribe', async (req, res) => {
     // column has NOT NULL, no default, so this must be provided.
     const webhookSecret = crypto.randomBytes(32).toString('hex');
 
-    console.log(`[Subscribe API] - Incoming request to create subscription. Connection Type: ${connection_type}, Webhook URL: ${webhook_url}`);
+    console.log(`[Subscribe API] - Incoming request to create subscription. Connection Type: ${connection_type}, Webhook URL: ${webhook_url}, Org: ${req.auth.organizationId}`);
 
     try {
-        console.log(`[Subscribe API] - Saving subscription to PostgreSQL. Subscription ID: ${subscriptionId}`);
-
-        // Save subscription to PostgreSQL
-        const queryText = `INSERT INTO subscriptions (subscription_id, connection_type, args, webhook_url, webhook_secret) VALUES ($1, $2, $3, $4, $5) RETURNING *`;
-        const values = [subscriptionId, connection_type, args, webhook_url, webhookSecret];
+        // Save subscription to PostgreSQL (with org_id)
+        const queryText = `INSERT INTO subscriptions
+                            (subscription_id, organization_id, connection_type, args, webhook_url, webhook_secret)
+                           VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`;
+        const values = [subscriptionId, req.auth.organizationId, connection_type, args, webhook_url, webhookSecret];
         const result = await pool.query(queryText, values);
 
         console.log(`[Subscribe API] - Subscription saved to PostgreSQL. Subscription ID: ${subscriptionId}`);
@@ -525,19 +554,25 @@ app.post('/subscribe', async (req, res) => {
     }
 });
 
-// PostgreSQL: Unsubscribe (Delete Subscription)
-app.post('/unsubscribe', async (req, res) => {
+// PostgreSQL: Unsubscribe (Delete Subscription, scoped to caller's org)
+app.post('/unsubscribe', requireAuth, async (req, res) => {
     const { subscription_id } = req.body;
 
     if (!subscription_id || typeof subscription_id !== 'string') {
         return errorResponse(res, 400, 'subscription_id is required');
     }
 
-    console.log(`[Unsubscribe API] - Incoming request to delete subscription. Subscription ID: ${subscription_id}`);
+    console.log(`[Unsubscribe API] - Incoming request to delete subscription. Subscription ID: ${subscription_id}, Org: ${req.auth.organizationId}`);
 
     try {
-        // Delete subscription from PostgreSQL
-        await pool.query(`DELETE FROM subscriptions WHERE subscription_id = $1`, [subscription_id]);
+        // Delete subscription from PostgreSQL (org-scoped)
+        const deleteResult = await pool.query(
+            `DELETE FROM subscriptions WHERE subscription_id = $1 AND organization_id = $2`,
+            [subscription_id, req.auth.organizationId]
+        );
+        if (deleteResult.rowCount === 0) {
+            return errorResponse(res, 404, 'Subscription not found');
+        }
         console.log(`[Unsubscribe API] - Subscription deleted from PostgreSQL. Subscription ID: ${subscription_id}`);
 
         // Publish to Kafka so the connector closes the upstream connection.

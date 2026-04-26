@@ -85,6 +85,7 @@ function truncateBody(value, maxLen = MAX_BODY_SIZE) {
  */
 async function recordDelivery({
     subscriptionId,
+    organizationId,
     eventId,
     status,
     httpStatusCode = null,
@@ -98,11 +99,13 @@ async function recordDelivery({
     try {
         await pool.query(
             `INSERT INTO delivery_events
-             (subscription_id, event_id, status, http_status_code, response_time_ms,
-              payload_size_bytes, request_body, response_body, retry_count, error_message)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+             (subscription_id, organization_id, event_id, status, http_status_code,
+              response_time_ms, payload_size_bytes, request_body, response_body,
+              retry_count, error_message)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
             [
                 subscriptionId,
+                organizationId,
                 eventId,
                 status,
                 httpStatusCode,
@@ -153,13 +156,22 @@ async function handleConnectionEvent({ message }) {
         }
 
         const subscription = JSON.parse(subscriptionDetails);
-        const { webhook_url: webhookUrl, webhook_secret: webhookSecret } = subscription;
+        const {
+            webhook_url: webhookUrl,
+            webhook_secret: webhookSecret,
+            organization_id: organizationId,
+        } = subscription;
+
+        if (!organizationId) {
+            console.error(`Subscription ${subscriptionId} has no organization_id; cannot record delivery`);
+            return;
+        }
 
         try {
-            await sendWebhook(subscriptionId, webhookUrl, webhookSecret, data, eventId, 0);
+            await sendWebhook(subscriptionId, organizationId, webhookUrl, webhookSecret, data, eventId, 0);
         } catch (error) {
             console.error(`Initial webhook request failed for subscription ID: ${subscriptionId}`, error.message);
-            retryWebhook(subscriptionId, webhookUrl, webhookSecret, data, eventId, 0);
+            retryWebhook(subscriptionId, organizationId, webhookUrl, webhookSecret, data, eventId, 0);
         }
     } catch (error) {
         console.error(`Error processing message for subscription ID: ${subscriptionId}`, error);
@@ -181,13 +193,14 @@ function signRequest(secret, timestampSec, rawBody) {
 /**
  * Send a webhook POST and record the outcome.
  * @param {string} subscriptionId - The subscription UUID
+ * @param {string} organizationId - The owning organization UUID (for delivery_events FK)
  * @param {string} webhookUrl - The destination URL
  * @param {string} webhookSecret - HMAC secret for signing
  * @param {any} data - The payload from the source
  * @param {string} eventId - Groups this attempt with retries
  * @param {number} retryCount - 0 for first attempt, 1+ for retries
  */
-async function sendWebhook(subscriptionId, webhookUrl, webhookSecret, data, eventId, retryCount) {
+async function sendWebhook(subscriptionId, organizationId, webhookUrl, webhookSecret, data, eventId, retryCount) {
     const requestBody = JSON.stringify({ data });
     const payloadSizeBytes = Buffer.byteLength(requestBody, 'utf8');
     const startTime = Date.now();
@@ -225,6 +238,7 @@ async function sendWebhook(subscriptionId, webhookUrl, webhookSecret, data, even
         // Record successful delivery
         await recordDelivery({
             subscriptionId,
+            organizationId,
             eventId,
             status: 'success',
             httpStatusCode: response.status,
@@ -247,6 +261,7 @@ async function sendWebhook(subscriptionId, webhookUrl, webhookSecret, data, even
         // Record the failed attempt
         await recordDelivery({
             subscriptionId,
+            organizationId,
             eventId,
             status: deliveryStatus,
             httpStatusCode,
@@ -266,10 +281,10 @@ async function sendWebhook(subscriptionId, webhookUrl, webhookSecret, data, even
  * Retry webhook delivery with escalating backoff intervals.
  * Intervals: 15m → 1h → 2h → 6h → 12h → 24h → DLQ
  */
-function retryWebhook(subscriptionId, webhookUrl, webhookSecret, data, eventId, retryCount) {
+function retryWebhook(subscriptionId, organizationId, webhookUrl, webhookSecret, data, eventId, retryCount) {
     if (retryCount >= maxRetries) {
         console.log(`Max retries reached for subscription ID: ${subscriptionId}, moving to Dead Letter Queue`);
-        sendToDLQ(subscriptionId, webhookUrl, data, eventId);
+        sendToDLQ(subscriptionId, organizationId, webhookUrl, data, eventId);
         return;
     }
 
@@ -278,11 +293,11 @@ function retryWebhook(subscriptionId, webhookUrl, webhookSecret, data, eventId, 
 
     setTimeout(async () => {
         try {
-            await sendWebhook(subscriptionId, webhookUrl, webhookSecret, data, eventId, retryCount + 1);
+            await sendWebhook(subscriptionId, organizationId, webhookUrl, webhookSecret, data, eventId, retryCount + 1);
             console.log(`Webhook retry ${retryCount + 1} successful for subscription ID: ${subscriptionId}`);
         } catch (error) {
             console.error(`Retry ${retryCount + 1} failed for subscription ID: ${subscriptionId}`, error.message);
-            retryWebhook(subscriptionId, webhookUrl, webhookSecret, data, eventId, retryCount + 1);
+            retryWebhook(subscriptionId, organizationId, webhookUrl, webhookSecret, data, eventId, retryCount + 1);
         }
     }, delay);
 }
@@ -291,12 +306,13 @@ function retryWebhook(subscriptionId, webhookUrl, webhookSecret, data, eventId, 
  * Send failed delivery to the Dead Letter Queue after all retries exhausted.
  * Records a 'dlq' status delivery event.
  */
-async function sendToDLQ(subscriptionId, webhookUrl, data, eventId) {
+async function sendToDLQ(subscriptionId, organizationId, webhookUrl, data, eventId) {
     const requestBody = JSON.stringify({ data });
 
     // Record DLQ entry
     await recordDelivery({
         subscriptionId,
+        organizationId,
         eventId,
         status: 'dlq',
         retryCount: maxRetries,
@@ -308,7 +324,7 @@ async function sendToDLQ(subscriptionId, webhookUrl, data, eventId) {
     try {
         await producer.send({
             topic: 'dlq_events',
-            messages: [{ value: JSON.stringify({ subscriptionId, webhookUrl, data }) }],
+            messages: [{ value: JSON.stringify({ subscriptionId, organizationId, webhookUrl, data }) }],
         });
         console.log(`Message sent to Dead Letter Queue (DLQ) for subscription ID: ${subscriptionId}`);
     } catch (err) {
@@ -335,7 +351,7 @@ async function recoverPendingRetries() {
     try {
         result = await pool.query(`
             SELECT DISTINCT ON (event_id)
-                event_id, subscription_id, retry_count, request_body, created_at
+                event_id, subscription_id, organization_id, retry_count, request_body, created_at
             FROM delivery_events
             WHERE status = 'retrying'
               AND created_at > NOW() - INTERVAL '24 hours'
@@ -366,6 +382,9 @@ async function recoverPendingRetries() {
             continue;
         }
         const { webhook_url: webhookUrl, webhook_secret: webhookSecret } = subscription;
+        // Trust the row's organization_id (was valid at write time) — the
+        // Redis copy might lag if the subscription's org was somehow changed.
+        const organizationId = row.organization_id;
 
         let data;
         try {
@@ -380,11 +399,11 @@ async function recoverPendingRetries() {
         // backoff window — that wait already elapsed during the outage.
         const nextAttempt = row.retry_count + 1;
         console.log(`Recovering event ${row.event_id} sub ${row.subscription_id} attempt ${nextAttempt}/${maxRetries}`);
-        sendWebhook(row.subscription_id, webhookUrl, webhookSecret, data, row.event_id, nextAttempt)
+        sendWebhook(row.subscription_id, organizationId, webhookUrl, webhookSecret, data, row.event_id, nextAttempt)
             .then(() => console.log(`Recovered delivery succeeded for event ${row.event_id}`))
             .catch((err) => {
                 console.error(`Recovered delivery failed for event ${row.event_id}:`, err.message);
-                retryWebhook(row.subscription_id, webhookUrl, webhookSecret, data, row.event_id, nextAttempt);
+                retryWebhook(row.subscription_id, organizationId, webhookUrl, webhookSecret, data, row.event_id, nextAttempt);
             });
     }
 }

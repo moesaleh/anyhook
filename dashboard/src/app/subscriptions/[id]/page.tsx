@@ -8,12 +8,11 @@ import {
   Copy,
   Check,
   Trash2,
-  ExternalLink,
+  Pencil,
   AlertCircle,
   Clock,
   Radio,
   Wifi,
-  Webhook,
   Settings2,
   Activity,
   Eye,
@@ -213,6 +212,13 @@ export default function SubscriptionDetailPage() {
             />
             {isPolling ? "Live" : "Paused"}
           </button>
+          <Link
+            href={`/subscriptions/${id}/edit`}
+            className="inline-flex items-center gap-2 rounded-lg border border-neutral-200 dark:border-neutral-800 text-neutral-700 dark:text-neutral-300 px-3 py-2 text-xs font-medium hover:bg-neutral-50 dark:hover:bg-neutral-900 transition-colors"
+          >
+            <Pencil className="h-3.5 w-3.5" />
+            Edit
+          </Link>
           <button
             onClick={() => setShowDelete(true)}
             className="inline-flex items-center gap-2 rounded-lg border border-red-200 dark:border-red-900 text-red-600 dark:text-red-400 px-3 py-2 text-xs font-medium hover:bg-red-50 dark:hover:bg-red-950 transition-colors"
@@ -434,14 +440,17 @@ function OverviewTab({
                 <p className="text-sm font-mono break-all leading-relaxed">
                   {subscription.webhook_url}
                 </p>
-                <a
-                  href={subscription.webhook_url}
-                  target="_blank"
-                  rel="noopener noreferrer"
+                <button
+                  onClick={() => onCopy(subscription.webhook_url, "webhook")}
                   className="text-neutral-400 hover:text-neutral-600 dark:hover:text-neutral-300 flex-shrink-0"
+                  title="Copy webhook URL"
                 >
-                  <ExternalLink className="h-3 w-3" />
-                </a>
+                  {copied === "webhook" ? (
+                    <Check className="h-3 w-3 text-emerald-500" />
+                  ) : (
+                    <Copy className="h-3 w-3" />
+                  )}
+                </button>
               </div>
             </div>
             <div>

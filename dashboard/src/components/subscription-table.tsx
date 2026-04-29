@@ -8,7 +8,6 @@ import {
   ArrowUp,
   ArrowDown,
   Trash2,
-  ExternalLink,
   Copy,
   Check,
   ChevronLeft,
@@ -160,7 +159,6 @@ export function SubscriptionTable({
           <option value="connected">Connected</option>
           <option value="disconnected">Disconnected</option>
           <option value="active">Active</option>
-          <option value="error">Error</option>
         </select>
       </div>
 
@@ -266,23 +264,12 @@ export function SubscriptionTable({
                       </span>
                     </td>
                     <td className="px-4 py-3">
-                      <div className="flex items-center gap-1.5">
-                        <span
-                          className="text-sm text-neutral-600 dark:text-neutral-400"
-                          title={sub.webhook_url}
-                        >
-                          {truncate(sub.webhook_url, 30)}
-                        </span>
-                        <a
-                          href={sub.webhook_url}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="text-neutral-400 hover:text-neutral-600 dark:hover:text-neutral-300"
-                          aria-label="Open webhook URL in new tab"
-                        >
-                          <ExternalLink className="h-3 w-3" />
-                        </a>
-                      </div>
+                      <span
+                        className="text-sm text-neutral-600 dark:text-neutral-400"
+                        title={sub.webhook_url}
+                      >
+                        {truncate(sub.webhook_url, 30)}
+                      </span>
                     </td>
                     <td className="px-4 py-3">
                       <StatusBadge

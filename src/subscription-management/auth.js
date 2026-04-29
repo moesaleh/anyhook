@@ -40,8 +40,43 @@ const {
   DEFAULT_EXPIRY_HOURS: RESET_EXPIRY_HOURS,
 } = require('../lib/password-reset');
 const { slugify } = require('../lib/slug');
+const { encrypt: encryptSecret, decrypt: decryptSecret } = require('../lib/envelope');
 
 const log = createLogger('auth');
+
+/**
+ * Read a stored totp_secret column value. Returns the plaintext base32
+ * secret + a callback that re-encrypts and persists if the row was on
+ * an older format (legacy plaintext, or ciphertext under the OLD key
+ * during rotation). Callers fire the callback fire-and-forget after
+ * verify so the migration happens in the background.
+ */
+async function readTotpSecret(pool, userId, storedValue) {
+  if (!storedValue) return { plaintext: null, persistRotation: () => {} };
+  let plaintext;
+  let neededRotation;
+  try {
+    ({ plaintext, neededRotation } = decryptSecret(storedValue));
+  } catch (err) {
+    // Tampered or undecryptable — surface to the caller.
+    throw err;
+  }
+  const persistRotation = async () => {
+    if (!neededRotation) return;
+    try {
+      const reEncrypted = encryptSecret(plaintext);
+      // Race-tolerant: only update if the value still matches what we
+      // read. Avoids clobbering a fresh enrollment that landed since.
+      await pool.query(
+        'UPDATE users SET totp_secret = $1 WHERE id = $2 AND totp_secret = $3',
+        [reEncrypted, userId, storedValue]
+      );
+    } catch (e) {
+      log.error('Failed to persist re-encrypted TOTP secret', e.message);
+    }
+  };
+  return { plaintext, persistRotation };
+}
 
 const COOKIE_NAME = 'anyhook_session';
 const COOKIE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
@@ -371,13 +406,18 @@ function mountAuthRoutes(
         return res.status(400).json({ error: '2FA is not enabled for this user' });
       }
       const user = userResult.rows[0];
+      const { plaintext: totpSecret, persistRotation } = await readTotpSecret(
+        pool,
+        user.id,
+        user.totp_secret
+      );
 
       // TOTP attempt with replay guard. verifyTotpAndGetStep returns
       // the step counter that matched (or null on failure). We reject
       // any step <= last_totp_step so a code stays single-use even
       // within the ±1 step (~90s) tolerance window.
       if (typeof code === 'string' && /^\d{6}$/.test(code)) {
-        const matchedStep = verifyTotpAndGetStep(user.totp_secret, code);
+        const matchedStep = verifyTotpAndGetStep(totpSecret, code);
         if (matchedStep !== null) {
           const last = user.last_totp_step != null ? Number(user.last_totp_step) : -1;
           if (matchedStep <= last) {
@@ -392,6 +432,9 @@ function mountAuthRoutes(
              WHERE id = $2`,
             [matchedStep, user.id]
           );
+          // Background-migrate the secret to the current encryption
+          // format if it was on legacy plaintext / OLD key.
+          persistRotation().catch(() => {});
           return completeLogin(res, user);
         }
       }
@@ -480,8 +523,10 @@ function mountAuthRoutes(
         });
       }
       const secret = generateTotpSecret();
+      // Encrypt at rest. encryptSecret returns plaintext when
+      // TOTP_SECRET_KEY is unset (dev / unconfigured prod).
       await pool.query('UPDATE users SET totp_secret = $1 WHERE id = $2', [
-        secret,
+        encryptSecret(secret),
         req.auth.userId,
       ]);
       res.status(200).json({
@@ -531,11 +576,18 @@ function mountAuthRoutes(
           .status(400)
           .json({ error: 'No pending enrollment — call /auth/2fa/setup first' });
       }
-      const matchedStep = verifyTotpAndGetStep(row.totp_secret, code);
+      const { plaintext: totpSecretSetup, persistRotation: persistSetupRotation } =
+        await readTotpSecret(pool, req.auth.userId, row.totp_secret);
+      const matchedStep = verifyTotpAndGetStep(totpSecretSetup, code);
       if (matchedStep === null) {
         await client.query('ROLLBACK');
         return res.status(401).json({ error: 'Invalid 2FA code' });
       }
+      // The pending secret was encrypted under the current key by
+      // /auth/2fa/setup, so persistRotation() is normally a no-op.
+      // Kept here for the case where an operator has rotated the key
+      // between /setup and /verify-setup.
+      persistSetupRotation().catch(() => {});
       // Mark this step as used so the same code can't be replayed
       // through verify-login in the next ~90s.
       await client.query(
@@ -594,15 +646,20 @@ function mountAuthRoutes(
 
       let codeOk = false;
       if (typeof code === 'string' && /^\d{6}$/.test(code)) {
-        const matchedStep = verifyTotpAndGetStep(user.totp_secret, code);
+        const { plaintext: totpSecretDisable } = await readTotpSecret(
+          pool,
+          req.auth.userId,
+          user.totp_secret
+        );
+        const matchedStep = verifyTotpAndGetStep(totpSecretDisable, code);
         if (matchedStep !== null) {
           const last = user.last_totp_step != null ? Number(user.last_totp_step) : -1;
           if (matchedStep <= last) {
             return res.status(401).json({ error: 'Code already used; wait for a new one' });
           }
           codeOk = true;
-          // Persist the step so a re-use attempt against verify-login
-          // in the same ±1 step window is rejected too.
+          // No persistRotation here -- we're about to clear totp_secret
+          // anyway in the disable path below.
           await pool.query(
             `UPDATE users
              SET last_totp_step = GREATEST(COALESCE(last_totp_step, -1), $1::bigint)

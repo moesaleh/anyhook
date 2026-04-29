@@ -57,20 +57,49 @@ class GraphQLHandler extends BaseHandler {
     }
 
     try {
-      // Create a WebSocket client using graphql-ws
+      // Create a WebSocket client using graphql-ws.
+      //
+      // Reconnect policy: we hand graphql-ws's built-in machinery a
+      // very large retryAttempts and an exponential-backoff retryWait
+      // so it never gives up on its own. The user-driven cancellation
+      // path is wsClient.dispose() in disconnect(), which the library
+      // honors and stops scheduling further attempts.
+      //
+      // Why not roll our own like WebSocketHandler? graphql-ws already
+      // re-executes the subscribe() handle across reconnects, so a
+      // subscribe-once-and-forget caller (us) keeps receiving events
+      // after a transient drop without us re-issuing the GraphQL
+      // subscription on every reconnect.
       const wsClient = createClient({
         url: endpoint_url,
         webSocketImpl: WebSocket,
-        retryAttempts: 3, // Automatically retry failed connections
+        retryAttempts: Number.MAX_SAFE_INTEGER,
+        shouldRetry: () => true,
+        retryWait: async retries => {
+          // 1s -> 2s -> 4s -> ... capped at 60s, ±25% jitter so flapping
+          // sources don't all reconnect in lockstep.
+          const exp = Math.min(60_000, 1000 * 2 ** Math.max(0, retries));
+          const jitter = exp * (Math.random() * 0.5 - 0.25);
+          const delay = Math.max(1000, Math.floor(exp + jitter));
+          await new Promise(r => setTimeout(r, delay));
+        },
         connectionParams: {
           headers: parsedHeaders,
         },
       });
 
-      wsClient.on('connecting', () => log.info('WebSocket connecting...'));
-      wsClient.on('connected', () => log.info('WebSocket connected.'));
-      wsClient.on('closed', () => log.info('WebSocket connection closed.'));
-      wsClient.on('error', error => log.error('WebSocket error:', error));
+      wsClient.on('connecting', () =>
+        log.info(`[GraphQLHandler] - connecting (subscription ${subscription_id})`)
+      );
+      wsClient.on('connected', () =>
+        log.info(`[GraphQLHandler] - connected (subscription ${subscription_id})`)
+      );
+      wsClient.on('closed', () =>
+        log.info(`[GraphQLHandler] - closed (subscription ${subscription_id})`)
+      );
+      wsClient.on('error', error =>
+        log.error(`[GraphQLHandler] - error on ${subscription_id}:`, error.message || error)
+      );
 
       // Execute the subscription query
       const subscriptionQuery = gql`

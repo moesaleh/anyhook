@@ -1,5 +1,11 @@
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:3001";
 
+// Default per-request timeout. Mutating endpoints (POST/PUT/DELETE)
+// can run a bit longer than reads — webhook delivery + sub-create
+// path involves Kafka writes. Read endpoints get the shorter timeout.
+const DEFAULT_TIMEOUT_MS = 15_000;
+const MUTATION_TIMEOUT_MS = 30_000;
+
 // Default fetch options. credentials: "include" sends the session cookie
 // cross-origin (dashboard:3000 -> api:3001). Backend CORS sets
 // Access-Control-Allow-Credentials: true to allow this.
@@ -8,12 +14,81 @@ const DEFAULT_FETCH_INIT: RequestInit = {
   cache: "no-store",
 };
 
+/**
+ * Error thrown when the backend returns 429. Carries the parsed
+ * Retry-After (seconds) so callers can render a friendlier UI than
+ * "Failed".
+ */
+export class RateLimitError extends Error {
+  retryAfterSec: number;
+  constructor(message: string, retryAfterSec: number) {
+    super(message);
+    this.name = "RateLimitError";
+    this.retryAfterSec = retryAfterSec;
+  }
+}
+
+/** Error thrown when the request exceeded its timeout. */
+export class TimeoutError extends Error {
+  constructor(message = "Request timed out") {
+    super(message);
+    this.name = "TimeoutError";
+  }
+}
+
+/** Error thrown when the browser is offline (navigator.onLine === false). */
+export class OfflineError extends Error {
+  constructor() {
+    super("You appear to be offline");
+    this.name = "OfflineError";
+  }
+}
+
+function isMutating(method: string | undefined): boolean {
+  if (!method) return false;
+  const m = method.toUpperCase();
+  return m === "POST" || m === "PUT" || m === "PATCH" || m === "DELETE";
+}
+
 async function apiFetch(path: string, init?: RequestInit): Promise<Response> {
-  return fetch(`${API_BASE}${path}`, {
-    ...DEFAULT_FETCH_INIT,
-    ...init,
-    headers: { ...(init?.headers || {}) },
-  });
+  // Cheap online check: don't even attempt the request when the
+  // browser is offline — we'd hit a network error after a timeout
+  // and the resulting message would be the same. This way the
+  // caller can render an "offline" UI without waiting.
+  if (typeof navigator !== "undefined" && navigator.onLine === false) {
+    throw new OfflineError();
+  }
+  const timeoutMs = isMutating(init?.method) ? MUTATION_TIMEOUT_MS : DEFAULT_TIMEOUT_MS;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(`${API_BASE}${path}`, {
+      ...DEFAULT_FETCH_INIT,
+      ...init,
+      headers: { ...(init?.headers || {}) },
+      signal: ctrl.signal,
+    });
+    if (res.status === 429) {
+      const ra = parseInt(res.headers.get("Retry-After") || "60", 10);
+      let serverMsg = "Rate limit exceeded";
+      try {
+        const body = await res.clone().json();
+        if (body?.error) serverMsg = body.error;
+      } catch {
+        // ignore JSON parse failures
+      }
+      throw new RateLimitError(serverMsg, Number.isFinite(ra) ? ra : 60);
+    }
+    return res;
+  } catch (err) {
+    if (err instanceof RateLimitError || err instanceof OfflineError) throw err;
+    if ((err as { name?: string })?.name === "AbortError") {
+      throw new TimeoutError();
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 // --- Auth + tenancy types ---

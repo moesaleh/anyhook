@@ -97,9 +97,26 @@ function verifyTotp(
   code,
   { time = Date.now(), step = DEFAULT_STEP, digits = DEFAULT_DIGITS, window = DEFAULT_WINDOW } = {}
 ) {
-  if (!secret || code == null) return false;
+  return verifyTotpAndGetStep(secret, code, { time, step, digits, window }) !== null;
+}
+
+/**
+ * Like verifyTotp but returns the matching step counter (an integer
+ * count of `step`-second intervals since the Unix epoch) on success,
+ * or null on failure. The caller can persist the returned step as the
+ * "highest accepted step" for the user, then reject any subsequent
+ * code at step <= that — closing the replay window where a code is
+ * still inside the ±1 step tolerance for ~90s but has already been
+ * used.
+ */
+function verifyTotpAndGetStep(
+  secret,
+  code,
+  { time = Date.now(), step = DEFAULT_STEP, digits = DEFAULT_DIGITS, window = DEFAULT_WINDOW } = {}
+) {
+  if (!secret || code == null) return null;
   const codeStr = String(code).padStart(digits, '0');
-  if (codeStr.length !== digits || !/^\d+$/.test(codeStr)) return false;
+  if (codeStr.length !== digits || !/^\d+$/.test(codeStr)) return null;
   const secretBuf = base32Decode(secret);
   const baseCounter = Math.floor(time / 1000 / step);
   for (let w = -window; w <= window; w++) {
@@ -107,10 +124,10 @@ function verifyTotp(
     const a = Buffer.from(expected);
     const b = Buffer.from(codeStr);
     if (a.length === b.length && crypto.timingSafeEqual(a, b)) {
-      return true;
+      return baseCounter + w;
     }
   }
-  return false;
+  return null;
 }
 
 /**
@@ -148,6 +165,7 @@ module.exports = {
   generateTotpSecret,
   generateTotp,
   verifyTotp,
+  verifyTotpAndGetStep,
   otpauthUrl,
   generateBackupCodes,
   hashBackupCode,

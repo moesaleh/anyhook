@@ -3,6 +3,7 @@ const {
   generateTotpSecret,
   generateTotp,
   verifyTotp,
+  verifyTotpAndGetStep,
   otpauthUrl,
   generateBackupCodes,
   hashBackupCode,
@@ -92,6 +93,29 @@ describe('generateTotp + verifyTotp', () => {
       expect(verifyTotp(secret, code)).toBe(false);
     }
   );
+});
+
+describe('verifyTotpAndGetStep (replay-guard primitive)', () => {
+  it('returns the step counter that matched on success', () => {
+    const secret = generateTotpSecret();
+    const t = 1700000000000; // fixed epoch ms
+    const code = generateTotp(secret, { time: t });
+    const expectedStep = Math.floor(t / 1000 / 30);
+    expect(verifyTotpAndGetStep(secret, code, { time: t })).toBe(expectedStep);
+  });
+
+  it('returns null on failure', () => {
+    const secret = generateTotpSecret();
+    expect(verifyTotpAndGetStep(secret, '000000')).toBe(null);
+  });
+
+  it('returns the previous step when matching the -1 window', () => {
+    const secret = generateTotpSecret();
+    const now = 1700000000000;
+    const past = generateTotp(secret, { time: now - 30_000 });
+    const expectedStep = Math.floor((now - 30_000) / 1000 / 30);
+    expect(verifyTotpAndGetStep(secret, past, { time: now })).toBe(expectedStep);
+  });
 });
 
 describe('otpauthUrl', () => {

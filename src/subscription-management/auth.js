@@ -22,7 +22,7 @@ const {
 const { generateApiKey, hashApiKey } = require('../lib/api-keys');
 const {
   generateTotpSecret,
-  verifyTotp,
+  verifyTotpAndGetStep,
   otpauthUrl,
   generateBackupCodes,
   hashBackupCode,
@@ -361,7 +361,7 @@ function mountAuthRoutes(
     }
     try {
       const userResult = await pool.query(
-        `SELECT id, email, name, totp_secret, totp_enabled_at, token_version
+        `SELECT id, email, name, totp_secret, totp_enabled_at, token_version, last_totp_step
          FROM users WHERE id = $1`,
         [claims.sub]
       );
@@ -370,9 +370,28 @@ function mountAuthRoutes(
       }
       const user = userResult.rows[0];
 
-      // TOTP attempt (no DB hit, fast path)
-      if (typeof code === 'string' && /^\d{6}$/.test(code) && verifyTotp(user.totp_secret, code)) {
-        return completeLogin(res, user);
+      // TOTP attempt with replay guard. verifyTotpAndGetStep returns
+      // the step counter that matched (or null on failure). We reject
+      // any step <= last_totp_step so a code stays single-use even
+      // within the ±1 step (~90s) tolerance window.
+      if (typeof code === 'string' && /^\d{6}$/.test(code)) {
+        const matchedStep = verifyTotpAndGetStep(user.totp_secret, code);
+        if (matchedStep !== null) {
+          const last = user.last_totp_step != null ? Number(user.last_totp_step) : -1;
+          if (matchedStep <= last) {
+            return res.status(401).json({ error: 'Code already used; wait for a new one' });
+          }
+          // Persist the highest step we've accepted. Race-safe: the
+          // CASE GREATEST guards against another concurrent verify
+          // from clobbering us with a lower step.
+          await pool.query(
+            `UPDATE users
+             SET last_totp_step = GREATEST(COALESCE(last_totp_step, -1), $1::bigint)
+             WHERE id = $2`,
+            [matchedStep, user.id]
+          );
+          return completeLogin(res, user);
+        }
       }
 
       // Backup code attempt: hash, claim under FOR UPDATE in a tx.
@@ -505,13 +524,20 @@ function mountAuthRoutes(
           .status(400)
           .json({ error: 'No pending enrollment — call /auth/2fa/setup first' });
       }
-      if (!verifyTotp(row.totp_secret, code)) {
+      const matchedStep = verifyTotpAndGetStep(row.totp_secret, code);
+      if (matchedStep === null) {
         await client.query('ROLLBACK');
         return res.status(401).json({ error: 'Invalid 2FA code' });
       }
+      // Mark this step as used so the same code can't be replayed
+      // through verify-login in the next ~90s.
       await client.query(
-        'UPDATE users SET totp_enabled_at = NOW(), updated_at = NOW() WHERE id = $1',
-        [req.auth.userId]
+        `UPDATE users
+         SET totp_enabled_at = NOW(),
+             last_totp_step = $1::bigint,
+             updated_at = NOW()
+         WHERE id = $2`,
+        [matchedStep, req.auth.userId]
       );
       await client.query('DELETE FROM backup_codes WHERE user_id = $1', [req.auth.userId]);
       const codes = generateBackupCodes(10);
@@ -547,7 +573,8 @@ function mountAuthRoutes(
     }
     try {
       const userResult = await pool.query(
-        'SELECT password_hash, totp_secret, totp_enabled_at FROM users WHERE id = $1',
+        `SELECT password_hash, totp_secret, totp_enabled_at, last_totp_step
+         FROM users WHERE id = $1`,
         [req.auth.userId]
       );
       if (userResult.rowCount === 0) return res.status(404).json({ error: 'User not found' });
@@ -560,7 +587,22 @@ function mountAuthRoutes(
 
       let codeOk = false;
       if (typeof code === 'string' && /^\d{6}$/.test(code)) {
-        codeOk = verifyTotp(user.totp_secret, code);
+        const matchedStep = verifyTotpAndGetStep(user.totp_secret, code);
+        if (matchedStep !== null) {
+          const last = user.last_totp_step != null ? Number(user.last_totp_step) : -1;
+          if (matchedStep <= last) {
+            return res.status(401).json({ error: 'Code already used; wait for a new one' });
+          }
+          codeOk = true;
+          // Persist the step so a re-use attempt against verify-login
+          // in the same ±1 step window is rejected too.
+          await pool.query(
+            `UPDATE users
+             SET last_totp_step = GREATEST(COALESCE(last_totp_step, -1), $1::bigint)
+             WHERE id = $2`,
+            [matchedStep, req.auth.userId]
+          );
+        }
       } else if (typeof code === 'string' && /^[0-9a-f]{4}-[0-9a-f]{4}$/.test(code)) {
         const r = await pool.query(
           `SELECT id FROM backup_codes

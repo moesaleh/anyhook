@@ -113,6 +113,30 @@ describeIfPg('2FA / TOTP (integration)', () => {
       const second = await request(app).post('/auth/2fa/setup').set('Cookie', cookie);
       expect(second.status).toBe(409);
     });
+
+    it('rejects re-use of a TOTP code at the same step (replay-guard)', async () => {
+      const setup = await request(app).post('/auth/2fa/setup').set('Cookie', cookie);
+      const secret = setup.body.secret;
+      const code = generateTotp(secret);
+      await request(app)
+        .post('/auth/2fa/verify-setup')
+        .set('Cookie', cookie)
+        .send({ code })
+        .expect(200);
+
+      // Login → verify-login with the SAME code → must reject. Even
+      // though TOTP's ±1 step tolerance would otherwise still accept
+      // it, the last_totp_step record blocks replay.
+      const login = await request(app)
+        .post('/auth/login')
+        .send({ email: '2fa@example.com', password: 'password123' });
+      const replay = await request(app).post('/auth/2fa/verify-login').send({
+        pending_token: login.body.pending_token,
+        code,
+      });
+      expect(replay.status).toBe(401);
+      expect(replay.body.error).toMatch(/already used/i);
+    });
   });
 
   describe('Login flow with 2FA enabled', () => {
@@ -122,10 +146,15 @@ describeIfPg('2FA / TOTP (integration)', () => {
     beforeEach(async () => {
       const setup = await request(app).post('/auth/2fa/setup').set('Cookie', cookie);
       secret = setup.body.secret;
+      // Use a code from one step in the past so the replay-guard
+      // (last_totp_step) advances forward when verify-login below
+      // submits a code from the current step. Otherwise the test runs
+      // fast enough that both calls hit the same step counter and the
+      // legitimate verify-login is rejected as a replay.
       const verify = await request(app)
         .post('/auth/2fa/verify-setup')
         .set('Cookie', cookie)
-        .send({ code: generateTotp(secret) });
+        .send({ code: generateTotp(secret, { time: Date.now() - 30_000 }) });
       backupCodes = verify.body.backup_codes;
     });
 
@@ -210,10 +239,12 @@ describeIfPg('2FA / TOTP (integration)', () => {
     beforeEach(async () => {
       const setup = await request(app).post('/auth/2fa/setup').set('Cookie', cookie);
       secret = setup.body.secret;
+      // Burn the previous step in setup so the disable-code below
+      // (current step) advances last_totp_step rather than colliding.
       await request(app)
         .post('/auth/2fa/verify-setup')
         .set('Cookie', cookie)
-        .send({ code: generateTotp(secret) });
+        .send({ code: generateTotp(secret, { time: Date.now() - 30_000 }) });
     });
 
     it('disables with correct password + TOTP', async () => {

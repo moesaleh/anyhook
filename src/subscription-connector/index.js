@@ -198,6 +198,11 @@ const metricsServer = startMetricsServer({ logger: log });
     await reloadActiveSubscriptions();
 
     await consumer.run({
+      // Manual commit so a process crash mid-handleMessage replays
+      // the message on restart instead of losing it (kafkajs's default
+      // autoCommit moves the cursor every 5s regardless of handler
+      // progress).
+      autoCommit: false,
       eachMessage: async payload => {
         try {
           await handleMessage(payload);
@@ -205,6 +210,22 @@ const metricsServer = startMetricsServer({ logger: log });
         } catch (err) {
           subscriptionEventsHandled.inc({ topic: payload.topic, outcome: 'error' });
           log.error('Unhandled error in consumer message handler:', err);
+        }
+        // Commit even on handler error: handleMessage already absorbs
+        // its internal failures (Redis miss, bad JSON, missing handler)
+        // and returns gracefully. Re-processing on restart wouldn't
+        // change the outcome and the partition would lock up. The
+        // commit moves the cursor PAST the message we just processed.
+        try {
+          await consumer.commitOffsets([
+            {
+              topic: payload.topic,
+              partition: payload.partition,
+              offset: String(Number(payload.message.offset) + 1),
+            },
+          ]);
+        } catch (err) {
+          log.error('Failed to commit Kafka offset:', err.message);
         }
       },
     });

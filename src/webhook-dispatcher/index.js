@@ -85,11 +85,28 @@ redisClient.on('error', err => log.error('Redis Client Error', err));
     await consumer.connect();
     await consumer.subscribe({ topics: ['connection_events'], fromBeginning: false });
     await consumer.run({
+      // Manual commit so a crash mid-delivery replays the message on
+      // restart. The dispatcher's producer-supplied event_id idempotency
+      // check (handleConnectionEvent) means a replay won't double-fire
+      // the webhook -- it'll see the existing delivery_events row and
+      // skip.
+      autoCommit: false,
       eachMessage: async payload => {
         try {
           await handleConnectionEvent(payload);
         } catch (err) {
           log.error('Unhandled error in connection_events handler:', err);
+        }
+        try {
+          await consumer.commitOffsets([
+            {
+              topic: payload.topic,
+              partition: payload.partition,
+              offset: String(Number(payload.message.offset) + 1),
+            },
+          ]);
+        } catch (err) {
+          log.error('Failed to commit Kafka offset:', err.message);
         }
       },
     });

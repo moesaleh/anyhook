@@ -2,11 +2,12 @@
 
 import { useEffect, useState, useCallback } from "react";
 import Link from "next/link";
-import { Plus, AlertCircle, Download, RefreshCw } from "lucide-react";
+import { Plus, AlertCircle, Download, RefreshCw, Upload } from "lucide-react";
 import { SubscriptionTable } from "@/components/subscription-table";
 import { DeleteDialog } from "@/components/delete-dialog";
 import { EmptyState } from "@/components/empty-state";
 import { LiveIndicator } from "@/components/live-indicator";
+import { ImportDialog } from "@/components/import-dialog";
 import {
   fetchSubscriptions,
   fetchAllStatuses,
@@ -29,6 +30,7 @@ export default function SubscriptionsPage() {
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
   const [isPolling, setIsPolling] = useState(true);
   const [bulkDeleting, setBulkDeleting] = useState(false);
+  const [showImport, setShowImport] = useState(false);
   const toast = useToast();
 
   const loadData = useCallback(
@@ -177,6 +179,13 @@ export default function SubscriptionsPage() {
           </p>
         </div>
         <div className="flex items-center gap-3">
+          <button
+            onClick={() => setShowImport(true)}
+            className="inline-flex items-center gap-2 rounded-lg border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-950 px-3 py-2.5 text-sm font-medium hover:bg-neutral-50 dark:hover:bg-neutral-900 transition-colors"
+          >
+            <Upload className="h-4 w-4" />
+            Import
+          </button>
           <ExportMenu
             disabled={subscriptions.length === 0}
             onExport={handleExport}
@@ -243,6 +252,12 @@ export default function SubscriptionsPage() {
         onConfirm={confirmDelete}
         onCancel={() => setDeleteTarget(null)}
         loading={deleting !== null}
+      />
+
+      <ImportDialog
+        open={showImport}
+        onClose={() => setShowImport(false)}
+        onImported={() => loadData(true)}
       />
     </div>
   );

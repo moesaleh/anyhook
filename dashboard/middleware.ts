@@ -1,7 +1,12 @@
 import { NextResponse, type NextRequest } from "next/server";
 
 // Routes that don't require a session cookie
-const PUBLIC_PATHS = new Set<string>(["/login", "/register"]);
+const PUBLIC_PATHS = new Set<string>([
+  "/login",
+  "/register",
+  "/forgot-password",
+  "/reset-password",
+]);
 
 // Cookie name MUST match the backend (src/subscription-management/auth.js
 // COOKIE_NAME constant).

@@ -213,8 +213,14 @@ function LoginForm() {
                 </button>
               </form>
 
-              <p className="mt-6 text-center text-xs text-neutral-500">
-                New to AnyHook?{" "}
+              <p className="mt-6 text-center text-xs text-neutral-500 space-x-3">
+                <Link
+                  href="/forgot-password"
+                  className="text-indigo-600 hover:text-indigo-800 dark:text-indigo-400 font-medium"
+                >
+                  Forgot password?
+                </Link>
+                <span>·</span>
                 <Link
                   href="/register"
                   className="text-indigo-600 hover:text-indigo-800 dark:text-indigo-400 font-medium"

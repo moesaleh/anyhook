@@ -28,6 +28,7 @@ import {
 import { useAuth } from "@/lib/auth-context";
 import { cn, formatDate } from "@/lib/utils";
 import { TwoFactorPanel } from "@/components/two-factor-panel";
+import { ChangePasswordForm } from "@/components/change-password-form";
 
 export default function SettingsPage() {
   const { user, organization, organizations, refresh } = useAuth();
@@ -75,7 +76,12 @@ export default function SettingsPage() {
           onCreated={refresh}
         />
       )}
-      {tab === "security" && <TwoFactorPanel />}
+      {tab === "security" && (
+        <div className="space-y-6">
+          <ChangePasswordForm />
+          <TwoFactorPanel />
+        </div>
+      )}
     </div>
   );
 }

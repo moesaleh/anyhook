@@ -292,6 +292,62 @@ export async function verify2faSetup(code: string): Promise<TwoFactorVerifySetup
   return res.json();
 }
 
+/* --- Password change + reset --- */
+
+export interface PasswordResetRequest {
+  message: string;
+  email_sent: boolean;
+  // Dev / no-SMTP convenience: when the backend has no SMTP transport
+  // configured it returns the raw token in the response so the flow
+  // works end-to-end without an inbox. With SMTP working this field
+  // is absent (the user gets the token in their email).
+  token?: string;
+  expires_at?: string;
+}
+
+export async function requestPasswordReset(email: string): Promise<PasswordResetRequest> {
+  const res = await apiFetch("/auth/password/reset-request", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email }),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || "Reset request failed");
+  }
+  return res.json();
+}
+
+export async function resetPassword(token: string, newPassword: string): Promise<void> {
+  const res = await apiFetch("/auth/password/reset", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ token, new_password: newPassword }),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || "Reset failed");
+  }
+}
+
+export async function changePassword(
+  currentPassword: string,
+  newPassword: string
+): Promise<void> {
+  const res = await apiFetch("/auth/password/change", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      current_password: currentPassword,
+      new_password: newPassword,
+    }),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || "Password change failed");
+  }
+}
+
 export async function disable2fa(currentPassword: string, code: string): Promise<void> {
   const res = await apiFetch("/auth/2fa/disable", {
     method: "POST",

@@ -389,6 +389,65 @@ function createApp({
     }
   });
 
+  // Time-series buckets for the dashboard sparklines.
+  //
+  // GET /deliveries/timeseries?range=24h|7d&buckets=24 (default 24h, 24 buckets)
+  //
+  // Returns N evenly-spaced buckets covering the requested range,
+  // org-scoped, with success / failed / total counts per bucket so
+  // the dashboard can render a trend without re-aggregating client-
+  // side. Empty buckets are emitted as zero so the X-axis is dense.
+  app.get('/deliveries/timeseries', requireAuth, rateLimit, async (req, res) => {
+    const range = req.query.range === '7d' ? '7 days' : '24 hours';
+    const numBuckets = Math.min(168, Math.max(2, parseInt(req.query.buckets, 10) || 24));
+    try {
+      // Postgres generate_series + width_bucket would also work, but
+      // the explicit start/end + interval arithmetic keeps the SQL
+      // legible and lets pg_advisory clients reason about it.
+      const result = await pool.query(
+        `WITH params AS (
+            SELECT
+              NOW() - $1::interval AS start_ts,
+              NOW()                  AS end_ts,
+              $2::int                AS n
+         ),
+         bucket_edges AS (
+            SELECT
+              g AS idx,
+              start_ts + (g::numeric * (end_ts - start_ts) / n) AS bucket_start,
+              start_ts + ((g+1)::numeric * (end_ts - start_ts) / n) AS bucket_end
+            FROM params, generate_series(0, params.n - 1) g
+         )
+         SELECT
+           e.idx,
+           e.bucket_start,
+           COUNT(de.delivery_id) FILTER (WHERE de.status = 'success')::int AS successful,
+           COUNT(de.delivery_id) FILTER (WHERE de.status IN ('failed','dlq'))::int AS failed,
+           COUNT(de.delivery_id)::int AS total
+         FROM bucket_edges e
+         LEFT JOIN delivery_events de
+           ON de.organization_id = $3
+          AND de.created_at >= e.bucket_start
+          AND de.created_at <  e.bucket_end
+         GROUP BY e.idx, e.bucket_start
+         ORDER BY e.idx`,
+        [range, numBuckets, req.auth.organizationId]
+      );
+      res.status(200).json({
+        range,
+        buckets: result.rows.map(r => ({
+          bucket_start: r.bucket_start,
+          successful: r.successful,
+          failed: r.failed,
+          total: r.total,
+        })),
+      });
+    } catch (err) {
+      log.error('Error fetching delivery timeseries:', err);
+      errorResponse(res, 500, 'Failed to fetch delivery timeseries');
+    }
+  });
+
   // Org-wide delivery stats
   app.get('/deliveries/stats', requireAuth, rateLimit, async (req, res) => {
     try {

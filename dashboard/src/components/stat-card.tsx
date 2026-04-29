@@ -1,5 +1,6 @@
 import { cn } from "@/lib/utils";
 import type { LucideIcon } from "lucide-react";
+import { Sparkline } from "./sparkline";
 
 interface StatCardProps {
   title: string;
@@ -7,6 +8,11 @@ interface StatCardProps {
   icon: LucideIcon;
   description?: string;
   className?: string;
+  /** Optional numeric series — when present, renders a trend sparkline
+   *  in the lower-right of the card. */
+  trend?: number[];
+  /** Sparkline color override class (defaults to indigo). */
+  trendClassName?: string;
 }
 
 export function StatCard({
@@ -15,6 +21,8 @@ export function StatCard({
   icon: Icon,
   description,
   className,
+  trend,
+  trendClassName,
 }: StatCardProps) {
   return (
     <div
@@ -30,9 +38,16 @@ export function StatCard({
         <Icon className="h-4 w-4 text-neutral-400 dark:text-neutral-600" />
       </div>
       <p className="mt-2 text-2xl font-bold tracking-tight">{value}</p>
-      {description && (
-        <p className="mt-1 text-xs text-neutral-500">{description}</p>
-      )}
+      <div className="mt-1 flex items-end justify-between gap-3">
+        {description ? (
+          <p className="text-xs text-neutral-500 flex-1 min-w-0">{description}</p>
+        ) : (
+          <span className="flex-1" />
+        )}
+        {trend && trend.length > 1 && (
+          <Sparkline data={trend} className={trendClassName} />
+        )}
+      </div>
     </div>
   );
 }

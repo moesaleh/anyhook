@@ -21,9 +21,14 @@ import {
   fetchSubscriptions,
   fetchAllStatuses,
   fetchGlobalDeliveryStats,
+  fetchDeliveryTimeseries,
   deleteSubscription,
 } from "@/lib/api";
-import type { Subscription, GlobalDeliveryStats } from "@/lib/api";
+import type {
+  Subscription,
+  GlobalDeliveryStats,
+  DeliveryTimeseries,
+} from "@/lib/api";
 
 const POLL_INTERVAL = 10000;
 
@@ -32,6 +37,7 @@ export default function DashboardPage() {
   const [connectedIds, setConnectedIds] = useState<Set<string>>(new Set());
   const [deliveryStats, setDeliveryStats] =
     useState<GlobalDeliveryStats | null>(null);
+  const [timeseries, setTimeseries] = useState<DeliveryTimeseries | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [deleting, setDeleting] = useState<string | null>(null);
@@ -41,13 +47,15 @@ export default function DashboardPage() {
   const loadData = useCallback(async () => {
     try {
       setError(null);
-      const [subs, statuses, dStats] = await Promise.all([
+      const [subs, statuses, dStats, ts] = await Promise.all([
         fetchSubscriptions(),
         fetchAllStatuses().catch(() => null),
         fetchGlobalDeliveryStats().catch(() => null),
+        fetchDeliveryTimeseries("24h", 24).catch(() => null),
       ]);
       setSubscriptions(subs);
       setDeliveryStats(dStats);
+      setTimeseries(ts);
       if (statuses) {
         setConnectedIds(
           new Set(
@@ -193,6 +201,8 @@ export default function DashboardPage() {
               ? `${deliveryStats.deliveries_24h} in last 24h`
               : "Webhook delivery attempts"
           }
+          trend={timeseries?.buckets.map((b) => b.total)}
+          trendClassName="text-indigo-500 dark:text-indigo-400"
         />
         <StatCard
           title="Success Rate"
@@ -207,6 +217,10 @@ export default function DashboardPage() {
               ? `${deliveryStats.successful} succeeded, ${deliveryStats.failed} failed`
               : "Delivery success percentage"
           }
+          trend={timeseries?.buckets.map((b) =>
+            b.total > 0 ? (b.successful / b.total) * 100 : 0
+          )}
+          trendClassName="text-emerald-500 dark:text-emerald-400"
         />
         <StatCard
           title="Avg Latency"
@@ -223,6 +237,8 @@ export default function DashboardPage() {
           value={loading || !deliveryStats ? "—" : deliveryStats.deliveries_7d}
           icon={Send}
           description="Deliveries in the past week"
+          trend={timeseries?.buckets.map((b) => b.total)}
+          trendClassName="text-neutral-400"
         />
       </div>
 

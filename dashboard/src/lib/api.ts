@@ -708,6 +708,29 @@ export async function fetchDeliveryStats(id: string): Promise<DeliveryStats> {
   return res.json();
 }
 
+export interface DeliveryTimeseriesBucket {
+  bucket_start: string;
+  successful: number;
+  failed: number;
+  total: number;
+}
+
+export interface DeliveryTimeseries {
+  range: "24 hours" | "7 days";
+  buckets: DeliveryTimeseriesBucket[];
+}
+
+export async function fetchDeliveryTimeseries(
+  range: "24h" | "7d" = "24h",
+  buckets = 24
+): Promise<DeliveryTimeseries> {
+  const params = new URLSearchParams({ range, buckets: String(buckets) });
+  const res = await apiFetch(`/deliveries/timeseries?${params}`);
+  checkAuth(res);
+  if (!res.ok) throw new Error("Failed to fetch delivery timeseries");
+  return res.json();
+}
+
 export async function fetchGlobalDeliveryStats(): Promise<GlobalDeliveryStats> {
   const res = await apiFetch("/deliveries/stats");
   checkAuth(res);

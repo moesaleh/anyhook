@@ -146,18 +146,51 @@ function otpauthUrl({ secret, label, issuer = 'AnyHook' }) {
 }
 
 /**
- * Generate N backup codes in `xxxx-xxxx` form (default 10).
- * Each code is single-use; this returns the raw values + their hashes.
- * Caller stores the hashes; raw values are shown to the user once.
+ * Generate N backup codes (default 10). Each code is single-use.
+ *
+ * Format: `xxxxxxxx-xxxxxxxx` — 64 bits of entropy (was 32 bits in the
+ * earlier `xxxx-xxxx` form). The longer form makes a brute-force attack
+ * against a leaked backup_codes table infeasible even without
+ * key-stretching: 2^64 / (commodity GPU rate ~10^11/s) ~= 5800 years.
+ *
+ * Hashing: HMAC-SHA256 with BACKUP_CODE_PEPPER (if set), else SHA-256.
+ * The pepper is a system-wide secret separate from JWT_SECRET — an
+ * attacker with only DB read access cannot brute-force the codes
+ * without it. Production deployments should set it. Without it (dev /
+ * tests / unconfigured prod) we keep returning SHA-256 hashes so
+ * existing rows in backup_codes still validate.
+ *
+ * Backwards-compat with the previous `xxxx-xxxx` 32-bit format and
+ * unsalted SHA-256: the verifier (in auth.js) accepts BOTH the new
+ * regex shape and the legacy one, and looks up by both peppered AND
+ * unpeppered hashes — so codes generated before this upgrade keep
+ * working until the user regenerates.
  */
+const BACKUP_CODE_REGEX = /^([0-9a-f]{4}-[0-9a-f]{4}|[0-9a-f]{8}-[0-9a-f]{8})$/;
+
 function generateBackupCodes(count = 10) {
   return Array.from({ length: count }, () => {
-    const raw = `${crypto.randomBytes(2).toString('hex')}-${crypto.randomBytes(2).toString('hex')}`;
+    // 4 bytes per half = 64 bits total
+    const raw = `${crypto.randomBytes(4).toString('hex')}-${crypto.randomBytes(4).toString('hex')}`;
     return { raw, hash: hashBackupCode(raw) };
   });
 }
 
 function hashBackupCode(raw) {
+  const pepper = process.env.BACKUP_CODE_PEPPER;
+  if (pepper) {
+    return crypto.createHmac('sha256', pepper).update(raw).digest('hex');
+  }
+  return crypto.createHash('sha256').update(raw).digest('hex');
+}
+
+/**
+ * Legacy hash function — always plain SHA-256 regardless of pepper.
+ * Used for backwards-compat lookups against rows generated before
+ * BACKUP_CODE_PEPPER was introduced. New rows always use
+ * hashBackupCode() (which is peppered when pepper is set).
+ */
+function legacyHashBackupCode(raw) {
   return crypto.createHash('sha256').update(raw).digest('hex');
 }
 
@@ -169,6 +202,8 @@ module.exports = {
   otpauthUrl,
   generateBackupCodes,
   hashBackupCode,
+  legacyHashBackupCode,
+  BACKUP_CODE_REGEX,
   base32Encode,
   base32Decode,
 };

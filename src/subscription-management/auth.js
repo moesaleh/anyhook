@@ -26,6 +26,8 @@ const {
   otpauthUrl,
   generateBackupCodes,
   hashBackupCode,
+  legacyHashBackupCode,
+  BACKUP_CODE_REGEX,
 } = require('../lib/totp');
 const {
   generateInvitationToken,
@@ -395,16 +397,21 @@ function mountAuthRoutes(
       }
 
       // Backup code attempt: hash, claim under FOR UPDATE in a tx.
-      if (typeof code === 'string' && /^[0-9a-f]{4}-[0-9a-f]{4}$/.test(code)) {
-        const codeHash = hashBackupCode(code);
+      // Accepts both the legacy xxxx-xxxx (32-bit) and new
+      // xxxxxxxx-xxxxxxxx (64-bit) formats. Looks up by both the
+      // peppered hash AND the legacy SHA-256 hash so codes generated
+      // before BACKUP_CODE_PEPPER was set still validate.
+      if (typeof code === 'string' && BACKUP_CODE_REGEX.test(code)) {
+        const newHash = hashBackupCode(code);
+        const oldHash = legacyHashBackupCode(code);
         const client = await pool.connect();
         try {
           await client.query('BEGIN');
           const r = await client.query(
             `SELECT id FROM backup_codes
-             WHERE user_id = $1 AND code_hash = $2 AND used_at IS NULL
+             WHERE user_id = $1 AND code_hash IN ($2, $3) AND used_at IS NULL
              FOR UPDATE`,
-            [user.id, codeHash]
+            [user.id, newHash, oldHash]
           );
           if (r.rowCount === 0) {
             await client.query('ROLLBACK');
@@ -603,11 +610,12 @@ function mountAuthRoutes(
             [matchedStep, req.auth.userId]
           );
         }
-      } else if (typeof code === 'string' && /^[0-9a-f]{4}-[0-9a-f]{4}$/.test(code)) {
+      } else if (typeof code === 'string' && BACKUP_CODE_REGEX.test(code)) {
+        // Both peppered + legacy hashes — see verify-login above.
         const r = await pool.query(
           `SELECT id FROM backup_codes
-           WHERE user_id = $1 AND code_hash = $2 AND used_at IS NULL`,
-          [req.auth.userId, hashBackupCode(code)]
+           WHERE user_id = $1 AND code_hash IN ($2, $3) AND used_at IS NULL`,
+          [req.auth.userId, hashBackupCode(code), legacyHashBackupCode(code)]
         );
         codeOk = r.rowCount > 0;
         if (codeOk) {

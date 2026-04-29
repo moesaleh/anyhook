@@ -78,7 +78,10 @@ describeIfPg('2FA / TOTP (integration)', () => {
       expect(verify.body.enabled).toBe(true);
       expect(verify.body.backup_codes).toHaveLength(10);
       for (const c of verify.body.backup_codes) {
-        expect(c).toMatch(/^[0-9a-f]{4}-[0-9a-f]{4}$/);
+        // 64-bit format (post-hardening). Legacy 4-4 still accepted by
+        // the validator for backwards compat, but new generation uses
+        // the wider form.
+        expect(c).toMatch(/^[0-9a-f]{8}-[0-9a-f]{8}$/);
       }
 
       const status = await request(app).get('/auth/2fa/status').set('Cookie', cookie);

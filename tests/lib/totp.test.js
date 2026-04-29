@@ -142,9 +142,9 @@ describe('generateBackupCodes', () => {
     expect(generateBackupCodes(5).length).toBe(5);
   });
 
-  it('codes are in xxxx-xxxx form', () => {
+  it('codes are in xxxxxxxx-xxxxxxxx form (64 bits of entropy)', () => {
     for (const c of generateBackupCodes(3)) {
-      expect(c.raw).toMatch(/^[0-9a-f]{4}-[0-9a-f]{4}$/);
+      expect(c.raw).toMatch(/^[0-9a-f]{8}-[0-9a-f]{8}$/);
     }
   });
 
@@ -153,14 +153,48 @@ describe('generateBackupCodes', () => {
     expect(new Set(codes).size).toBe(20);
   });
 
-  it('hash matches sha256 hex of raw', () => {
-    const { raw, hash } = generateBackupCodes(1)[0];
-    expect(hash).toBe(crypto.createHash('sha256').update(raw).digest('hex'));
+  it('hash matches sha256 hex of raw when no pepper is set', () => {
+    const before = process.env.BACKUP_CODE_PEPPER;
+    delete process.env.BACKUP_CODE_PEPPER;
+    try {
+      const { raw, hash } = generateBackupCodes(1)[0];
+      expect(hash).toBe(crypto.createHash('sha256').update(raw).digest('hex'));
+    } finally {
+      if (before !== undefined) process.env.BACKUP_CODE_PEPPER = before;
+    }
   });
 });
 
 describe('hashBackupCode', () => {
+  const ORIGINAL = process.env.BACKUP_CODE_PEPPER;
+  afterEach(() => {
+    if (ORIGINAL !== undefined) process.env.BACKUP_CODE_PEPPER = ORIGINAL;
+    else delete process.env.BACKUP_CODE_PEPPER;
+  });
+
   it('deterministic', () => {
     expect(hashBackupCode('abcd-1234')).toBe(hashBackupCode('abcd-1234'));
+  });
+
+  it('falls back to plain SHA-256 when BACKUP_CODE_PEPPER is unset', () => {
+    delete process.env.BACKUP_CODE_PEPPER;
+    expect(hashBackupCode('abcd-1234')).toBe(
+      crypto.createHash('sha256').update('abcd-1234').digest('hex')
+    );
+  });
+
+  it('uses HMAC-SHA256 when BACKUP_CODE_PEPPER is set', () => {
+    process.env.BACKUP_CODE_PEPPER = 'pepper-of-the-day';
+    expect(hashBackupCode('abcd-1234')).toBe(
+      crypto.createHmac('sha256', 'pepper-of-the-day').update('abcd-1234').digest('hex')
+    );
+  });
+
+  it('peppered hash differs from unpeppered hash', () => {
+    delete process.env.BACKUP_CODE_PEPPER;
+    const noPepper = hashBackupCode('abcd-1234');
+    process.env.BACKUP_CODE_PEPPER = 'pepper-of-the-day';
+    const peppered = hashBackupCode('abcd-1234');
+    expect(noPepper).not.toBe(peppered);
   });
 });

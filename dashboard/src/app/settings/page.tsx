@@ -26,6 +26,7 @@ import {
   type CreatedApiKey,
 } from "@/lib/api";
 import { useAuth } from "@/lib/auth-context";
+import { useToast } from "@/lib/toast";
 import { cn, formatDate } from "@/lib/utils";
 import { TwoFactorPanel } from "@/components/two-factor-panel";
 import { ChangePasswordForm } from "@/components/change-password-form";
@@ -102,6 +103,7 @@ function MembersPanel({ currentUserId }: { currentUserId: string | null }) {
   const [addEmail, setAddEmail] = useState("");
   const [addRole, setAddRole] = useState<"member" | "admin" | "owner">("member");
   const [adding, setAdding] = useState(false);
+  const toast = useToast();
 
   async function load() {
     try {
@@ -124,11 +126,15 @@ function MembersPanel({ currentUserId }: { currentUserId: string | null }) {
     setAdding(true);
     try {
       await addOrgMember(addEmail.trim(), addRole);
+      toast.success(`Added ${addEmail.trim()} as ${addRole}`);
       setAddEmail("");
       setShowAdd(false);
       await load();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to add member");
+      toast.error(
+        "Failed to add member",
+        err instanceof Error ? err.message : undefined
+      );
     } finally {
       setAdding(false);
     }
@@ -138,9 +144,13 @@ function MembersPanel({ currentUserId }: { currentUserId: string | null }) {
     if (!confirm("Remove this member from the organization?")) return;
     try {
       await removeOrgMember(userId);
+      toast.success("Member removed");
       await load();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to remove member");
+      toast.error(
+        "Failed to remove member",
+        err instanceof Error ? err.message : undefined
+      );
     }
   }
 
@@ -156,9 +166,13 @@ function MembersPanel({ currentUserId }: { currentUserId: string | null }) {
       // "change role" — backend RBAC enforces the owner-protection
       // rules (commit 51d290f).
       await addOrgMember(member.email, role);
+      toast.success(`${member.email} is now ${role}`);
       await load();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to change role");
+      toast.error(
+        "Failed to change role",
+        err instanceof Error ? err.message : undefined
+      );
       // Refresh anyway in case the backend rolled back partway
       await load();
     }

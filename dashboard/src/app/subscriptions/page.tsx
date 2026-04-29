@@ -13,6 +13,7 @@ import {
   deleteSubscription,
 } from "@/lib/api";
 import type { Subscription } from "@/lib/api";
+import { useToast } from "@/lib/toast";
 
 const POLL_INTERVAL = 10000;
 
@@ -26,6 +27,7 @@ export default function SubscriptionsPage() {
   const [refreshing, setRefreshing] = useState(false);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
   const [isPolling, setIsPolling] = useState(true);
+  const toast = useToast();
 
   const loadData = useCallback(
     async (showRefresh = false) => {
@@ -74,6 +76,7 @@ export default function SubscriptionsPage() {
   async function confirmDelete() {
     if (!deleteTarget) return;
     setDeleting(deleteTarget);
+    const idShort = deleteTarget.slice(0, 8);
     try {
       await deleteSubscription(deleteTarget);
       setSubscriptions((prev) =>
@@ -84,8 +87,12 @@ export default function SubscriptionsPage() {
         next.delete(deleteTarget);
         return next;
       });
-    } catch {
-      setError("Failed to delete subscription.");
+      toast.success(`Subscription ${idShort}… deleted`);
+    } catch (err) {
+      toast.error(
+        "Failed to delete subscription",
+        err instanceof Error ? err.message : undefined
+      );
     } finally {
       setDeleting(null);
       setDeleteTarget(null);

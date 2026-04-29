@@ -3,6 +3,7 @@ import { Sidebar } from "@/components/sidebar";
 import { ErrorBoundary } from "@/components/error-boundary";
 import { AuthProvider } from "@/lib/auth-context";
 import { ThemeProvider, THEME_INIT_SCRIPT } from "@/lib/theme";
+import { ToastProvider } from "@/lib/toast";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -29,12 +30,14 @@ export default function RootLayout({
       </head>
       <body className="min-h-full flex font-sans">
         <ThemeProvider>
-          <AuthProvider>
-            <Sidebar />
-            <main className="flex-1 min-h-screen overflow-auto">
-              <ErrorBoundary>{children}</ErrorBoundary>
-            </main>
-          </AuthProvider>
+          <ToastProvider>
+            <AuthProvider>
+              <Sidebar />
+              <main className="flex-1 min-h-screen overflow-auto">
+                <ErrorBoundary>{children}</ErrorBoundary>
+              </main>
+            </AuthProvider>
+          </ToastProvider>
         </ThemeProvider>
       </body>
     </html>

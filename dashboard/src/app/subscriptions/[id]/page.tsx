@@ -24,6 +24,7 @@ import {
   fetchDeliveryStats,
   deleteSubscription,
 } from "@/lib/api";
+import { useToast } from "@/lib/toast";
 import { StatusBadge } from "@/components/status-badge";
 import { ConnectionTypeBadge } from "@/components/connection-type-badge";
 import { ConnectionFlow } from "@/components/connection-flow";
@@ -96,13 +97,19 @@ export default function SubscriptionDetailPage() {
     }
   }
 
+  const toast = useToast();
+
   async function handleDelete() {
     setDeleting(true);
     try {
       await deleteSubscription(id);
+      toast.success("Subscription deleted");
       router.push("/subscriptions");
-    } catch {
-      setError("Failed to delete subscription.");
+    } catch (err) {
+      toast.error(
+        "Failed to delete subscription",
+        err instanceof Error ? err.message : undefined
+      );
       setDeleting(false);
       setShowDelete(false);
     }

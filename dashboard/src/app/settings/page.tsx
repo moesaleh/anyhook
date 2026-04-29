@@ -29,6 +29,7 @@ import { useAuth } from "@/lib/auth-context";
 import { cn, formatDate } from "@/lib/utils";
 import { TwoFactorPanel } from "@/components/two-factor-panel";
 import { ChangePasswordForm } from "@/components/change-password-form";
+import { InvitationsPanel } from "@/components/invitations-panel";
 
 export default function SettingsPage() {
   const { user, organization, organizations, refresh } = useAuth();
@@ -67,7 +68,12 @@ export default function SettingsPage() {
         </nav>
       </div>
 
-      {tab === "members" && <MembersPanel currentUserId={user?.id || null} />}
+      {tab === "members" && (
+        <div className="space-y-8">
+          <MembersPanel currentUserId={user?.id || null} />
+          <InvitationsPanel />
+        </div>
+      )}
       {tab === "api-keys" && <ApiKeysPanel />}
       {tab === "organizations" && (
         <OrganizationsPanel
@@ -138,6 +144,26 @@ function MembersPanel({ currentUserId }: { currentUserId: string | null }) {
     }
   }
 
+  async function handleRoleChange(
+    member: OrganizationMember,
+    role: "owner" | "admin" | "member"
+  ) {
+    if (role === member.role) return;
+    setError(null);
+    try {
+      // POST /organizations/current/members is `INSERT ... ON CONFLICT
+      // DO UPDATE SET role`, so the same endpoint serves "add" and
+      // "change role" — backend RBAC enforces the owner-protection
+      // rules (commit 51d290f).
+      await addOrgMember(member.email, role);
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to change role");
+      // Refresh anyway in case the backend rolled back partway
+      await load();
+    }
+  }
+
   return (
     <div>
       <div className="flex items-center justify-between mb-4">
@@ -197,8 +223,8 @@ function MembersPanel({ currentUserId }: { currentUserId: string | null }) {
             Add
           </button>
           <p className="w-full text-xs text-neutral-500 mt-1">
-            User must have already registered. Invite-by-email is on the
-            roadmap.
+            User must have already registered. To invite by email, use the
+            Invitations panel below.
           </p>
         </form>
       )}
@@ -226,9 +252,27 @@ function MembersPanel({ currentUserId }: { currentUserId: string | null }) {
                     <div className="text-xs text-neutral-500">{m.email}</div>
                   </td>
                   <td className="px-4 py-3 text-xs">
-                    <span className="inline-flex items-center rounded-full bg-neutral-100 dark:bg-neutral-800 px-2 py-0.5 capitalize">
-                      {m.role}
-                    </span>
+                    {m.id === currentUserId ? (
+                      <span className="inline-flex items-center rounded-full bg-neutral-100 dark:bg-neutral-800 px-2 py-0.5 capitalize">
+                        {m.role}
+                      </span>
+                    ) : (
+                      <select
+                        value={m.role}
+                        onChange={(e) =>
+                          handleRoleChange(
+                            m,
+                            e.target.value as "owner" | "admin" | "member"
+                          )
+                        }
+                        className="rounded-md border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-950 px-2 py-0.5 text-xs capitalize"
+                        aria-label={`Role for ${m.email}`}
+                      >
+                        <option value="member">member</option>
+                        <option value="admin">admin</option>
+                        <option value="owner">owner</option>
+                      </select>
+                    )}
                   </td>
                   <td className="px-4 py-3 text-xs text-neutral-500">
                     {formatDate(m.created_at)}

@@ -444,6 +444,96 @@ export async function removeOrgMember(userId: string): Promise<void> {
   }
 }
 
+/* --- Invitations --- */
+
+export interface Invitation {
+  id: string;
+  organization_id?: string;
+  email: string;
+  role: "owner" | "admin" | "member";
+  expires_at: string;
+  accepted_at: string | null;
+  revoked_at: string | null;
+  created_at: string;
+}
+
+export interface CreatedInvitation extends Invitation {
+  // Returned ONCE on creation when SMTP is unconfigured (dev mode).
+  // Absent when the backend successfully emailed the invitee.
+  token?: string;
+  email_sent: boolean;
+  message: string;
+}
+
+export async function fetchInvitations(): Promise<Invitation[]> {
+  const res = await apiFetch("/organizations/current/invitations");
+  checkAuth(res);
+  if (!res.ok) throw new Error("Failed to load invitations");
+  return res.json();
+}
+
+export async function createInvitation(data: {
+  email: string;
+  role?: "owner" | "admin" | "member";
+  expires_in_days?: number;
+}): Promise<CreatedInvitation> {
+  const res = await apiFetch("/organizations/current/invitations", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || "Failed to create invitation");
+  }
+  return res.json();
+}
+
+export async function revokeInvitation(id: string): Promise<void> {
+  const res = await apiFetch(`/organizations/current/invitations/${id}`, {
+    method: "DELETE",
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || "Failed to revoke invitation");
+  }
+}
+
+export interface InvitationLookup {
+  email: string;
+  role: "owner" | "admin" | "member";
+  organization_name: string;
+  expires_at: string;
+}
+
+/** Anonymous: read-only lookup for the registration page. */
+export async function lookupInvitation(token: string): Promise<InvitationLookup> {
+  const res = await apiFetch(`/invitations/${encodeURIComponent(token)}`);
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || "Invitation not found");
+  }
+  return res.json();
+}
+
+/** Anonymous: redeem an invitation token + create a user. */
+export async function acceptInvite(data: {
+  token: string;
+  password: string;
+  name?: string;
+}): Promise<SessionResponse> {
+  const res = await apiFetch("/auth/accept-invite", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || "Failed to accept invitation");
+  }
+  return res.json();
+}
+
 export async function fetchQuotas(): Promise<QuotasResponse> {
   const res = await apiFetch("/organizations/current/quotas");
   checkAuth(res);

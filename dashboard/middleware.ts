@@ -8,6 +8,11 @@ const PUBLIC_PATHS = new Set<string>([
   "/reset-password",
 ]);
 
+// Path prefixes that don't require a session cookie. Used for routes
+// with dynamic segments (e.g. /invitations/[token]) where exact-match
+// against a Set isn't sufficient.
+const PUBLIC_PREFIXES = ["/invitations/"];
+
 // Cookie name MUST match the backend (src/subscription-management/auth.js
 // COOKIE_NAME constant).
 const SESSION_COOKIE = "anyhook_session";
@@ -15,7 +20,8 @@ const SESSION_COOKIE = "anyhook_session";
 export function middleware(request: NextRequest) {
   const { pathname } = request.nextUrl;
   const session = request.cookies.get(SESSION_COOKIE);
-  const isPublic = PUBLIC_PATHS.has(pathname);
+  const isPublic =
+    PUBLIC_PATHS.has(pathname) || PUBLIC_PREFIXES.some(p => pathname.startsWith(p));
 
   // Block access to protected pages without a cookie. Note: we only check
   // for cookie presence, not validity — actual validation happens server-side

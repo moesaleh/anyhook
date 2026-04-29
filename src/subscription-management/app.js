@@ -543,7 +543,19 @@ function createApp({
           messages: [{ key: id, value: id }],
         });
       } catch (kafkaErr) {
+        // Symmetric with POST /subscribe: signal the failure to the
+        // caller. The DB and Redis are now ahead of the connector
+        // (which won't receive the update_events message and will
+        // keep using the old config). Returning 200 here would let
+        // the dashboard claim "saved" while the live connection
+        // silently runs the previous config.
         log.error(`[Update API] - Failed to publish update_events for ${id}`, kafkaErr);
+        return errorResponse(
+          res,
+          500,
+          'Subscription updated in DB but Kafka publish failed; ' +
+            'connector still running previous config until reconciled'
+        );
       }
       res.status(200).json(withoutSecret(result.rows[0]));
     } catch (err) {

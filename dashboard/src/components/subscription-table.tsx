@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect } from "react";
 import Link from "next/link";
 import {
   Search,
@@ -14,7 +14,7 @@ import {
   ChevronRight,
   Eye,
 } from "lucide-react";
-import { cn, formatDate, truncate } from "@/lib/utils";
+import { cn, formatDate, truncate, useDebounced } from "@/lib/utils";
 import { StatusBadge } from "./status-badge";
 import { ConnectionTypeBadge } from "./connection-type-badge";
 import type { Subscription } from "@/lib/api";
@@ -24,6 +24,10 @@ interface SubscriptionTableProps {
   connectedIds?: Set<string>;
   onDelete: (id: string) => void;
   deleting: string | null;
+  /** Optional bulk-delete handler. Renders the multi-select column +
+   * top toolbar action when present. */
+  onBulkDelete?: (ids: string[]) => void | Promise<void>;
+  bulkDeleting?: boolean;
 }
 
 type SortField = "created_at" | "connection_type" | "status" | "webhook_url";
@@ -36,20 +40,40 @@ export function SubscriptionTable({
   connectedIds,
   onDelete,
   deleting,
+  onBulkDelete,
+  bulkDeleting = false,
 }: SubscriptionTableProps) {
   const [search, setSearch] = useState("");
+  const debouncedSearch = useDebounced(search, 200);
   const [typeFilter, setTypeFilter] = useState<string>("all");
   const [statusFilter, setStatusFilter] = useState<string>("all");
   const [sortField, setSortField] = useState<SortField>("created_at");
   const [sortDir, setSortDir] = useState<SortDir>("desc");
   const [page, setPage] = useState(1);
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+
+  // Reset selection if the underlying list shrinks (after a delete).
+  // Keeps the bulk-delete toolbar from claiming "3 selected" when only
+  // one of those rows still exists.
+  useEffect(() => {
+    setSelected((prev) => {
+      const present = new Set(subscriptions.map((s) => s.subscription_id));
+      let changed = false;
+      const next = new Set<string>();
+      prev.forEach((id) => {
+        if (present.has(id)) next.add(id);
+        else changed = true;
+      });
+      return changed ? next : prev;
+    });
+  }, [subscriptions]);
 
   const filtered = useMemo(() => {
     let result = subscriptions;
 
-    if (search) {
-      const q = search.toLowerCase();
+    if (debouncedSearch) {
+      const q = debouncedSearch.toLowerCase();
       result = result.filter(
         (s) =>
           s.subscription_id.toLowerCase().includes(q) ||
@@ -84,10 +108,50 @@ export function SubscriptionTable({
     });
 
     return result;
-  }, [subscriptions, connectedIds, search, typeFilter, statusFilter, sortField, sortDir]);
+  }, [subscriptions, connectedIds, debouncedSearch, typeFilter, statusFilter, sortField, sortDir]);
 
   const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
   const paginated = filtered.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
+
+  const showBulk = !!onBulkDelete;
+  const allOnPageSelected =
+    paginated.length > 0 &&
+    paginated.every((s) => selected.has(s.subscription_id));
+  const someOnPageSelected = paginated.some((s) => selected.has(s.subscription_id));
+
+  function togglePageSelection() {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (allOnPageSelected) {
+        for (const s of paginated) next.delete(s.subscription_id);
+      } else {
+        for (const s of paginated) next.add(s.subscription_id);
+      }
+      return next;
+    });
+  }
+
+  function toggleRowSelection(id: string) {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  async function confirmBulkDelete() {
+    if (!onBulkDelete) return;
+    if (selected.size === 0) return;
+    if (
+      !confirm(
+        `Delete ${selected.size} subscription${selected.size === 1 ? "" : "s"}? This cannot be undone.`
+      )
+    )
+      return;
+    await onBulkDelete([...selected]);
+    setSelected(new Set());
+  }
 
   function toggleSort(field: SortField) {
     if (sortField === field) {
@@ -120,6 +184,37 @@ export function SubscriptionTable({
 
   return (
     <div>
+      {/* Bulk-action bar — shown when one or more rows are selected. */}
+      {showBulk && selected.size > 0 && (
+        <div
+          role="region"
+          aria-label="Bulk actions"
+          className="mb-3 flex items-center justify-between gap-3 rounded-lg border border-indigo-200 dark:border-indigo-900 bg-indigo-50 dark:bg-indigo-950/40 px-3 py-2 text-sm"
+        >
+          <span className="text-indigo-900 dark:text-indigo-200 font-medium">
+            {selected.size} selected
+          </span>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setSelected(new Set())}
+              className="text-xs text-indigo-700 dark:text-indigo-300 hover:underline"
+            >
+              Clear
+            </button>
+            <button
+              type="button"
+              onClick={confirmBulkDelete}
+              disabled={bulkDeleting}
+              className="inline-flex items-center gap-1.5 rounded-lg bg-red-600 text-white px-3 py-1.5 text-xs font-medium hover:bg-red-700 disabled:opacity-60"
+            >
+              <Trash2 className="h-3.5 w-3.5" />
+              {bulkDeleting ? "Deleting..." : "Delete selected"}
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Toolbar */}
       <div className="flex flex-col sm:flex-row gap-3 mb-4">
         <div className="relative flex-1">
@@ -167,6 +262,20 @@ export function SubscriptionTable({
         <table className="min-w-full divide-y divide-neutral-200 dark:divide-neutral-800">
           <thead className="bg-neutral-50 dark:bg-neutral-900">
             <tr>
+              {showBulk && (
+                <th className="w-10 px-3 py-3">
+                  <input
+                    type="checkbox"
+                    aria-label="Select all on page"
+                    checked={allOnPageSelected}
+                    ref={(el) => {
+                      if (el) el.indeterminate = !allOnPageSelected && someOnPageSelected;
+                    }}
+                    onChange={togglePageSelection}
+                    className="h-3.5 w-3.5 rounded border-neutral-300 dark:border-neutral-700"
+                  />
+                </th>
+              )}
               <th className="px-4 py-3 text-left text-xs font-medium text-neutral-500 uppercase tracking-wider">
                 Subscription ID
               </th>
@@ -214,7 +323,7 @@ export function SubscriptionTable({
             {paginated.length === 0 ? (
               <tr>
                 <td
-                  colSpan={7}
+                  colSpan={showBulk ? 8 : 7}
                   className="px-4 py-12 text-center text-sm text-neutral-500"
                 >
                   {subscriptions.length === 0
@@ -225,11 +334,28 @@ export function SubscriptionTable({
             ) : (
               paginated.map((sub) => {
                 const isConnected = connectedIds?.has(sub.subscription_id);
+                const isSelected = selected.has(sub.subscription_id);
                 return (
                   <tr
                     key={sub.subscription_id}
-                    className="hover:bg-neutral-50 dark:hover:bg-neutral-900/50 transition-colors group"
+                    className={cn(
+                      "transition-colors group",
+                      isSelected
+                        ? "bg-indigo-50/50 dark:bg-indigo-950/20"
+                        : "hover:bg-neutral-50 dark:hover:bg-neutral-900/50"
+                    )}
                   >
+                    {showBulk && (
+                      <td className="w-10 px-3 py-3">
+                        <input
+                          type="checkbox"
+                          aria-label={`Select ${sub.subscription_id.slice(0, 8)}`}
+                          checked={isSelected}
+                          onChange={() => toggleRowSelection(sub.subscription_id)}
+                          className="h-3.5 w-3.5 rounded border-neutral-300 dark:border-neutral-700"
+                        />
+                      </td>
+                    )}
                     <td className="px-4 py-3">
                       <div className="flex items-center gap-1.5">
                         <Link

@@ -27,6 +27,7 @@ export default function SubscriptionsPage() {
   const [refreshing, setRefreshing] = useState(false);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
   const [isPolling, setIsPolling] = useState(true);
+  const [bulkDeleting, setBulkDeleting] = useState(false);
   const toast = useToast();
 
   const loadData = useCallback(
@@ -71,6 +72,42 @@ export default function SubscriptionsPage() {
 
   async function handleDelete(id: string) {
     setDeleteTarget(id);
+  }
+
+  async function handleBulkDelete(ids: string[]) {
+    if (ids.length === 0) return;
+    setBulkDeleting(true);
+    // Fire deletes in parallel; collect successes/failures so partial
+    // outcomes still update the UI cleanly.
+    const results = await Promise.allSettled(ids.map((id) => deleteSubscription(id)));
+    const succeeded: string[] = [];
+    let failed = 0;
+    results.forEach((r, i) => {
+      if (r.status === "fulfilled") succeeded.push(ids[i]);
+      else failed++;
+    });
+    if (succeeded.length > 0) {
+      const succeededSet = new Set(succeeded);
+      setSubscriptions((prev) =>
+        prev.filter((s) => !succeededSet.has(s.subscription_id))
+      );
+      setConnectedIds((prev) => {
+        const next = new Set(prev);
+        succeededSet.forEach((id) => next.delete(id));
+        return next;
+      });
+    }
+    if (failed === 0) {
+      toast.success(`Deleted ${succeeded.length} subscription${succeeded.length === 1 ? "" : "s"}`);
+    } else if (succeeded.length === 0) {
+      toast.error(`Failed to delete ${failed} subscription${failed === 1 ? "" : "s"}`);
+    } else {
+      toast.error(
+        `Deleted ${succeeded.length} of ${ids.length} subscriptions`,
+        `${failed} delete${failed === 1 ? "" : "s"} failed.`
+      );
+    }
+    setBulkDeleting(false);
   }
 
   async function confirmDelete() {
@@ -161,6 +198,8 @@ export default function SubscriptionsPage() {
           connectedIds={connectedIds}
           onDelete={handleDelete}
           deleting={deleting}
+          onBulkDelete={handleBulkDelete}
+          bulkDeleting={bulkDeleting}
         />
       )}
 

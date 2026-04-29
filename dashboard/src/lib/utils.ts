@@ -1,7 +1,26 @@
 import { clsx, type ClassValue } from "clsx";
+import { useEffect, useState } from "react";
 
 export function cn(...inputs: ClassValue[]) {
   return clsx(inputs);
+}
+
+/**
+ * Debounce a value so it only "settles" after the input has been
+ * stable for `delayMs`. Used by the subscription table search input
+ * to avoid filtering 500-row arrays on every keystroke.
+ *
+ * The current value updates immediately (so the input stays
+ * controlled and responsive); the deferred value catches up after
+ * the timer.
+ */
+export function useDebounced<T>(value: T, delayMs = 200): T {
+  const [debounced, setDebounced] = useState(value);
+  useEffect(() => {
+    const t = setTimeout(() => setDebounced(value), delayMs);
+    return () => clearTimeout(t);
+  }, [value, delayMs]);
+  return debounced;
 }
 
 export function formatDate(dateString: string): string {

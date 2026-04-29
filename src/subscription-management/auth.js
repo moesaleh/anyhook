@@ -110,21 +110,32 @@ function makeRequireAuth({ pool }) {
       if (!claims) {
         return res.status(401).json({ error: 'Invalid or expired session' });
       }
-      // Verify the membership still exists (user could have been removed
-      // from the org since the cookie was issued)
+      // Single query: verify the membership still exists (user could
+      // have been removed from the org since cookie issue) AND check
+      // token_version to invalidate outstanding cookies after logout /
+      // password change / 2FA disable.
       try {
         const result = await pool.query(
-          `SELECT role FROM memberships
-                     WHERE user_id = $1 AND organization_id = $2`,
+          `SELECT m.role, u.token_version
+           FROM memberships m
+           JOIN users u ON u.id = m.user_id
+           WHERE m.user_id = $1 AND m.organization_id = $2`,
           [claims.sub, claims.org]
         );
         if (result.rowCount === 0) {
           return res.status(403).json({ error: 'No active membership in this organization' });
         }
+        const row = result.rows[0];
+        const cookieTokenVersion = claims.tv || 0;
+        if (cookieTokenVersion !== row.token_version) {
+          // Cookie was issued before a logout / password change / 2FA
+          // disable. Treat like an expired session.
+          return res.status(401).json({ error: 'Invalid or expired session' });
+        }
         req.auth = {
           userId: claims.sub,
           organizationId: claims.org,
-          role: result.rows[0].role,
+          role: row.role,
           via: 'cookie',
         };
         return next();
@@ -215,7 +226,7 @@ function mountAuthRoutes(
       const userResult = await client.query(
         `INSERT INTO users (email, password_hash, name)
                  VALUES ($1, $2, $3)
-                 RETURNING id, email, name, created_at`,
+                 RETURNING id, email, name, token_version, created_at`,
         [email.toLowerCase(), passwordHash, name || null]
       );
       const user = userResult.rows[0];
@@ -252,7 +263,7 @@ function mountAuthRoutes(
 
       await client.query('COMMIT');
 
-      const token = signSession(user.id, org.id);
+      const token = signSession(user.id, org.id, { tokenVersion: user.token_version });
       setSessionCookie(res, token);
       res.status(201).json({
         user: { id: user.id, email: user.email, name: user.name },
@@ -270,6 +281,10 @@ function mountAuthRoutes(
   /**
    * Build the standard "logged in" payload + set the session cookie.
    * Reused by /auth/login (no-2FA path) and /auth/2fa/verify-login.
+   *
+   * `user.token_version` MUST be present — it's encoded into the JWT
+   * so requireAuth can invalidate outstanding cookies on logout /
+   * password-change / 2FA-disable.
    */
   async function completeLogin(res, user) {
     const orgs = await pool.query(
@@ -284,7 +299,7 @@ function mountAuthRoutes(
       return res.status(403).json({ error: 'User has no organization memberships' });
     }
     const activeOrg = orgs.rows[0];
-    const token = signSession(user.id, activeOrg.id);
+    const token = signSession(user.id, activeOrg.id, { tokenVersion: user.token_version });
     setSessionCookie(res, token);
     return res.status(200).json({
       user: { id: user.id, email: user.email, name: user.name },
@@ -305,7 +320,7 @@ function mountAuthRoutes(
 
     try {
       const userResult = await pool.query(
-        `SELECT id, email, name, password_hash, totp_secret, totp_enabled_at
+        `SELECT id, email, name, password_hash, totp_secret, totp_enabled_at, token_version
          FROM users WHERE LOWER(email) = LOWER($1)`,
         [email]
       );
@@ -346,7 +361,7 @@ function mountAuthRoutes(
     }
     try {
       const userResult = await pool.query(
-        `SELECT id, email, name, totp_secret, totp_enabled_at
+        `SELECT id, email, name, totp_secret, totp_enabled_at, token_version
          FROM users WHERE id = $1`,
         [claims.sub]
       );
@@ -559,12 +574,19 @@ function mountAuthRoutes(
       }
       if (!codeOk) return res.status(401).json({ error: 'Invalid 2FA code' });
 
+      // Bump token_version on disable so any cookie issued while 2FA
+      // was protecting this account is invalidated. The user has just
+      // weakened their auth posture; re-login forces them to confirm
+      // they still know the password.
       await pool.query(
-        `UPDATE users SET totp_secret = NULL, totp_enabled_at = NULL, updated_at = NOW()
+        `UPDATE users SET totp_secret = NULL, totp_enabled_at = NULL,
+                          token_version = token_version + 1,
+                          updated_at = NOW()
          WHERE id = $1`,
         [req.auth.userId]
       );
       await pool.query('DELETE FROM backup_codes WHERE user_id = $1', [req.auth.userId]);
+      clearSessionCookie(res);
       res.status(200).json({ enabled: false, message: '2FA disabled' });
     } catch (err) {
       log.error('2FA disable failed:', err);
@@ -572,7 +594,30 @@ function mountAuthRoutes(
     }
   });
 
-  app.post('/auth/logout', (req, res) => {
+  // POST /auth/logout — clears the cookie AND bumps users.token_version
+  // so any other devices holding a copy of this cookie are invalidated
+  // server-side. Without the bump, a leaked cookie would survive logout
+  // for the full 7-day expiry.
+  //
+  // We don't require auth here (logout is idempotent + non-destructive)
+  // but we DO read the cookie ourselves so we know which user to bump.
+  // Failure to identify the user just clears the cookie and returns 200
+  // — no info leak.
+  app.post('/auth/logout', async (req, res) => {
+    const cookieToken = req.cookies && req.cookies[COOKIE_NAME];
+    if (cookieToken) {
+      const claims = verifySession(cookieToken);
+      if (claims && claims.sub) {
+        try {
+          await pool.query('UPDATE users SET token_version = token_version + 1 WHERE id = $1', [
+            claims.sub,
+          ]);
+        } catch (err) {
+          log.error('Failed to bump token_version on logout:', err.message);
+          // Non-fatal — cookie clear still happens.
+        }
+      }
+    }
     clearSessionCookie(res);
     res.status(200).json({ message: 'Logged out' });
   });
@@ -634,7 +679,14 @@ function mountAuthRoutes(
       if (result.rowCount === 0) {
         return res.status(403).json({ error: 'Not a member of that organization' });
       }
-      const token = signSession(req.auth.userId, targetOrgId);
+      // Re-read token_version so the new cookie carries the current
+      // value (cookie-rotation that doesn't invalidate other devices).
+      const userRow = await pool.query('SELECT token_version FROM users WHERE id = $1', [
+        req.auth.userId,
+      ]);
+      const token = signSession(req.auth.userId, targetOrgId, {
+        tokenVersion: userRow.rows[0].token_version,
+      });
       setSessionCookie(res, token);
       res.status(200).json({ organization_id: targetOrgId });
     } catch (err) {
@@ -930,10 +982,17 @@ function mountAuthRoutes(
         return res.status(401).json({ error: 'Current password is incorrect' });
       }
       const newHash = await hashPassword(new_password);
-      await pool.query('UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2', [
-        newHash,
-        req.auth.userId,
-      ]);
+      // Bumping token_version invalidates every outstanding session
+      // cookie for this user (other devices, stolen cookie, etc.). The
+      // current session is also invalidated — clients should expect to
+      // re-login after this call. clearSessionCookie keeps the UX
+      // consistent.
+      await pool.query(
+        `UPDATE users SET password_hash = $1, token_version = token_version + 1,
+                          updated_at = NOW()
+         WHERE id = $2`,
+        [newHash, req.auth.userId]
+      );
       // Invalidate any outstanding reset tokens for this user — they
       // chose a new password, any in-flight resets are obsolete.
       await pool.query(
@@ -941,6 +1000,7 @@ function mountAuthRoutes(
          WHERE user_id = $1 AND used_at IS NULL`,
         [req.auth.userId]
       );
+      clearSessionCookie(res);
       res.status(200).json({ message: 'Password changed' });
     } catch (err) {
       log.error('Password change failed:', err);
@@ -1052,10 +1112,14 @@ function mountAuthRoutes(
         return res.status(410).json({ error: 'Token expired' });
       }
       const newHash = await hashPassword(new_password);
-      await client.query('UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2', [
-        newHash,
-        row.user_id,
-      ]);
+      // Same as the authenticated change-password path: bump
+      // token_version to invalidate every outstanding session cookie.
+      await client.query(
+        `UPDATE users SET password_hash = $1, token_version = token_version + 1,
+                          updated_at = NOW()
+         WHERE id = $2`,
+        [newHash, row.user_id]
+      );
       await client.query('UPDATE password_reset_tokens SET used_at = NOW() WHERE id = $1', [
         row.id,
       ]);
@@ -1302,7 +1366,7 @@ function mountAuthRoutes(
       const userResult = await client.query(
         `INSERT INTO users (email, password_hash, name)
          VALUES ($1, $2, $3)
-         RETURNING id, email, name, created_at`,
+         RETURNING id, email, name, token_version, created_at`,
         [inv.email, passwordHash, name || null]
       );
       const user = userResult.rows[0];
@@ -1321,7 +1385,9 @@ function mountAuthRoutes(
       );
       await client.query('COMMIT');
 
-      const sessionToken = signSession(user.id, inv.organization_id);
+      const sessionToken = signSession(user.id, inv.organization_id, {
+        tokenVersion: user.token_version,
+      });
       setSessionCookie(res, sessionToken);
       res.status(201).json({
         user: { id: user.id, email: user.email, name: user.name },

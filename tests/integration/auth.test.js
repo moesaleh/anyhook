@@ -159,6 +159,64 @@ describeIfPg('auth + tenancy (integration)', () => {
       const setCookie = res.headers['set-cookie'] || [];
       expect(setCookie.some(c => c.startsWith('anyhook_session='))).toBe(true);
     });
+
+    it('invalidates other devices holding the same JWT (token_version bump)', async () => {
+      // Log in twice for the same user — both cookies see token_version=0
+      const reg = await request(app)
+        .post('/auth/register')
+        .send({ email: 'tv@example.com', password: 'password123' });
+      const cookieDeviceA = getSessionCookie(reg.headers['set-cookie']);
+
+      const loginB = await request(app)
+        .post('/auth/login')
+        .send({ email: 'tv@example.com', password: 'password123' });
+      const cookieDeviceB = getSessionCookie(loginB.headers['set-cookie']);
+
+      // Both cookies work
+      const meA1 = await request(app).get('/auth/me').set('Cookie', cookieDeviceA);
+      const meB1 = await request(app).get('/auth/me').set('Cookie', cookieDeviceB);
+      expect(meA1.status).toBe(200);
+      expect(meB1.status).toBe(200);
+
+      // Device A logs out
+      await request(app).post('/auth/logout').set('Cookie', cookieDeviceA).expect(200);
+
+      // Both cookies are now invalid (token_version was bumped — A's
+      // cookie was issued with tv=0, the row is now tv=1; B's cookie
+      // was also issued with tv=0).
+      const meA2 = await request(app).get('/auth/me').set('Cookie', cookieDeviceA);
+      const meB2 = await request(app).get('/auth/me').set('Cookie', cookieDeviceB);
+      expect(meA2.status).toBe(401);
+      expect(meB2.status).toBe(401);
+    });
+
+    it('password change invalidates outstanding cookies', async () => {
+      const reg = await request(app)
+        .post('/auth/register')
+        .send({ email: 'pwchange@example.com', password: 'oldpassword123' });
+      const cookieA = getSessionCookie(reg.headers['set-cookie']);
+      const loginB = await request(app)
+        .post('/auth/login')
+        .send({ email: 'pwchange@example.com', password: 'oldpassword123' });
+      const cookieB = getSessionCookie(loginB.headers['set-cookie']);
+
+      // Change password from device A
+      await request(app)
+        .post('/auth/password/change')
+        .set('Cookie', cookieA)
+        .send({ current_password: 'oldpassword123', new_password: 'newpassword456' })
+        .expect(200);
+
+      // Both cookies now invalid
+      expect((await request(app).get('/auth/me').set('Cookie', cookieA)).status).toBe(401);
+      expect((await request(app).get('/auth/me').set('Cookie', cookieB)).status).toBe(401);
+
+      // New password works
+      const newLogin = await request(app)
+        .post('/auth/login')
+        .send({ email: 'pwchange@example.com', password: 'newpassword456' });
+      expect(newLogin.status).toBe(200);
+    });
   });
 
   describe('protected route enforcement', () => {

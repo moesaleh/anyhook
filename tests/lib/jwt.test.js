@@ -15,8 +15,20 @@ describe('signSession + verifySession', () => {
   it('round-trips claims', () => {
     const token = signSession('user-1', 'org-1');
     const claims = verifySession(token);
-    expect(claims).toMatchObject({ sub: 'user-1', org: 'org-1', iss: ISSUER });
+    expect(claims).toMatchObject({ sub: 'user-1', org: 'org-1', iss: ISSUER, tv: 0 });
     expect(claims.exp).toBeGreaterThan(Date.now() / 1000);
+  });
+
+  it('encodes options.tokenVersion as the `tv` claim', () => {
+    const token = signSession('user-1', 'org-1', { tokenVersion: 7 });
+    const claims = verifySession(token);
+    expect(claims.tv).toBe(7);
+  });
+
+  it('defaults `tv` to 0 when tokenVersion is omitted', () => {
+    const token = signSession('user-1', 'org-1');
+    const claims = verifySession(token);
+    expect(claims.tv).toBe(0);
   });
 
   it('returns null for tampered tokens', () => {

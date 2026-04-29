@@ -22,11 +22,27 @@ function getJwtSecret() {
   return secret;
 }
 
+/**
+ * Sign a session JWT.
+ *
+ * @param {string} userId
+ * @param {string} organizationId
+ * @param {object} options
+ * @param {number} [options.tokenVersion=0] — users.token_version at sign
+ *   time. requireAuth re-checks this against the live row on every
+ *   authenticated request, so bumping it invalidates outstanding cookies
+ *   (logout, password change, 2FA disable).
+ * @param {string} [options.expiresIn]
+ */
 function signSession(userId, organizationId, options = {}) {
-  return jwt.sign({ sub: userId, org: organizationId }, getJwtSecret(), {
-    expiresIn: options.expiresIn || DEFAULT_EXPIRES_IN,
-    issuer: ISSUER,
-  });
+  return jwt.sign(
+    { sub: userId, org: organizationId, tv: options.tokenVersion || 0 },
+    getJwtSecret(),
+    {
+      expiresIn: options.expiresIn || DEFAULT_EXPIRES_IN,
+      issuer: ISSUER,
+    }
+  );
 }
 
 function verifySession(token) {

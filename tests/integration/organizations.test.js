@@ -109,6 +109,130 @@ describeIfPg('organizations + members + api keys (integration)', () => {
     });
   });
 
+  describe('owner protections (admin overthrow defense)', () => {
+    let adminCookie;
+
+    beforeEach(async () => {
+      // Pre-register three users we can promote to various roles in
+      // Owner Co. They each start as owner of their own org.
+      const reg = email =>
+        request(app).post('/auth/register').send({ email, password: 'password123' });
+
+      const adminReg = await reg('admin@example.com');
+      adminCookie = getSessionCookie(adminReg.headers['set-cookie']);
+      await request(app)
+        .post('/organizations/current/members')
+        .set('Cookie', cookie) // existing owner
+        .send({ email: 'admin@example.com', role: 'admin' });
+
+      await reg('owner2@example.com');
+      // owner2 added as owner — gives us a multi-owner org
+      await request(app)
+        .post('/organizations/current/members')
+        .set('Cookie', cookie)
+        .send({ email: 'owner2@example.com', role: 'owner' });
+
+      await reg('plain@example.com');
+      await request(app)
+        .post('/organizations/current/members')
+        .set('Cookie', cookie)
+        .send({ email: 'plain@example.com', role: 'member' });
+    });
+
+    async function switchTo(targetCookie, targetOrgName) {
+      // Find target org id by listing this user's orgs via /auth/me, then
+      // switch their session to it.
+      const me = await request(app).get('/auth/me').set('Cookie', targetCookie);
+      const target = me.body.organizations.find(o => o.name === targetOrgName);
+      const swap = await request(app)
+        .post('/auth/switch-org')
+        .set('Cookie', targetCookie)
+        .send({ organization_id: target.id });
+      return getSessionCookie(swap.headers['set-cookie']);
+    }
+
+    it('admin CANNOT demote an owner via add-member', async () => {
+      const adminInOwnerCo = await switchTo(adminCookie, 'Owner Co');
+      const res = await request(app)
+        .post('/organizations/current/members')
+        .set('Cookie', adminInOwnerCo)
+        .send({ email: 'owner2@example.com', role: 'member' });
+      expect(res.status).toBe(403);
+      expect(res.body.error).toMatch(/Only owners/);
+
+      // owner2's role unchanged
+      const list = await request(app).get('/organizations/current/members').set('Cookie', cookie);
+      const owner2 = list.body.find(m => m.email === 'owner2@example.com');
+      expect(owner2.role).toBe('owner');
+    });
+
+    it('owner CAN demote another owner', async () => {
+      const res = await request(app)
+        .post('/organizations/current/members')
+        .set('Cookie', cookie)
+        .send({ email: 'owner2@example.com', role: 'admin' });
+      expect(res.status).toBe(201);
+      expect(res.body.role).toBe('admin');
+    });
+
+    it('owner CANNOT demote the LAST owner', async () => {
+      // First demote owner2 so the original owner is the only one left
+      await request(app)
+        .post('/organizations/current/members')
+        .set('Cookie', cookie)
+        .send({ email: 'owner2@example.com', role: 'member' });
+
+      // Now try to demote the original owner (self) — also blocked because
+      // they're the last owner. (The endpoint allows self-edit; the
+      // last-owner guard catches it regardless of who's calling.)
+      const res = await request(app)
+        .post('/organizations/current/members')
+        .set('Cookie', cookie)
+        .send({ email: 'owner@example.com', role: 'admin' });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toMatch(/last owner/i);
+    });
+
+    it('admin CANNOT remove an owner via DELETE', async () => {
+      const adminInOwnerCo = await switchTo(adminCookie, 'Owner Co');
+      // Find owner2's userId
+      const list = await request(app).get('/organizations/current/members').set('Cookie', cookie);
+      const owner2 = list.body.find(m => m.email === 'owner2@example.com');
+
+      const res = await request(app)
+        .delete(`/organizations/current/members/${owner2.id}`)
+        .set('Cookie', adminInOwnerCo);
+      expect(res.status).toBe(403);
+
+      // Still a member
+      const list2 = await request(app).get('/organizations/current/members').set('Cookie', cookie);
+      expect(list2.body.find(m => m.email === 'owner2@example.com')).toBeDefined();
+    });
+
+    it('owner CAN remove a non-last owner', async () => {
+      // Owner Co has 2 owners (original + owner2). The original owner
+      // removes owner2 — allowed because there's still one owner left.
+      const list = await request(app).get('/organizations/current/members').set('Cookie', cookie);
+      const owner2 = list.body.find(m => m.email === 'owner2@example.com');
+      const res = await request(app)
+        .delete(`/organizations/current/members/${owner2.id}`)
+        .set('Cookie', cookie);
+      expect(res.status).toBe(200);
+      const after = await request(app).get('/organizations/current/members').set('Cookie', cookie);
+      const owners = after.body.filter(m => m.role === 'owner');
+      expect(owners.length).toBe(1);
+    });
+
+    // Note: the "last owner DELETE" branch only fires through a
+    // concurrent race (one owner deleting another while the latter is
+    // simultaneously demoted). In serial flow the self-removal guard
+    // catches the only would-be path. The advisory lock on the
+    // organization_id makes both racers serialize, and the second one
+    // observes the count == 1 → blocked. This is exercised at the SQL
+    // level by the lock semantics; a deterministic JS test would need a
+    // sync barrier mid-transaction.
+  });
+
   describe('API keys', () => {
     it('creates a key, lists it, then revokes it', async () => {
       const create = await request(app)

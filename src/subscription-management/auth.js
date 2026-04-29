@@ -709,9 +709,17 @@ function mountAuthRoutes(
     }
   });
 
-  // POST /organizations/current/members — add an existing user by email.
-  // Requires owner/admin role. (Real product needs an invite flow with
-  // email tokens; this is the minimum viable version.)
+  // POST /organizations/current/members — add or update an existing user
+  // by email. Requires owner/admin role.
+  //
+  // Owner-demotion rules (defense against admin-overthrow):
+  //   - Only owners can demote an existing owner.
+  //   - Never demote the last owner of the org. The transaction holds
+  //     a row lock + counts owners under FOR UPDATE so two concurrent
+  //     demotions can't both succeed.
+  //
+  // Real product needs an invite-by-email flow for users that don't
+  // yet exist; that lives at /organizations/current/invitations.
   app.post(
     '/organizations/current/members',
     requireAuth,
@@ -724,30 +732,81 @@ function mountAuthRoutes(
       if (!['owner', 'admin', 'member'].includes(targetRole)) {
         return res.status(400).json({ error: 'role must be owner, admin, or member' });
       }
+      const client = await pool.connect();
       try {
-        const userResult = await pool.query('SELECT id FROM users WHERE LOWER(email) = LOWER($1)', [
-          email,
+        await client.query('BEGIN');
+        // Per-org advisory lock so concurrent role mutations on different
+        // memberships in the same org serialize. Without it, two admins
+        // concurrently demoting two distinct owners can both pass the
+        // owner-count check (each sees 2) and the org ends up with 0
+        // owners.
+        await client.query('SELECT pg_advisory_xact_lock(hashtext($1::text))', [
+          req.auth.organizationId,
         ]);
+        const userResult = await client.query(
+          'SELECT id FROM users WHERE LOWER(email) = LOWER($1)',
+          [email]
+        );
         if (userResult.rowCount === 0) {
+          await client.query('ROLLBACK');
           return res
             .status(404)
             .json({ error: 'No user with that email; they must register first' });
         }
-        await pool.query(
+        const targetUserId = userResult.rows[0].id;
+
+        // Lock the existing membership row so a concurrent demotion of
+        // the same user can't pass the count-then-update check twice.
+        const existing = await client.query(
+          `SELECT role FROM memberships
+           WHERE user_id = $1 AND organization_id = $2 FOR UPDATE`,
+          [targetUserId, req.auth.organizationId]
+        );
+
+        if (existing.rowCount > 0 && existing.rows[0].role === 'owner' && targetRole !== 'owner') {
+          // Demotion of an existing owner.
+          if (req.auth.role !== 'owner') {
+            await client.query('ROLLBACK');
+            return res.status(403).json({
+              error: "Only owners can change an owner's role",
+            });
+          }
+          const owners = await client.query(
+            `SELECT COUNT(*)::int AS n FROM memberships
+             WHERE organization_id = $1 AND role = 'owner'`,
+            [req.auth.organizationId]
+          );
+          if (owners.rows[0].n <= 1) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({
+              error: 'Cannot demote the last owner; promote someone else first',
+            });
+          }
+        }
+
+        await client.query(
           `INSERT INTO memberships (user_id, organization_id, role)
                  VALUES ($1, $2, $3)
                  ON CONFLICT (user_id, organization_id) DO UPDATE SET role = EXCLUDED.role`,
-          [userResult.rows[0].id, req.auth.organizationId, targetRole]
+          [targetUserId, req.auth.organizationId, targetRole]
         );
-        res.status(201).json({ user_id: userResult.rows[0].id, role: targetRole });
+        await client.query('COMMIT');
+        res.status(201).json({ user_id: targetUserId, role: targetRole });
       } catch (err) {
+        await client.query('ROLLBACK');
         log.error('Add member failed:', err);
         res.status(500).json({ error: 'Add member failed' });
+      } finally {
+        client.release();
       }
     }
   );
 
-  // DELETE /organizations/current/members/:userId — remove a member
+  // DELETE /organizations/current/members/:userId — remove a member.
+  //
+  // Same protection as the demotion path: only owners can remove
+  // owners, and the last owner can never be removed (transferring
+  // ownership first is the only way to leave an org you solo-own).
   app.delete(
     '/organizations/current/members/:userId',
     requireAuth,
@@ -758,19 +817,53 @@ function mountAuthRoutes(
       if (userId === req.auth.userId) {
         return res.status(400).json({ error: 'Cannot remove yourself; transfer ownership first' });
       }
+      const client = await pool.connect();
       try {
-        const result = await pool.query(
+        await client.query('BEGIN');
+        // Per-org advisory lock — see /members POST for rationale.
+        await client.query('SELECT pg_advisory_xact_lock(hashtext($1::text))', [
+          req.auth.organizationId,
+        ]);
+        const target = await client.query(
+          `SELECT role FROM memberships
+           WHERE user_id = $1 AND organization_id = $2 FOR UPDATE`,
+          [userId, req.auth.organizationId]
+        );
+        if (target.rowCount === 0) {
+          await client.query('ROLLBACK');
+          return res.status(404).json({ error: 'Member not found' });
+        }
+        const targetRole = target.rows[0].role;
+        if (targetRole === 'owner' && req.auth.role !== 'owner') {
+          await client.query('ROLLBACK');
+          return res.status(403).json({ error: 'Only owners can remove an owner' });
+        }
+        if (targetRole === 'owner') {
+          const owners = await client.query(
+            `SELECT COUNT(*)::int AS n FROM memberships
+             WHERE organization_id = $1 AND role = 'owner'`,
+            [req.auth.organizationId]
+          );
+          if (owners.rows[0].n <= 1) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({
+              error: 'Cannot remove the last owner; promote someone else first',
+            });
+          }
+        }
+        await client.query(
           `DELETE FROM memberships
                  WHERE user_id = $1 AND organization_id = $2`,
           [userId, req.auth.organizationId]
         );
-        if (result.rowCount === 0) {
-          return res.status(404).json({ error: 'Member not found' });
-        }
+        await client.query('COMMIT');
         res.status(200).json({ message: 'Member removed' });
       } catch (err) {
+        await client.query('ROLLBACK');
         log.error('Remove member failed:', err);
         res.status(500).json({ error: 'Remove member failed' });
+      } finally {
+        client.release();
       }
     }
   );

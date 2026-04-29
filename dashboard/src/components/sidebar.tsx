@@ -15,6 +15,7 @@ import {
 import { cn } from "@/lib/utils";
 import { useAuth } from "@/lib/auth-context";
 import { QuotaIndicator } from "./quota-indicator";
+import { ThemeToggle } from "./theme-toggle";
 
 const navigation = [
   { name: "Dashboard", href: "/", icon: LayoutDashboard },
@@ -114,6 +115,11 @@ export function Sidebar() {
 
       {/* Per-org quota usage */}
       {organization && <QuotaIndicator />}
+
+      {/* Theme toggle */}
+      <div className="px-3 py-3 border-t border-neutral-200 dark:border-neutral-800">
+        <ThemeToggle />
+      </div>
 
       {/* User card + logout */}
       <div className="border-t border-neutral-200 dark:border-neutral-800 p-3">

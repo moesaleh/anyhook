@@ -1,8 +1,22 @@
 @import "tailwindcss";
 
+/*
+ * Dark mode strategy: explicit class on the <html> root, OR an
+ * inherited `system` mode that mirrors prefers-color-scheme. The
+ * ThemeProvider component sets/removes `class="dark"` on documentElement
+ * based on the persisted preference. The `:where()` keeps specificity
+ * at 0 so the variant doesn't outrank ad-hoc utility ordering.
+ */
+@variant dark (&:where(.dark, .dark *));
+
 :root {
   --background: #ffffff;
   --foreground: #171717;
+}
+
+.dark {
+  --background: #0a0a0a;
+  --foreground: #ededed;
 }
 
 @theme inline {
@@ -10,13 +24,6 @@
   --color-foreground: var(--foreground);
   --font-sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
 }
 
 body {
@@ -45,8 +52,6 @@ html {
   border-radius: 3px;
 }
 
-@media (prefers-color-scheme: dark) {
-  ::-webkit-scrollbar-thumb {
-    background: #404040;
-  }
+.dark ::-webkit-scrollbar-thumb {
+  background: #404040;
 }

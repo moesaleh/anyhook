@@ -21,12 +21,64 @@ const DEFAULTS = {
   apiKeys: 10,
 };
 
+/**
+ * Quota check + claim. Without locking, two concurrent /subscribe at
+ * the limit boundary both see used < limit and both succeed → over-
+ * quota by 1. We take a per-org pg_advisory_xact_lock that is held
+ * until the END of the surrounding HTTP request: middleware acquires
+ * it on a connection that lives in res.locals so the create handler's
+ * INSERT runs in the same transaction. On the response 'finish' event
+ * we release.
+ *
+ * Falling open on DB error stays unchanged: a transient pool blip
+ * shouldn't block legitimate writes.
+ */
+
+const ADVISORY_LOCK_KEY_QUOTAS = 8472394; // arbitrary stable namespace
+
 function makeSubscriptionQuotaCheck({ pool, log, limit = DEFAULTS.subscriptions } = {}) {
   if (!pool) throw new Error('makeSubscriptionQuotaCheck: pool is required');
   return async function subscriptionQuota(req, res, next) {
     if (!req.auth || !req.auth.organizationId) return next();
     try {
-      const r = await pool.query(
+      // Take a per-org session-level advisory lock so the count + the
+      // subsequent insert in the handler can't race a sibling request.
+      // We can't use pg_advisory_xact_lock because the create handler
+      // runs in its own implicit transaction; instead we use the
+      // session-level lock + release it on response 'finish'.
+      const lockClient = await pool.connect();
+      let released = false;
+      const release = async () => {
+        if (released) return;
+        released = true;
+        try {
+          await lockClient.query('SELECT pg_advisory_unlock($1, $2)', [
+            ADVISORY_LOCK_KEY_QUOTAS,
+            // Use the lower 32 bits of the org_id's hash via hashtext.
+            // pg_advisory_lock(int, int) needs both args int4.
+            req.auth.organizationId,
+          ]);
+        } catch (e) {
+          if (log) log.error('Failed to unlock quota advisory lock', { err: e.message });
+        } finally {
+          lockClient.release();
+        }
+      };
+      res.on('finish', release);
+      res.on('close', release);
+      try {
+        await lockClient.query(
+          'SELECT pg_advisory_lock($1, hashtext($2::text))',
+          [ADVISORY_LOCK_KEY_QUOTAS, req.auth.organizationId]
+        );
+      } catch (err) {
+        if (log)
+          log.error('Quota advisory lock failed (failing open)', { err: err.message });
+        await release();
+        return next();
+      }
+
+      const r = await lockClient.query(
         `SELECT
             (SELECT COUNT(*)::int FROM subscriptions WHERE organization_id = $1) AS used,
             (SELECT max_subscriptions FROM organizations WHERE id = $1) AS override`,
@@ -37,6 +89,7 @@ function makeSubscriptionQuotaCheck({ pool, log, limit = DEFAULTS.subscriptions 
       res.setHeader('X-Quota-Limit', String(effectiveLimit));
       res.setHeader('X-Quota-Used', String(used));
       if (used >= effectiveLimit) {
+        await release();
         return res.status(429).json({
           error: 'Subscription quota exceeded for organization',
           quota: 'subscriptions',
@@ -57,7 +110,37 @@ function makeApiKeyQuotaCheck({ pool, log, limit = DEFAULTS.apiKeys } = {}) {
   return async function apiKeyQuota(req, res, next) {
     if (!req.auth || !req.auth.organizationId) return next();
     try {
-      const r = await pool.query(
+      const lockClient = await pool.connect();
+      let released = false;
+      const release = async () => {
+        if (released) return;
+        released = true;
+        try {
+          await lockClient.query('SELECT pg_advisory_unlock($1, hashtext($2::text))', [
+            ADVISORY_LOCK_KEY_QUOTAS + 1,
+            req.auth.organizationId,
+          ]);
+        } catch (e) {
+          if (log) log.error('Failed to unlock api-key quota lock', { err: e.message });
+        } finally {
+          lockClient.release();
+        }
+      };
+      res.on('finish', release);
+      res.on('close', release);
+      try {
+        await lockClient.query('SELECT pg_advisory_lock($1, hashtext($2::text))', [
+          ADVISORY_LOCK_KEY_QUOTAS + 1,
+          req.auth.organizationId,
+        ]);
+      } catch (err) {
+        if (log)
+          log.error('API key quota advisory lock failed (failing open)', { err: err.message });
+        await release();
+        return next();
+      }
+
+      const r = await lockClient.query(
         `SELECT
             (SELECT COUNT(*)::int FROM api_keys
              WHERE organization_id = $1 AND revoked_at IS NULL) AS used,
@@ -69,6 +152,7 @@ function makeApiKeyQuotaCheck({ pool, log, limit = DEFAULTS.apiKeys } = {}) {
       res.setHeader('X-Quota-Limit', String(effectiveLimit));
       res.setHeader('X-Quota-Used', String(used));
       if (used >= effectiveLimit) {
+        await release();
         return res.status(429).json({
           error: 'API key quota exceeded for organization',
           quota: 'api_keys',

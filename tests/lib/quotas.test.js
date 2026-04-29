@@ -4,10 +4,28 @@ const {
   DEFAULTS,
 } = require('../../src/lib/quotas');
 
+/**
+ * Pool stub that returns a client whose query() returns the canned
+ * { used, override } shape. The middleware now uses pool.connect()
+ * because it holds a session-level pg_advisory_lock for the request
+ * duration, so the test stub mirrors that.
+ */
 function mockPool(count, override = null) {
+  const client = {
+    async query(sql) {
+      // pg_advisory_lock / pg_advisory_unlock — stub as no-op.
+      if (typeof sql === 'string' && sql.includes('pg_advisory_')) {
+        return { rows: [] };
+      }
+      return { rows: [{ used: count, override }] };
+    },
+    release() {},
+  };
   return {
+    async connect() {
+      return client;
+    },
     async query() {
-      // Matches the new shape: subselects return `used` + `override`.
       return { rows: [{ used: count, override }] };
     },
   };
@@ -15,6 +33,9 @@ function mockPool(count, override = null) {
 
 function mockBrokenPool() {
   return {
+    async connect() {
+      throw new Error('connection refused');
+    },
     async query() {
       throw new Error('connection refused');
     },
@@ -27,12 +48,17 @@ function mockReq(orgId = 'org-1') {
 
 function mockRes() {
   const headers = {};
+  const listeners = { finish: [], close: [] };
   let statusCode = 200;
   let jsonBody = null;
   return {
     headers,
+    listeners,
     setHeader(k, v) {
       headers[k] = v;
+    },
+    on(event, fn) {
+      if (listeners[event]) listeners[event].push(fn);
     },
     status(c) {
       statusCode = c;
@@ -40,6 +66,9 @@ function mockRes() {
     },
     json(b) {
       jsonBody = b;
+      // Fire the response 'finish' event so the middleware releases its
+      // advisory lock + connection back to the pool.
+      listeners.finish.forEach(fn => fn());
       return this;
     },
     get statusCode() {

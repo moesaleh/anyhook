@@ -17,6 +17,28 @@ class GraphQLHandler extends BaseHandler {
     const { args, subscription_id } = subscription;
     const { query, endpoint_url, headers } = args;
 
+    // Defensive close: connect() can be re-invoked for the same
+    // subscription_id by a Kafka redelivery (consumer rebalance, pod
+    // restart before commit) or by an update_events handler. Without
+    // this, the previous wsClient + subscribe handle become orphaned —
+    // their TCP connection stays open, the source keeps streaming into
+    // a closure that publishes to connection_events, and we get
+    // duplicate webhook deliveries until the orphaned socket dies.
+    // WebSocketHandler already does this; aligning behaviour here.
+    if (this.activeSubscriptions[subscription_id] || this.wsClients[subscription_id]) {
+      log.info(
+        `[GraphQLHandler] - connect() called for already-tracked subscription ${subscription_id}; closing existing client first`
+      );
+      try {
+        this.disconnect(subscription_id);
+      } catch (err) {
+        log.error(
+          `[GraphQLHandler] - Defensive disconnect failed for ${subscription_id}:`,
+          err.message
+        );
+      }
+    }
+
     log.info(`[GraphQLHandler] - Connecting to WebSocket for subscription ID: ${subscription_id}`);
     log.info(`[GraphQLHandler] - Endpoint URL: ${endpoint_url}`);
     log.info(`[GraphQLHandler] - GraphQL Query: ${query}`);

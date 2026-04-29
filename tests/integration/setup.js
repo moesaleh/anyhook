@@ -58,11 +58,32 @@ function inMemoryRedis() {
       return [...store.keys()];
     },
     async scan(cursor, opts) {
-      // One-shot scan: return everything on the first call, end on the second.
+      // One-shot scan: return matching keys on cursor=0, terminate on
+      // any subsequent call. Supports MATCH glob patterns the same way
+      // real Redis does (so callers using `MATCH 'sub:*'` get only
+      // namespaced subscription cache keys, not rate-limit counters).
       if (cursor === 0) {
         const count = (opts && opts.COUNT) || 100;
-        const keys = [...store.keys()].slice(0, count);
-        return { cursor: 0, keys };
+        const match = opts && opts.MATCH;
+        let keys = [...store.keys()];
+        if (match) {
+          // Tiny glob → regex translator. Real Redis only supports
+          // *, ?, [chars]; tests only use * so we keep it minimal.
+          const pattern = new RegExp(
+            '^' +
+              match
+                .split(/(\*|\?)/)
+                .map(part => {
+                  if (part === '*') return '.*';
+                  if (part === '?') return '.';
+                  return part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                })
+                .join('') +
+              '$'
+          );
+          keys = keys.filter(k => pattern.test(k));
+        }
+        return { cursor: 0, keys: keys.slice(0, count) };
       }
       return { cursor: 0, keys: [] };
     },

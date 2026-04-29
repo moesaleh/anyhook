@@ -21,6 +21,11 @@ const path = require('path');
 const { isValidUrl } = require('../lib/url-validation');
 const { makeSubscriptionQuotaCheck, makeApiKeyQuotaCheck } = require('../lib/quotas');
 const { makeEmailTransport } = require('../lib/email');
+const {
+  subscriptionCacheKey,
+  subscriptionIdFromKey,
+  SUBSCRIPTION_KEY_PATTERN,
+} = require('../lib/subscription-cache');
 const { mountAuthRoutes } = require('./auth');
 
 // Read OpenAPI spec at module load. Errors during read fall back to a
@@ -239,7 +244,7 @@ function createApp({
         return errorResponse(res, 404, 'Subscription not found');
       }
       const subscription = dbResult.rows[0];
-      const cached = await redisClient.get(id);
+      const cached = await redisClient.get(subscriptionCacheKey(id));
       const isConnected = cached !== null;
 
       let cachedAt = null;
@@ -264,7 +269,9 @@ function createApp({
     }
   });
 
-  // Bulk status — uses SCAN
+  // Bulk status — SCAN with MATCH so we only return subscription cache
+  // entries (sub:*), not rate-limit counters or other keys sharing the
+  // Redis instance.
   app.get('/subscriptions/status/all', requireAuth, rateLimit, async (req, res) => {
     try {
       const dbResult = await pool.query(
@@ -275,10 +282,14 @@ function createApp({
       const connectedIds = new Set();
       let cursor = 0;
       do {
-        const result = await redisClient.scan(cursor, { COUNT: 100 });
+        const result = await redisClient.scan(cursor, {
+          MATCH: SUBSCRIPTION_KEY_PATTERN,
+          COUNT: 100,
+        });
         cursor = result.cursor;
         for (const key of result.keys) {
-          connectedIds.add(key);
+          const id = subscriptionIdFromKey(key);
+          if (id) connectedIds.add(id);
         }
       } while (cursor !== 0);
 
@@ -427,18 +438,58 @@ function createApp({
     }
   });
 
-  // Admin: delete all subscriptions
+  // Admin: delete all subscriptions across all orgs.
+  //
+  // Cleans up the full chain so connectors don't keep stale connections
+  // open and dispatchers don't keep retrying:
+  //   1. DELETE rows from subscriptions (delivery_events / pending_retries
+  //      cascade via FK).
+  //   2. DELETE every sub:* Redis key (so connector reload from Redis
+  //      doesn't resurrect them, and the live status endpoint doesn't
+  //      report them as connected).
+  //   3. Publish unsubscribe_events for each so the connectors close
+  //      their open upstream connections — without this, a wipe leaves
+  //      every active GraphQL/WebSocket source connected to a sub that
+  //      no longer exists.
   app.delete('/subscriptions', requireAdminKey, async (req, res) => {
     try {
-      const result = await pool.query('DELETE FROM subscriptions RETURNING *');
-      if (result.rowCount > 0) {
-        log.info(`All subscriptions deleted successfully. Deleted rows: ${result.rowCount}`);
-        res
-          .status(200)
-          .json({ message: 'All subscriptions deleted successfully', deleted: result.rowCount });
-      } else {
-        errorResponse(res, 404, 'No subscriptions found to delete');
+      const deleted = await pool.query('DELETE FROM subscriptions RETURNING subscription_id');
+
+      // Best-effort: clear sub:* keys + emit unsubscribe events. We
+      // don't fail the API call if any of these fail (operator wanted
+      // a wipe; rolling back the DB delete is worse).
+      let cursor = 0;
+      const cacheKeys = [];
+      do {
+        const scan = await redisClient.scan(cursor, {
+          MATCH: SUBSCRIPTION_KEY_PATTERN,
+          COUNT: 100,
+        });
+        cursor = scan.cursor;
+        cacheKeys.push(...scan.keys);
+      } while (cursor !== 0);
+      if (cacheKeys.length > 0) {
+        await Promise.allSettled(cacheKeys.map(k => redisClient.del(k)));
       }
+
+      if (deleted.rowCount > 0) {
+        const events = deleted.rows.map(r => ({
+          key: r.subscription_id,
+          value: r.subscription_id,
+        }));
+        try {
+          await producer.send({ topic: 'unsubscribe_events', messages: events });
+        } catch (kafkaErr) {
+          log.error('Admin wipe: failed to publish unsubscribe_events', kafkaErr.message);
+        }
+      }
+
+      log.info(`Admin wipe: rows=${deleted.rowCount}, redis_keys_cleared=${cacheKeys.length}`);
+      res.status(200).json({
+        message: 'All subscriptions deleted',
+        deleted: deleted.rowCount,
+        redis_keys_cleared: cacheKeys.length,
+      });
     } catch (err) {
       log.error('Error deleting all subscriptions:', err);
       errorResponse(res, 500, 'Failed to delete subscriptions');
@@ -483,7 +534,7 @@ function createApp({
       if (result.rows.length === 0) {
         return errorResponse(res, 404, 'Subscription not found');
       }
-      await redisClient.set(id, JSON.stringify(result.rows[0]));
+      await redisClient.set(subscriptionCacheKey(id), JSON.stringify(result.rows[0]));
       try {
         // key=id so all events for this subscription land on the same
         // partition → the same connector pod handles them in order.
@@ -526,7 +577,7 @@ function createApp({
       log.info(
         `[Subscribe API] - Subscription saved to PostgreSQL. Subscription ID: ${subscriptionId}`
       );
-      await redisClient.set(subscriptionId, JSON.stringify(result.rows[0]));
+      await redisClient.set(subscriptionCacheKey(subscriptionId), JSON.stringify(result.rows[0]));
       log.info(`[Subscribe API] - Subscription saved to Redis. Subscription ID: ${subscriptionId}`);
 
       try {
@@ -693,14 +744,43 @@ function createApp({
     }
   });
 
+  // POST /redis/reload — repopulate the subscription cache from
+  // PostgreSQL.
+  //
+  // Important: we DON'T flushAll any more — that wiped pending_retries
+  // queue rows in flight (they're stored in PG, but the dispatcher
+  // looks up webhook URL + secret from Redis at retry time, so a
+  // flush would orphan in-flight retries to DLQ). Instead we delete
+  // only the namespaced sub:* keys, then re-SET them. Rate-limit and
+  // any other Redis-resident state is preserved.
   app.post('/redis/reload', requireAdminKey, async (req, res) => {
     try {
       const result = await pool.query('SELECT * FROM subscriptions');
-      await redisClient.flushAll();
-      for (const subscription of result.rows) {
-        await redisClient.set(subscription.subscription_id, JSON.stringify(subscription));
+      // Delete existing sub:* keys without touching anything else.
+      let cursor = 0;
+      const toDelete = [];
+      do {
+        const scan = await redisClient.scan(cursor, {
+          MATCH: SUBSCRIPTION_KEY_PATTERN,
+          COUNT: 100,
+        });
+        cursor = scan.cursor;
+        toDelete.push(...scan.keys);
+      } while (cursor !== 0);
+      if (toDelete.length > 0) {
+        await Promise.all(toDelete.map(k => redisClient.del(k)));
       }
-      res.status(200).json({ message: 'Redis cache reloaded from PostgreSQL' });
+      for (const subscription of result.rows) {
+        await redisClient.set(
+          subscriptionCacheKey(subscription.subscription_id),
+          JSON.stringify(subscription)
+        );
+      }
+      res.status(200).json({
+        message: 'Redis subscription cache reloaded from PostgreSQL',
+        cleared: toDelete.length,
+        loaded: result.rows.length,
+      });
     } catch (err) {
       log.error('Error reloading Redis cache', err);
       errorResponse(res, 500, 'Failed to reload Redis from PostgreSQL');

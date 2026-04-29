@@ -9,6 +9,7 @@ const promClient = require('prom-client');
 const { createLogger } = require('../lib/logger');
 const { startMetricsServer } = require('../lib/metrics-server');
 const { signRequest } = require('../lib/webhook-signature');
+const { subscriptionCacheKey } = require('../lib/subscription-cache');
 
 const log = createLogger('webhook-dispatcher');
 
@@ -194,7 +195,7 @@ async function handleConnectionEvent({ message }) {
   const eventId = uuidv4();
 
   try {
-    const subscriptionDetails = await redisClient.get(subscriptionId);
+    const subscriptionDetails = await redisClient.get(subscriptionCacheKey(subscriptionId));
 
     if (!subscriptionDetails) {
       log.error(`No subscription details found for ID: ${subscriptionId}`);
@@ -433,7 +434,7 @@ async function claimDueRetries() {
  * the webhook, and update or remove the queue row based on outcome.
  */
 async function processClaimedRetry(row) {
-  const subscriptionDetails = await redisClient.get(row.subscription_id);
+  const subscriptionDetails = await redisClient.get(subscriptionCacheKey(row.subscription_id));
 
   // Subscription deleted between schedule and retry — drop the queue row,
   // record a final 'failed' delivery_event for audit. The FK CASCADE on

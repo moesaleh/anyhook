@@ -65,10 +65,10 @@ function parseInetAtonIPv4(str) {
 
   // Per-part width depends on how many parts were given.
   const limits = {
-    1: [0xFFFFFFFF],
-    2: [0xFF, 0xFFFFFF],
-    3: [0xFF, 0xFF, 0xFFFF],
-    4: [0xFF, 0xFF, 0xFF, 0xFF],
+    1: [0xffffffff],
+    2: [0xff, 0xffffff],
+    3: [0xff, 0xff, 0xffff],
+    4: [0xff, 0xff, 0xff, 0xff],
   };
   const lim = limits[nums.length];
   for (let i = 0; i < nums.length; i++) {
@@ -91,7 +91,7 @@ function parseInetAtonIPv4(str) {
 }
 
 function isPrivateIPv4Number(n) {
-  if (n < 0 || n > 0xFFFFFFFF) return true;
+  if (n < 0 || n > 0xffffffff) return true;
   const a = (n >>> 24) & 0xff;
   const b = (n >>> 16) & 0xff;
   if (a === 0) return true; // 0.0.0.0/8

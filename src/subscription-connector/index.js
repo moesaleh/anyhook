@@ -5,6 +5,11 @@ const { Kafka, logLevel } = require('kafkajs');
 const promClient = require('prom-client');
 const { createLogger } = require('../lib/logger');
 const { startMetricsServer } = require('../lib/metrics-server');
+const {
+  subscriptionCacheKey,
+  subscriptionIdFromKey,
+  SUBSCRIPTION_KEY_PATTERN,
+} = require('../lib/subscription-cache');
 const GraphQLHandler = require('./handlers/graphqlHandler');
 const WebSocketHandler = require('./handlers/webSocketHandler');
 
@@ -44,21 +49,31 @@ redisClient.on('error', err => log.error('Redis Client Error', err));
 
 // Reload subscriptions present in Redis on startup so connections survive
 // connector restarts. Runs after Redis connect, before consumer.run().
+//
+// SCAN MATCH 'sub:*' is critical — Redis is shared with rate-limit
+// counters and other state. Without the prefix filter, the connector
+// would try to JSON.parse rate-limit values (which happen to be
+// numbers) and contact every "subscription" found, which on a multi-pod
+// deploy means every pod fans out to every upstream once per startup.
 async function reloadActiveSubscriptions() {
   try {
-    // SCAN, not KEYS — KEYS blocks Redis on large keyspaces.
-    const subscriptionIds = [];
+    const cacheKeys = [];
     let cursor = 0;
     do {
-      const result = await redisClient.scan(cursor, { COUNT: 100 });
+      const result = await redisClient.scan(cursor, {
+        MATCH: SUBSCRIPTION_KEY_PATTERN,
+        COUNT: 100,
+      });
       cursor = result.cursor;
-      subscriptionIds.push(...result.keys);
+      cacheKeys.push(...result.keys);
     } while (cursor !== 0);
 
-    log.info(`Found ${subscriptionIds.length} subscriptions in Redis to reload`);
+    log.info(`Found ${cacheKeys.length} subscriptions in Redis to reload`);
 
-    for (const subscriptionId of subscriptionIds) {
-      const subscriptionDetails = await redisClient.get(subscriptionId);
+    for (const key of cacheKeys) {
+      const subscriptionId = subscriptionIdFromKey(key);
+      if (!subscriptionId) continue;
+      const subscriptionDetails = await redisClient.get(key);
       if (!subscriptionDetails) continue;
       const subscription = JSON.parse(subscriptionDetails);
       const handler = connectionHandlers[subscription.connection_type];
@@ -84,7 +99,7 @@ async function handleMessage({ topic, message }) {
 
   if (topic === 'subscription_events') {
     try {
-      const subscriptionDetails = await redisClient.get(subscriptionId);
+      const subscriptionDetails = await redisClient.get(subscriptionCacheKey(subscriptionId));
       if (!subscriptionDetails) {
         log.error(`No subscription details found in Redis for ID: ${subscriptionId}`);
         return;
@@ -106,7 +121,7 @@ async function handleMessage({ topic, message }) {
     // Subscription config changed — tear down the existing connection
     // and reopen with the new config from Redis.
     try {
-      const subscriptionDetails = await redisClient.get(subscriptionId);
+      const subscriptionDetails = await redisClient.get(subscriptionCacheKey(subscriptionId));
       if (!subscriptionDetails) {
         log.error(`No subscription details found in Redis for update event: ${subscriptionId}`);
         return;
@@ -127,8 +142,9 @@ async function handleMessage({ topic, message }) {
   }
 
   if (topic === 'unsubscribe_events') {
+    const cacheKey = subscriptionCacheKey(subscriptionId);
     try {
-      const subscriptionDetails = await redisClient.get(subscriptionId);
+      const subscriptionDetails = await redisClient.get(cacheKey);
       if (subscriptionDetails) {
         const subscription = JSON.parse(subscriptionDetails);
         const handler = connectionHandlers[subscription.connection_type];
@@ -141,11 +157,20 @@ async function handleMessage({ topic, message }) {
           log.error(`No handler found for connection type: ${subscription.connection_type}`);
         }
       } else {
-        // Subscription already removed from Redis — nothing to disconnect
+        // Subscription already removed from Redis — fall back to closing
+        // every handler's connection for this id so we don't leak open
+        // sockets when the cache was wiped before the kafka event arrived.
         log.warn(`Unsubscribe event for ${subscriptionId} but no Redis entry`);
+        for (const handler of Object.values(connectionHandlers)) {
+          try {
+            handler.disconnect(subscriptionId);
+          } catch (e) {
+            log.error(`Disconnect-by-fallback failed for ${subscriptionId}:`, e.message);
+          }
+        }
       }
       // Always remove from Redis to keep cache + DB consistent
-      await redisClient.del(subscriptionId);
+      await redisClient.del(cacheKey);
     } catch (err) {
       log.error('Error handling unsubscribe_events:', err);
     }

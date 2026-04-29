@@ -363,8 +363,20 @@ async function sendWebhook(
         : JSON.stringify(error.response.data)
       : null;
 
-    // Determine status: 'retrying' if more retries available, 'failed' otherwise
-    const deliveryStatus = retryCount < maxRetries ? 'retrying' : 'failed';
+    // Status semantics:
+    //   'retrying' — failure, more attempts queued.
+    //   'dlq'      — final failure on the last allowed attempt; the
+    //                caller (processClaimedRetry / handleConnectionEvent)
+    //                will publish to the DLQ Kafka topic next, but the
+    //                delivery_events row is written HERE with the actual
+    //                HTTP status / response body so dashboards have the
+    //                terminal context. sendToDLQ() does NOT write a
+    //                separate delivery_events row to avoid duplicating
+    //                the final attempt.
+    //   'failed'   — reserved for processClaimedRetry's
+    //                "subscription deleted between schedule and retry"
+    //                branch; never emitted from this function.
+    const deliveryStatus = retryCount < maxRetries ? 'retrying' : 'dlq';
     webhookDeliveries.inc({ status: deliveryStatus });
     webhookDeliveryDuration.observe({ status: deliveryStatus }, responseTimeMs / 1000);
 
@@ -411,14 +423,20 @@ async function enqueueRetry(eventId, subscriptionId, organizationId, requestBody
   const nextAttemptAt = new Date(Date.now() + delayMs);
 
   try {
+    // Use GREATEST(existing, EXCLUDED) on retry_count + next_attempt_at
+    // so a duplicate enqueue at a stale (lower) retry count can't
+    // reset progress. Without this, a Kafka redelivery (or any other
+    // path that re-enqueues the same event_id) would clobber the
+    // current retry_count back to a lower value and bury a permanently-
+    // failing event in extra retries.
     await pool.query(
       `INSERT INTO pending_retries
          (event_id, subscription_id, organization_id, request_body,
           retry_count, next_attempt_at)
        VALUES ($1, $2, $3, $4, $5, $6)
        ON CONFLICT (event_id) DO UPDATE SET
-          retry_count = EXCLUDED.retry_count,
-          next_attempt_at = EXCLUDED.next_attempt_at,
+          retry_count = GREATEST(pending_retries.retry_count, EXCLUDED.retry_count),
+          next_attempt_at = GREATEST(pending_retries.next_attempt_at, EXCLUDED.next_attempt_at),
           locked_at = NULL,
           locked_by = NULL`,
       [eventId, subscriptionId, organizationId, requestBody, retryCount, nextAttemptAt]
@@ -636,35 +654,24 @@ async function pollRetryQueue() {
 
 /**
  * Send failed delivery to the Dead Letter Queue after all retries exhausted.
- * Records a 'dlq' status delivery event.
+ *
+ * The corresponding delivery_events row was already written by sendWebhook
+ * with status='dlq' and the actual HTTP status / response body. We do
+ * NOT write another row here — that double-record was the source of
+ * inflated 'failed + dlq' totals on dashboards.
  */
 async function sendToDLQ(subscriptionId, organizationId, webhookUrl, data, eventId) {
-  const requestBody = JSON.stringify({ data });
-
-  // Record DLQ entry
-  await recordDelivery({
-    subscriptionId,
-    organizationId,
-    eventId,
-    status: 'dlq',
-    retryCount: maxRetries,
-    payloadSizeBytes: Buffer.byteLength(requestBody, 'utf8'),
-    requestBody,
-    errorMessage: 'Max retries exceeded, moved to Dead Letter Queue',
-  });
-
   try {
     await producer.send({
       topic: 'dlq_events',
       messages: [
         {
           key: subscriptionId,
-          value: JSON.stringify({ subscriptionId, organizationId, webhookUrl, data }),
+          value: JSON.stringify({ subscriptionId, organizationId, webhookUrl, data, eventId }),
         },
       ],
     });
     log.info(`Message sent to Dead Letter Queue (DLQ) for subscription ID: ${subscriptionId}`);
-    webhookDeliveries.inc({ status: 'dlq' });
   } catch (err) {
     log.error('Error sending to Dead Letter Queue (DLQ)', err);
   }

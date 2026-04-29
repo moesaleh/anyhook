@@ -7,8 +7,6 @@ import {
   LayoutDashboard,
   Radio,
   Settings,
-  Webhook,
-  Activity,
   ChevronsUpDown,
   LogOut,
   Check,
@@ -22,11 +20,6 @@ const navigation = [
   { name: "Dashboard", href: "/", icon: LayoutDashboard },
   { name: "Subscriptions", href: "/subscriptions", icon: Radio },
   { name: "Settings", href: "/settings", icon: Settings },
-];
-
-const secondaryNav = [
-  { name: "Activity", href: "#", icon: Activity, disabled: true },
-  { name: "Webhooks", href: "#", icon: Webhook, disabled: true },
 ];
 
 export function Sidebar() {
@@ -97,9 +90,6 @@ export function Sidebar() {
       )}
 
       <nav className="flex-1 px-3 py-4 space-y-1">
-        <p className="px-2 mb-2 text-xs font-medium text-neutral-500 uppercase tracking-wider">
-          Main
-        </p>
         {navigation.map((item) => {
           const isActive =
             pathname === item.href ||
@@ -120,22 +110,6 @@ export function Sidebar() {
             </Link>
           );
         })}
-
-        <p className="px-2 mt-6 mb-2 text-xs font-medium text-neutral-500 uppercase tracking-wider">
-          Coming Soon
-        </p>
-        {secondaryNav.map((item) => (
-          <span
-            key={item.name}
-            className="flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium text-neutral-400 dark:text-neutral-600 cursor-not-allowed"
-          >
-            <item.icon className="h-4 w-4" />
-            {item.name}
-            <span className="ml-auto text-[10px] bg-neutral-200 dark:bg-neutral-800 text-neutral-500 px-1.5 py-0.5 rounded-full">
-              Soon
-            </span>
-          </span>
-        ))}
       </nav>
 
       {/* Per-org quota usage */}

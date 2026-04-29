@@ -434,14 +434,64 @@ async function claimDueRetries() {
  * the webhook, and update or remove the queue row based on outcome.
  */
 async function processClaimedRetry(row) {
-  const subscriptionDetails = await redisClient.get(subscriptionCacheKey(row.subscription_id));
+  let subscription = null;
 
-  // Subscription deleted between schedule and retry — drop the queue row,
-  // record a final 'failed' delivery_event for audit. The FK CASCADE on
-  // sub deletion would normally handle this, but we may also race deletion.
-  if (!subscriptionDetails) {
+  // Look up the subscription. Try Redis first (hot cache), then fall
+  // back to Postgres if Redis is missing the row — covers the case
+  // where an operator flushed Redis between schedule and retry, or a
+  // /redis/reload cycle hadn't repopulated the key yet. Without the
+  // PG fallback, every in-flight retry would silently DLQ the moment
+  // Redis was touched.
+  const subscriptionDetails = await redisClient.get(subscriptionCacheKey(row.subscription_id));
+  if (subscriptionDetails) {
+    try {
+      subscription = JSON.parse(subscriptionDetails);
+    } catch (err) {
+      log.error(`Bad Redis payload for ${row.subscription_id}:`, err.message);
+      // Don't drop the queue row — the Redis state may recover. Just unlock.
+      await pool.query(
+        'UPDATE pending_retries SET locked_at = NULL, locked_by = NULL WHERE event_id = $1',
+        [row.event_id]
+      );
+      return;
+    }
+  } else {
+    try {
+      const r = await pool.query(
+        `SELECT subscription_id, organization_id, webhook_url, webhook_secret
+         FROM subscriptions WHERE subscription_id = $1`,
+        [row.subscription_id]
+      );
+      if (r.rowCount > 0) {
+        subscription = r.rows[0];
+        // Re-warm the cache so subsequent retries don't pay the PG cost.
+        try {
+          await redisClient.set(
+            subscriptionCacheKey(row.subscription_id),
+            JSON.stringify(subscription)
+          );
+        } catch (err) {
+          log.error(`Failed to re-warm Redis for ${row.subscription_id}:`, err.message);
+        }
+      }
+    } catch (err) {
+      log.error(`PG fallback lookup failed for ${row.subscription_id}:`, err.message);
+      // Unlock so the next poll retries. PG may recover.
+      await pool.query(
+        'UPDATE pending_retries SET locked_at = NULL, locked_by = NULL WHERE event_id = $1',
+        [row.event_id]
+      );
+      return;
+    }
+  }
+
+  // Subscription truly deleted (not in Redis, not in PG) — drop the
+  // queue row + record a 'failed' delivery_event for audit. The FK
+  // CASCADE on sub deletion would normally handle this; this branch
+  // covers a race window between sub-delete and the retry poller.
+  if (!subscription) {
     log.warn(
-      `Subscription ${row.subscription_id} no longer in Redis; dropping retry ${row.event_id}`
+      `Subscription ${row.subscription_id} not in Redis OR Postgres; dropping retry ${row.event_id}`
     );
     await pool.query('DELETE FROM pending_retries WHERE event_id = $1', [row.event_id]);
     await recordDelivery({
@@ -456,18 +506,6 @@ async function processClaimedRetry(row) {
     return;
   }
 
-  let subscription;
-  try {
-    subscription = JSON.parse(subscriptionDetails);
-  } catch (err) {
-    log.error(`Bad Redis payload for ${row.subscription_id}:`, err.message);
-    // Don't drop the queue row — the Redis state may recover. Just unlock.
-    await pool.query(
-      'UPDATE pending_retries SET locked_at = NULL, locked_by = NULL WHERE event_id = $1',
-      [row.event_id]
-    );
-    return;
-  }
   const { webhook_url: webhookUrl, webhook_secret: webhookSecret } = subscription;
 
   let data;

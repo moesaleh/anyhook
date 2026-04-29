@@ -31,6 +31,25 @@ export function timeAgo(date: Date): string {
   return `${days}d ago`;
 }
 
+/**
+ * Sanitise a `next`-style redirect-target query param so an attacker
+ * can't craft `?next=https://evil.com/` to redirect users post-auth.
+ *
+ * Only same-origin paths are allowed: must start with a single `/` and
+ * not with `//` (protocol-relative), `/\` (some browsers normalise
+ * backslash → forward slash), or `/?` chains that confuse middleware.
+ * Anything else falls back to the dashboard root.
+ */
+export function sanitiseNextPath(next: string | null | undefined): string {
+  if (!next) return "/";
+  if (!next.startsWith("/")) return "/";
+  // Protocol-relative — `//evil.com` navigates to evil.com.
+  if (next.startsWith("//")) return "/";
+  // Browsers normalise `\` to `/`, so `/\evil.com` becomes `//evil.com`.
+  if (next.startsWith("/\\")) return "/";
+  return next;
+}
+
 export function formatUptime(createdAt: string): string {
   const ms = Date.now() - new Date(createdAt).getTime();
   const seconds = Math.floor(ms / 1000);

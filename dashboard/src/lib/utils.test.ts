@@ -1,5 +1,12 @@
 import { describe, it, expect } from "vitest";
-import { cn, formatDate, truncate, timeAgo, formatUptime } from "./utils";
+import {
+  cn,
+  formatDate,
+  truncate,
+  timeAgo,
+  formatUptime,
+  sanitiseNextPath,
+} from "./utils";
 
 describe("cn", () => {
   it("joins class strings with spaces", () => {
@@ -84,6 +91,30 @@ describe("formatUptime", () => {
   it("days + hours when ≥ 1 day", () => {
     const d = new Date(Date.now() - (5 * 24 * 60 * 60 * 1000 + 3 * 60 * 60 * 1000));
     expect(formatUptime(d.toISOString())).toBe("5d 3h");
+  });
+});
+
+describe("sanitiseNextPath (open-redirect defense)", () => {
+  it.each([
+    [null, "/"],
+    [undefined, "/"],
+    ["", "/"],
+    ["/", "/"],
+    ["/subscriptions", "/subscriptions"],
+    ["/subscriptions/abc-123", "/subscriptions/abc-123"],
+    ["/settings?tab=members", "/settings?tab=members"],
+    // Open-redirect attempts must fall back to "/"
+    ["https://evil.com/", "/"],
+    ["http://evil.com/", "/"],
+    ["//evil.com/", "/"], // protocol-relative
+    ["///evil.com/", "/"],
+    ["/\\evil.com/", "/"], // backslash-prefixed; browser may normalise
+    ["javascript:alert(1)", "/"],
+    ["data:text/html,<script>", "/"],
+    ["evil.com/", "/"], // not absolute path
+    ["..", "/"], // not absolute path
+  ])("sanitiseNextPath(%j) === %j", (input, expected) => {
+    expect(sanitiseNextPath(input)).toBe(expected);
   });
 });
 

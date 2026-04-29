@@ -5,6 +5,7 @@ import { useSearchParams } from "next/navigation";
 import Link from "next/link";
 import { AlertCircle, Loader2, Webhook } from "lucide-react";
 import { login } from "@/lib/api";
+import { sanitiseNextPath } from "@/lib/utils";
 
 export default function LoginPage() {
   return (
@@ -24,7 +25,7 @@ function LoginShell() {
 
 function LoginForm() {
   const searchParams = useSearchParams();
-  const next = searchParams.get("next") || "/";
+  const next = sanitiseNextPath(searchParams.get("next"));
 
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");

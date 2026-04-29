@@ -27,10 +27,13 @@ import {
 } from "@/lib/api";
 import { useAuth } from "@/lib/auth-context";
 import { cn, formatDate } from "@/lib/utils";
+import { TwoFactorPanel } from "@/components/two-factor-panel";
 
 export default function SettingsPage() {
   const { user, organization, organizations, refresh } = useAuth();
-  const [tab, setTab] = useState<"members" | "api-keys" | "organizations">("members");
+  const [tab, setTab] = useState<
+    "members" | "api-keys" | "organizations" | "security"
+  >("members");
 
   return (
     <div className="p-6 lg:p-8 max-w-5xl mx-auto">
@@ -45,7 +48,7 @@ export default function SettingsPage() {
 
       <div className="border-b border-neutral-200 dark:border-neutral-800 mb-6">
         <nav className="-mb-px flex gap-6">
-          {(["members", "api-keys", "organizations"] as const).map((t) => (
+          {(["members", "api-keys", "organizations", "security"] as const).map((t) => (
             <button
               key={t}
               type="button"
@@ -72,6 +75,7 @@ export default function SettingsPage() {
           onCreated={refresh}
         />
       )}
+      {tab === "security" && <TwoFactorPanel />}
     </div>
   );
 }

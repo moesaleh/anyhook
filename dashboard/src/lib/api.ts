@@ -183,10 +183,32 @@ export async function fetchMe(): Promise<SessionResponse> {
   return res.json();
 }
 
-export async function login(
-  email: string,
-  password: string
-): Promise<SessionResponse> {
+/**
+ * Result of POST /auth/login. The endpoint behaves in two modes:
+ *
+ *   - 2FA disabled: returns the full SessionResponse and sets the
+ *     anyhook_session cookie. `needs_2fa` is absent / false.
+ *
+ *   - 2FA enabled: returns { needs_2fa: true, pending_token } with NO
+ *     cookie set. The caller must POST /auth/2fa/verify-login with
+ *     the pending_token + a 6-digit TOTP (or backup code) to complete
+ *     the login.
+ *
+ * The discriminated-union shape lets the login page branch on
+ * `needs_2fa` without a runtime guess. Receivers should `if
+ * ("needs_2fa" in result)` style or use the helper below.
+ */
+export type LoginResult =
+  | { needs_2fa: true; pending_token: string }
+  | (SessionResponse & { needs_2fa?: false });
+
+export function loginNeeds2fa(
+  r: LoginResult
+): r is { needs_2fa: true; pending_token: string } {
+  return r && (r as { needs_2fa?: boolean }).needs_2fa === true;
+}
+
+export async function login(email: string, password: string): Promise<LoginResult> {
   const res = await apiFetch("/auth/login", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -197,6 +219,89 @@ export async function login(
     throw new Error(body.error || "Login failed");
   }
   return res.json();
+}
+
+/**
+ * Second-step login when 2FA is enabled. Submits the pending_token
+ * obtained from `login()` together with a 6-digit TOTP or
+ * `xxxxxxxx-xxxxxxxx` (or legacy `xxxx-xxxx`) backup code. On success
+ * the anyhook_session cookie is set and the SessionResponse is
+ * returned.
+ */
+export async function verifyLogin2fa(
+  pendingToken: string,
+  code: string
+): Promise<SessionResponse> {
+  const res = await apiFetch("/auth/2fa/verify-login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ pending_token: pendingToken, code }),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || "2FA verification failed");
+  }
+  return res.json();
+}
+
+/* --- 2FA management (settings page) --- */
+
+export interface TwoFactorStatus {
+  enabled: boolean;
+  enrollment_pending: boolean;
+  unused_backup_codes: number;
+}
+
+export async function fetch2faStatus(): Promise<TwoFactorStatus> {
+  const res = await apiFetch("/auth/2fa/status");
+  checkAuth(res);
+  if (!res.ok) throw new Error("Failed to load 2FA status");
+  return res.json();
+}
+
+export interface TwoFactorSetup {
+  secret: string;
+  otpauth_url: string;
+}
+
+export async function start2faSetup(): Promise<TwoFactorSetup> {
+  const res = await apiFetch("/auth/2fa/setup", { method: "POST" });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || "Failed to start 2FA setup");
+  }
+  return res.json();
+}
+
+export interface TwoFactorVerifySetup {
+  enabled: true;
+  backup_codes: string[];
+  message: string;
+}
+
+export async function verify2faSetup(code: string): Promise<TwoFactorVerifySetup> {
+  const res = await apiFetch("/auth/2fa/verify-setup", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ code }),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || "Failed to verify 2FA setup");
+  }
+  return res.json();
+}
+
+export async function disable2fa(currentPassword: string, code: string): Promise<void> {
+  const res = await apiFetch("/auth/2fa/disable", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ current_password: currentPassword, code }),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || "Failed to disable 2FA");
+  }
 }
 
 export async function registerUser(data: {

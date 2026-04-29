@@ -2,11 +2,11 @@
 
 <div align="center">
 
-[![GitHub license](https://img.shields.io/github/license/swanblocks-inc/anyhook)](https://github.com/swanblocks-inc/anyhook/blob/main/LICENSE)
-[![GitHub stars](https://img.shields.io/github/stars/swanblocks-inc/anyhook)](https://github.com/swanblocks-inc/anyhook/stargazers)
-[![GitHub issues](https://img.shields.io/github/issues/swanblocks-inc/anyhook)](https://github.com/swanblocks-inc/anyhook/issues)
-[![GitHub pull requests](https://img.shields.io/github/issues-pr/swanblocks-inc/anyhook)](https://github.com/swanblocks-inc/anyhook/pulls)
-[![Build Status](https://github.com/swanblocks-inc/anyhook/workflows/CI/CD%20Pipeline/badge.svg)](https://github.com/swanblocks-inc/anyhook/actions)
+[![GitHub license](https://img.shields.io/github/license/SwanBlocks-inc/anyhook)](https://github.com/SwanBlocks-inc/anyhook/blob/main/LICENSE)
+[![GitHub stars](https://img.shields.io/github/stars/SwanBlocks-inc/anyhook)](https://github.com/SwanBlocks-inc/anyhook/stargazers)
+[![GitHub issues](https://img.shields.io/github/issues/SwanBlocks-inc/anyhook)](https://github.com/SwanBlocks-inc/anyhook/issues)
+[![GitHub pull requests](https://img.shields.io/github/issues-pr/SwanBlocks-inc/anyhook)](https://github.com/SwanBlocks-inc/anyhook/pulls)
+[![Build Status](https://github.com/SwanBlocks-inc/anyhook/workflows/CI/CD%20Pipeline/badge.svg)](https://github.com/SwanBlocks-inc/anyhook/actions)
 
 </div>
 
@@ -43,7 +43,7 @@ AnyHook is a powerful and flexible subscription proxy server that connects vario
 
 ```bash
 # Clone the repository
-git clone https://github.com/swanblocks-inc/anyhook.git
+git clone https://github.com/SwanBlocks-inc/anyhook.git
 cd anyhook
 
 # Copy and configure environment variables
@@ -101,8 +101,8 @@ For security issues, please see our [Security Policy](SECURITY.md).
 
 ## 🌟 Support
 
-- 🐛 Report bugs by opening [GitHub issues](https://github.com/swanblocks-inc/anyhook/issues)
-- 💡 Request features in our [GitHub discussions](https://github.com/swanblocks-inc/anyhook/discussions)
+- 🐛 Report bugs by opening [GitHub issues](https://github.com/SwanBlocks-inc/anyhook/issues)
+- 💡 Request features in our [GitHub discussions](https://github.com/SwanBlocks-inc/anyhook/discussions)
 
 ## 🙏 Acknowledgments
 

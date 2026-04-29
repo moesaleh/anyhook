@@ -29,12 +29,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/anyhook/anyhook.git"
+    "url": "https://github.com/SwanBlocks-inc/anyhook.git"
   },
   "bugs": {
-    "url": "https://github.com/anyhook/anyhook/issues"
+    "url": "https://github.com/SwanBlocks-inc/anyhook/issues"
   },
-  "homepage": "https://anyhook.dev",
+  "homepage": "https://github.com/SwanBlocks-inc/anyhook",
   "dependencies": {
     "@apollo/client": "^3.14.1",
     "@redis/client": "^5.12.1",

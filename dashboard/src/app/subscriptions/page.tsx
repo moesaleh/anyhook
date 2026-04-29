@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useCallback } from "react";
 import Link from "next/link";
-import { Plus, AlertCircle, RefreshCw } from "lucide-react";
+import { Plus, AlertCircle, Download, RefreshCw } from "lucide-react";
 import { SubscriptionTable } from "@/components/subscription-table";
 import { DeleteDialog } from "@/components/delete-dialog";
 import { EmptyState } from "@/components/empty-state";
@@ -14,6 +14,7 @@ import {
 } from "@/lib/api";
 import type { Subscription } from "@/lib/api";
 import { useToast } from "@/lib/toast";
+import { downloadFile, exportAsCsv, exportAsJson } from "@/lib/export";
 
 const POLL_INTERVAL = 10000;
 
@@ -72,6 +73,35 @@ export default function SubscriptionsPage() {
 
   async function handleDelete(id: string) {
     setDeleteTarget(id);
+  }
+
+  function timestampedFilename(ext: "json" | "csv") {
+    const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, -5);
+    return `anyhook-subscriptions-${ts}.${ext}`;
+  }
+
+  function handleExport(format: "json" | "csv") {
+    if (subscriptions.length === 0) {
+      toast.info("Nothing to export — no subscriptions in this organization");
+      return;
+    }
+    if (format === "json") {
+      downloadFile(
+        exportAsJson(subscriptions),
+        timestampedFilename("json"),
+        "application/json"
+      );
+    } else {
+      downloadFile(
+        exportAsCsv(subscriptions),
+        timestampedFilename("csv"),
+        "text/csv"
+      );
+    }
+    toast.success(
+      `Exported ${subscriptions.length} subscription${subscriptions.length === 1 ? "" : "s"}`,
+      `Format: ${format.toUpperCase()}`
+    );
   }
 
   async function handleBulkDelete(ids: string[]) {
@@ -147,6 +177,10 @@ export default function SubscriptionsPage() {
           </p>
         </div>
         <div className="flex items-center gap-3">
+          <ExportMenu
+            disabled={subscriptions.length === 0}
+            onExport={handleExport}
+          />
           <button
             onClick={() => loadData(true)}
             disabled={refreshing}
@@ -210,6 +244,78 @@ export default function SubscriptionsPage() {
         onCancel={() => setDeleteTarget(null)}
         loading={deleting !== null}
       />
+    </div>
+  );
+}
+
+/**
+ * Tiny dropdown for the JSON / CSV export choice. Closes on outside
+ * click + Escape. No third-party menu lib.
+ */
+function ExportMenu({
+  disabled,
+  onExport,
+}: {
+  disabled: boolean;
+  onExport: (format: "json" | "csv") => void;
+}) {
+  const [open, setOpen] = useState(false);
+  useEffect(() => {
+    if (!open) return;
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") setOpen(false);
+    }
+    function onClick() {
+      setOpen(false);
+    }
+    document.addEventListener("keydown", onKey);
+    document.addEventListener("click", onClick);
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      document.removeEventListener("click", onClick);
+    };
+  }, [open]);
+  return (
+    <div className="relative" onClick={(e) => e.stopPropagation()}>
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        disabled={disabled}
+        className="inline-flex items-center gap-2 rounded-lg border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-950 px-3 py-2.5 text-sm font-medium hover:bg-neutral-50 dark:hover:bg-neutral-900 transition-colors disabled:opacity-60"
+        aria-haspopup="menu"
+        aria-expanded={open}
+      >
+        <Download className="h-4 w-4" /> Export
+      </button>
+      {open && (
+        <div
+          role="menu"
+          className="absolute right-0 mt-1 z-10 w-32 rounded-lg border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-950 shadow-lg overflow-hidden text-sm"
+        >
+          <button
+            role="menuitem"
+            type="button"
+            onClick={() => {
+              onExport("json");
+              setOpen(false);
+            }}
+            className="block w-full text-left px-3 py-2 hover:bg-neutral-100 dark:hover:bg-neutral-900"
+          >
+            JSON
+          </button>
+          <button
+            role="menuitem"
+            type="button"
+            onClick={() => {
+              onExport("csv");
+              setOpen(false);
+            }}
+            className="block w-full text-left px-3 py-2 hover:bg-neutral-100 dark:hover:bg-neutral-900"
+          >
+            CSV
+          </button>
+        </div>
+      )}
     </div>
   );
 }

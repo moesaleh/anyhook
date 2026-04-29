@@ -178,9 +178,9 @@ async function handleConnectionEvent({ message }) {
     return;
   }
 
-  let subscriptionId, data;
+  let subscriptionId, data, payloadEventId;
   try {
-    ({ subscriptionId, data } = JSON.parse(raw));
+    ({ subscriptionId, eventId: payloadEventId, data } = JSON.parse(raw));
   } catch (err) {
     log.error('Failed to parse Kafka message, skipping:', err.message);
     return;
@@ -191,10 +191,37 @@ async function handleConnectionEvent({ message }) {
     return;
   }
 
-  // Generate a unique event ID that groups this delivery + all its retries
-  const eventId = uuidv4();
+  // Use the producer-supplied event_id when present so a Kafka redelivery
+  // (rebalance / pod restart before commit) reuses the same id and the
+  // duplicate-detection branch below skips the redelivered message.
+  // Older in-flight messages without eventId fall back to a fresh uuid.
+  const eventId = payloadEventId || uuidv4();
 
   try {
+    // Idempotency: if we've already recorded any delivery_events row
+    // for this (subscription, event) pair, the message is a Kafka
+    // redelivery and the original chain is already in flight or
+    // complete. Skip — don't produce a second parallel retry chain.
+    if (payloadEventId) {
+      try {
+        const existing = await pool.query(
+          `SELECT 1 FROM delivery_events
+           WHERE subscription_id = $1 AND event_id = $2 LIMIT 1`,
+          [subscriptionId, payloadEventId]
+        );
+        if (existing.rowCount > 0) {
+          log.info(
+            `Skipping duplicate delivery for subscription=${subscriptionId} event=${payloadEventId}`
+          );
+          return;
+        }
+      } catch (err) {
+        // PG unavailable — fall through; we'd rather risk a duplicate
+        // delivery than drop the legitimate event.
+        log.error('Idempotency check failed (proceeding):', err.message);
+      }
+    }
+
     const subscriptionDetails = await redisClient.get(subscriptionCacheKey(subscriptionId));
 
     if (!subscriptionDetails) {

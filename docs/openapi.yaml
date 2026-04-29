@@ -412,6 +412,156 @@ paths:
         '409': { description: A user with the invite's email already exists }
         '410': { description: Token revoked / used / expired }
 
+  # ---- 2FA / TOTP (RFC 6238) -------------------------------------------------
+  # Login is a two-step flow when 2FA is enabled. /auth/login returns
+  # `{ needs_2fa: true, pending_token }` instead of setting the session
+  # cookie; the client then POSTs /auth/2fa/verify-login with the
+  # pending_token + a code.
+
+  /auth/2fa/status:
+    get:
+      tags: [Auth, 2FA]
+      summary: Current 2FA state for the logged-in user
+      description: Cookie sessions only. API-key auth returns 403.
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  enabled: { type: boolean }
+                  enrollment_pending: { type: boolean }
+                  unused_backup_codes: { type: integer }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /auth/2fa/setup:
+    post:
+      tags: [Auth, 2FA]
+      summary: Begin TOTP enrollment
+      description: |
+        Generates a TOTP secret and stores it as PENDING (not enforced
+        yet — verify-setup completes enrollment). Cookie sessions only.
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  secret:
+                    type: string
+                    description: Base32-encoded TOTP secret. Show in the UI for manual entry.
+                  otpauth_url:
+                    type: string
+                    description: 'otpauth://totp/...?secret=...&issuer=AnyHook for QR rendering.'
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { description: 2FA already enabled — disable first to rotate }
+
+  /auth/2fa/verify-setup:
+    post:
+      tags: [Auth, 2FA]
+      summary: Finalize TOTP enrollment
+      description: |
+        Verifies a 6-digit code against the pending secret, marks 2FA
+        enabled, and returns 10 single-use backup codes (raw values
+        shown ONCE — only their hash is persisted). Cookie sessions only.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code: { type: string, description: 6-digit TOTP }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  enabled: { type: boolean, enum: [true] }
+                  backup_codes:
+                    type: array
+                    items: { type: string, description: 'xxxxxxxx-xxxxxxxx (64-bit)' }
+                  message: { type: string }
+        '400': { description: No pending enrollment / malformed code }
+        '401': { description: Wrong code }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { description: 2FA already enabled }
+
+  /auth/2fa/verify-login:
+    post:
+      tags: [Auth, 2FA]
+      summary: Second-step login with TOTP / backup code
+      security: []
+      description: |
+        Submitted by the client when /auth/login returns needs_2fa.
+        Code is either a 6-digit TOTP or a backup code (`xxxxxxxx-xxxxxxxx`
+        new format, or the legacy `xxxx-xxxx`). On success the
+        anyhook_session cookie is set.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pending_token, code]
+              properties:
+                pending_token:
+                  type: string
+                  description: Ephemeral 5-min JWT issued by /auth/login
+                code: { type: string }
+      responses:
+        '200':
+          description: Authenticated. Sets anyhook_session.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user: { $ref: '#/components/schemas/User' }
+                  organization: { $ref: '#/components/schemas/Organization' }
+                  organizations:
+                    type: array
+                    items: { $ref: '#/components/schemas/Organization' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { description: Bad pending_token / wrong code / replay attempt }
+
+  /auth/2fa/disable:
+    post:
+      tags: [Auth, 2FA]
+      summary: Turn 2FA off
+      description: |
+        Requires the current password AND a current TOTP / backup code.
+        Bumps users.token_version on success so other sessions are
+        invalidated; clears the session cookie too. Cookie sessions only.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [current_password, code]
+              properties:
+                current_password: { type: string }
+                code: { type: string }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  enabled: { type: boolean, enum: [false] }
+                  message: { type: string }
+        '400': { description: 2FA not enabled / missing fields }
+        '401': { description: Wrong password / wrong code }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
   # ---- Organizations ---------------------------------------------------------
   /organizations:
     post:
@@ -940,6 +1090,7 @@ paths:
 
 tags:
   - name: Auth
+  - name: 2FA
   - name: Organizations
   - name: API Keys
   - name: Invitations

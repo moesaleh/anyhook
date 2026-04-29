@@ -12,14 +12,14 @@ process.env.KAFKAJS_NO_PARTITIONER_WARNING = '1';
 const { Pool } = require('pg');
 const redis = require('@redis/client');
 const { Kafka, logLevel } = require('kafkajs');
-const promClient = require('prom-client');
 const { exec } = require('child_process');
 const { createLogger } = require('../lib/logger');
 const { makeRateLimit, ipKeyFn } = require('../lib/rate-limit');
+const { startMetricsServer } = require('../lib/metrics-server');
 const { createApp } = require('./app');
 
 const log = createLogger('subscription-management');
-promClient.collectDefaultMetrics();
+// startMetricsServer() handles default-metrics collection — don't double-register.
 
 function parseBrokers(envValue) {
   return (envValue || 'localhost:9092')
@@ -140,6 +140,12 @@ async function createKafkaTopics() {
   );
 }
 
+// Internal HTTP for /metrics + /health on METRICS_PORT (default 9090).
+// Same pattern as the worker services — docker-compose does NOT map this
+// port publicly, so Prometheus scrapes over the internal network and
+// /metrics is no longer reachable from the public API surface.
+const metricsServer = startMetricsServer({ logger: log });
+
 let server;
 (async () => {
   try {
@@ -169,6 +175,7 @@ async function shutdown(signal) {
   try {
     if (server) await new Promise(resolve => server.close(resolve));
     await Promise.allSettled([
+      new Promise(resolve => metricsServer.close(resolve)),
       producer.disconnect(),
       admin.disconnect(),
       redisClient.quit(),

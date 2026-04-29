@@ -199,15 +199,13 @@ function createApp({
     res.send(OPENAPI_YAML);
   });
 
-  // Prometheus scrape (no auth — only reachable on the API network).
-  app.get('/metrics', async (req, res) => {
-    try {
-      res.setHeader('Content-Type', promClient.register.contentType);
-      res.end(await promClient.register.metrics());
-    } catch (err) {
-      res.status(500).end(String(err && err.message));
-    }
-  });
+  // /metrics is served on a SEPARATE internal port (METRICS_PORT, default
+  // 9090) by ./index.js — matches the worker pattern in
+  // src/lib/metrics-server.js, so docker-compose only maps the public API
+  // port and Prometheus reaches metrics over the internal network.
+  // Historically /metrics was here on port 3001 and unauthenticated; that
+  // leaked route names + latency histograms to anyone who reached the API
+  // host. See docs/openapi.yaml + .env.example for the new setup.
 
   // Health check
   app.get('/health', async (req, res) => {

@@ -202,15 +202,12 @@ paths:
                       redis: { type: string, enum: [connected, disconnected] }
         '503': { description: Postgres or Redis unreachable }
 
-  /metrics:
-    get:
-      summary: Prometheus exposition (text format)
-      security: []
-      responses:
-        '200':
-          description: Prometheus metrics in text/plain
-          content:
-            text/plain: {}
+  # /metrics is no longer served on the public API port. It moved to the
+  # internal METRICS_PORT (default 9090) for all three services so that
+  # docker-compose only maps the API port publicly. Prometheus scrapes
+  # the metrics endpoint over the internal docker network. Documented
+  # here as a comment rather than a removed path so consumers reading
+  # this spec see why the endpoint vanished.
 
   # ---- Auth ------------------------------------------------------------------
   /auth/register:

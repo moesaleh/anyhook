@@ -800,6 +800,66 @@ paths:
         '429': { $ref: '#/components/responses/RateLimited' }
         '500': { description: Created in DB but Kafka publish failed; reconcile manually }
 
+  /subscribe/bulk:
+    post:
+      tags: [Subscriptions]
+      summary: Bulk-create subscriptions (max 100 per request)
+      description: |
+        Imports up to 100 subscriptions in a single call. Quota is
+        checked against the org's effective limit BEFORE any inserts —
+        request is rejected with 429 if it would push the org over.
+        Per-entry validation runs independently; invalid entries are
+        reported with `{index, error}` while valid ones still create.
+        Each successful entry returns its own webhook_secret (shown
+        ONCE).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [subscriptions]
+              properties:
+                subscriptions:
+                  type: array
+                  minItems: 1
+                  maxItems: 100
+                  items:
+                    type: object
+                    required: [connection_type, args, webhook_url]
+                    properties:
+                      connection_type: { type: string, enum: [graphql, websocket] }
+                      args: { type: object }
+                      webhook_url: { type: string, format: uri }
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  results:
+                    type: array
+                    items:
+                      oneOf:
+                        - type: object
+                          properties:
+                            index: { type: integer }
+                            subscriptionId: { type: string, format: uuid }
+                            webhook_secret: { type: string }
+                        - type: object
+                          properties:
+                            index: { type: integer }
+                            error: { type: string }
+                  summary:
+                    type: object
+                    properties:
+                      total: { type: integer }
+                      successful: { type: integer }
+                      failed: { type: integer }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
   /unsubscribe:
     post:
       tags: [Subscriptions]

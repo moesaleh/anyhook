@@ -19,7 +19,11 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { isValidUrl } = require('../lib/url-validation');
-const { makeSubscriptionQuotaCheck, makeApiKeyQuotaCheck } = require('../lib/quotas');
+const {
+  makeSubscriptionQuotaCheck,
+  makeApiKeyQuotaCheck,
+  ADVISORY_LOCK_KEY_QUOTAS,
+} = require('../lib/quotas');
 const { makeEmailTransport } = require('../lib/email');
 const {
   subscriptionCacheKey,
@@ -679,6 +683,150 @@ function createApp({
     } catch (err) {
       log.error(`[Subscribe API] - Error creating subscription:`, err);
       errorResponse(res, 500, 'Failed to create subscription');
+    }
+  });
+
+  // Bulk-create subscriptions.
+  //
+  // POST /subscribe/bulk
+  //   body: { subscriptions: [ { connection_type, args, webhook_url }, ... ] }
+  //
+  // - Capped at MAX_BULK_SIZE per request so a single call can't blow
+  //   past the org quota by orders of magnitude.
+  // - Per-entry validation: invalid entries return { index, error };
+  //   valid entries proceed independently. The whole call is NOT
+  //   transactional — partial success is allowed (matches the
+  //   "import 100 from a JSON; 3 had bad URLs, ignore those" UX).
+  // - Quota: takes the same advisory lock the per-request quota
+  //   middleware uses; counts current usage + bulk size against the
+  //   org's effective limit. 429 if the request would put us over.
+  // - Each successful entry produces its own webhook_secret, returned
+  //   ONCE in the response.
+  const MAX_BULK_SIZE = 100;
+  app.post('/subscribe/bulk', requireAuth, rateLimit, async (req, res) => {
+    const { subscriptions: entries } = req.body || {};
+    if (!Array.isArray(entries) || entries.length === 0) {
+      return errorResponse(res, 400, 'subscriptions must be a non-empty array');
+    }
+    if (entries.length > MAX_BULK_SIZE) {
+      return errorResponse(
+        res,
+        400,
+        `Maximum ${MAX_BULK_SIZE} subscriptions per request (got ${entries.length})`
+      );
+    }
+
+    // Per-org advisory lock for the duration of the request — same
+    // pattern as the per-request quota middleware. Two parallel bulks
+    // for the same org serialize.
+    const lockClient = await pool.connect();
+    let released = false;
+    const release = async () => {
+      if (released) return;
+      released = true;
+      try {
+        await lockClient.query('SELECT pg_advisory_unlock($1, hashtext($2::text))', [
+          ADVISORY_LOCK_KEY_QUOTAS,
+          req.auth.organizationId,
+        ]);
+      } catch (e) {
+        log.error('Bulk advisory unlock failed', e.message);
+      } finally {
+        lockClient.release();
+      }
+    };
+    res.on('finish', release);
+    res.on('close', release);
+
+    try {
+      // Same lock-key as the subscriptionQuota middleware so a
+      // concurrent single-row /subscribe and a bulk import for the
+      // same org serialize against each other.
+      await lockClient.query('SELECT pg_advisory_lock($1, hashtext($2::text))', [
+        ADVISORY_LOCK_KEY_QUOTAS,
+        req.auth.organizationId,
+      ]);
+
+      const usageRow = await lockClient.query(
+        `SELECT
+            (SELECT COUNT(*)::int FROM subscriptions WHERE organization_id = $1) AS used,
+            (SELECT max_subscriptions FROM organizations WHERE id = $1) AS override`,
+        [req.auth.organizationId]
+      );
+      const used = usageRow.rows[0].used;
+      const envLimit = parseInt(process.env.ORG_MAX_SUBSCRIPTIONS, 10) || 100;
+      const effectiveLimit =
+        usageRow.rows[0].override != null ? usageRow.rows[0].override : envLimit;
+      if (used + entries.length > effectiveLimit) {
+        await release();
+        return res.status(429).json({
+          error: 'Subscription quota would be exceeded',
+          quota: 'subscriptions',
+          used,
+          limit: effectiveLimit,
+          requested: entries.length,
+        });
+      }
+
+      const results = [];
+      for (let i = 0; i < entries.length; i++) {
+        const entry = entries[i];
+        const validationErrors = validateSubscriptionInput(entry);
+        if (validationErrors.length > 0) {
+          results.push({ index: i, error: validationErrors.join('; ') });
+          continue;
+        }
+        const subscriptionId = uuidv4();
+        const webhookSecret = crypto.randomBytes(32).toString('hex');
+        try {
+          const insRes = await lockClient.query(
+            `INSERT INTO subscriptions
+               (subscription_id, organization_id, connection_type, args, webhook_url, webhook_secret)
+             VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+            [
+              subscriptionId,
+              req.auth.organizationId,
+              entry.connection_type,
+              entry.args,
+              entry.webhook_url,
+              webhookSecret,
+            ]
+          );
+          await redisClient.set(
+            subscriptionCacheKey(subscriptionId),
+            JSON.stringify(insRes.rows[0])
+          );
+          try {
+            await producer.send({
+              topic: 'subscription_events',
+              messages: [{ key: subscriptionId, value: subscriptionId }],
+            });
+          } catch (kafkaErr) {
+            // Same trade-off as per-row /subscribe: DB is the source
+            // of truth. We log + record the entry as successful since
+            // the row is in DB; an operator can reconcile by running
+            // /redis/reload + a Kafka backfill if needed.
+            log.error(
+              `[Bulk Subscribe] - Kafka publish failed for ${subscriptionId}`,
+              kafkaErr.message
+            );
+          }
+          results.push({ index: i, subscriptionId, webhook_secret: webhookSecret });
+        } catch (err) {
+          log.error(`[Bulk Subscribe] - Failed entry ${i}`, err.message);
+          results.push({ index: i, error: 'Insert failed' });
+        }
+      }
+
+      const successful = results.filter(r => r.subscriptionId).length;
+      const failed = results.length - successful;
+      res.status(201).json({
+        results,
+        summary: { total: entries.length, successful, failed },
+      });
+    } catch (err) {
+      log.error('[Bulk Subscribe] - Error processing bulk request:', err);
+      errorResponse(res, 500, 'Failed to process bulk subscribe');
     }
   });
 

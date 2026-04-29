@@ -763,6 +763,39 @@ export async function createSubscription(data: {
   return res.json();
 }
 
+export interface BulkSubscriptionEntry {
+  connection_type: string;
+  args: Record<string, unknown>;
+  webhook_url: string;
+}
+
+export interface BulkSubscriptionResult {
+  index: number;
+  subscriptionId?: string;
+  webhook_secret?: string;
+  error?: string;
+}
+
+export interface BulkSubscriptionResponse {
+  results: BulkSubscriptionResult[];
+  summary: { total: number; successful: number; failed: number };
+}
+
+export async function createSubscriptionsBulk(
+  subscriptions: BulkSubscriptionEntry[]
+): Promise<BulkSubscriptionResponse> {
+  const res = await apiFetch("/subscribe/bulk", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ subscriptions }),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || "Bulk import failed");
+  }
+  return res.json();
+}
+
 export async function updateSubscription(
   id: string,
   data: {

@@ -34,7 +34,13 @@ const DEFAULTS = {
  * shouldn't block legitimate writes.
  */
 
-const ADVISORY_LOCK_KEY_QUOTAS = 8472394; // arbitrary stable namespace
+// Stable namespaces for the per-org advisory locks. Exported so
+// other handlers (e.g. /subscribe/bulk) can take the SAME lock as
+// the per-request subscriptionQuota middleware — otherwise a bulk
+// import could race a single create. Values are arbitrary but
+// must be int4 (pg_advisory_lock(int, int)).
+const ADVISORY_LOCK_KEY_QUOTAS = 8472394;
+const ADVISORY_LOCK_KEY_API_KEYS = 8472395;
 
 function makeSubscriptionQuotaCheck({ pool, log, limit = DEFAULTS.subscriptions } = {}) {
   if (!pool) throw new Error('makeSubscriptionQuotaCheck: pool is required');
@@ -117,7 +123,7 @@ function makeApiKeyQuotaCheck({ pool, log, limit = DEFAULTS.apiKeys } = {}) {
         released = true;
         try {
           await lockClient.query('SELECT pg_advisory_unlock($1, hashtext($2::text))', [
-            ADVISORY_LOCK_KEY_QUOTAS + 1,
+            ADVISORY_LOCK_KEY_API_KEYS,
             req.auth.organizationId,
           ]);
         } catch (e) {
@@ -130,7 +136,7 @@ function makeApiKeyQuotaCheck({ pool, log, limit = DEFAULTS.apiKeys } = {}) {
       res.on('close', release);
       try {
         await lockClient.query('SELECT pg_advisory_lock($1, hashtext($2::text))', [
-          ADVISORY_LOCK_KEY_QUOTAS + 1,
+          ADVISORY_LOCK_KEY_API_KEYS,
           req.auth.organizationId,
         ]);
       } catch (err) {
@@ -168,4 +174,10 @@ function makeApiKeyQuotaCheck({ pool, log, limit = DEFAULTS.apiKeys } = {}) {
   };
 }
 
-module.exports = { makeSubscriptionQuotaCheck, makeApiKeyQuotaCheck, DEFAULTS };
+module.exports = {
+  makeSubscriptionQuotaCheck,
+  makeApiKeyQuotaCheck,
+  DEFAULTS,
+  ADVISORY_LOCK_KEY_QUOTAS,
+  ADVISORY_LOCK_KEY_API_KEYS,
+};

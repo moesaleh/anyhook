@@ -26,10 +26,9 @@
 - [x] Searchable table (filter by ID, webhook URL, endpoint)
 - [x] Column sorting (type, status, webhook URL, created date)
 - [x] Type filter dropdown (All / GraphQL / WebSocket)
-- [x] Status filter dropdown (All / Connected / Disconnected / Active / Error)
+- [x] Status filter dropdown (All / Connected / Disconnected / Active)
 - [x] Pagination (10 per page)
 - [x] Copy subscription ID to clipboard
-- [x] External link to webhook URL
 - [x] Inline delete with confirmation dialog
 - [x] "View" action link (appears on row hover)
 - [x] Empty state with CTA to create first subscription
@@ -44,15 +43,15 @@
 - [x] **Overview tab**: 3-column card grid (Connection Status, Source, Destination)
 - [x] Connection status card: live state badge, Redis cache status, uptime counter, last check timestamp
 - [x] Source card: connection type icon + badge, endpoint URL with copy, event filter (WebSocket)
-- [x] Destination card: webhook URL with external link, HTTP method, retry policy summary
+- [x] Destination card: webhook URL with copy, HTTP method, retry policy summary
 - [x] **Configuration tab**: GraphQL query / WebSocket message code block with copy
 - [x] Headers displayed as key-value table
 - [x] Full JSON args with copy-to-clipboard
 - [x] **Activity tab**: connection timeline with animated state indicators
-- [x] Delivery logs placeholder (future feature)
 - [x] Visual data flow diagram: Source → AnyHook → Webhook (color-coded by connection state)
 - [x] Live/Pause toggle for auto-refresh polling
 - [x] Back navigation to subscriptions list
+- [x] Edit button → /subscriptions/[id]/edit (single-page form, reuses wizard step components)
 - [x] Delete button with confirmation dialog
 
 ---
@@ -74,14 +73,15 @@
 ---
 
 ## 5. Edit/Update Subscription
-**Status: TODO**
+**Status: DONE**
 
-- [ ] Edit button on subscription detail page
-- [ ] Pre-populated form with current subscription values
-- [ ] Inline editing for webhook URL (quick edit without full form)
-- [ ] Update API call (`PUT /subscriptions/:id`) already exists in backend
-- [ ] Confirmation before saving changes
-- [ ] Success/error toast notification after update
+- [x] Edit button on subscription detail page
+- [x] Pre-populated form with current subscription values (endpoint, query/message, headers, webhook URL)
+- [x] Update API call (`PUT /subscriptions/:id`)
+- [x] Wizard step components reused so the field layout matches the create flow
+- [x] Connection type is pinned (delete + recreate to change it)
+- [x] Backend publishes `update_events` to Kafka so the connector reloads the live connection
+- [x] Backend returns 500 if Kafka publish fails — the dashboard surfaces the error
 
 ---
 
@@ -117,6 +117,7 @@
 - [x] Backend: event_id groups original delivery + all retries
 - [x] Backend: request/response payloads truncated to 10KB to prevent DB bloat
 - [x] Backend: best-effort logging (Postgres failure doesn't block webhook delivery)
+- [x] Backend: final attempt records exactly one row (`dlq` includes the actual HTTP context; `failed` is reserved for sub-deleted-during-retry)
 
 ---
 
@@ -148,10 +149,10 @@
 - [x] Retry button on API failure
 - [x] Graceful loading states (spinners) on all pages
 - [x] Empty states with helpful CTAs
-- [ ] Global error boundary (catch unhandled React errors)
+- [x] Global error boundary (catch unhandled React errors)
 - [ ] Offline detection banner ("You appear to be offline")
 - [ ] Request timeout handling with user-friendly message
-- [ ] Rate limiting feedback from API
+- [ ] Rate limiting feedback from API (429 toast)
 
 ---
 
@@ -177,12 +178,15 @@
 ---
 
 ## 13. Testing & Quality
-**Status: TODO**
+**Status: PARTIAL**
 
-- [ ] Component unit tests (Jest + React Testing Library)
-- [ ] API integration tests
-- [ ] E2E tests for creation wizard flow
-- [ ] E2E tests for delete flow
+- [x] Component unit tests (Vitest + React Testing Library — 73 passing)
+- [x] Backend lib unit tests (Jest — 252 passing)
+- [x] Backend integration tests (real Postgres in CI; auth, subscriptions, organizations, invitations, password, quotas, two-factor)
+- [x] E2E tests for /login + /register render + form behaviour (Playwright)
+- [ ] E2E tests for the create-subscription wizard
+- [ ] E2E tests for the delete flow
+- [ ] E2E tests for the 2FA enrollment + login flows
 - [ ] Accessibility audit (keyboard navigation, screen reader labels, ARIA)
 
 ---
@@ -199,13 +203,30 @@
 ---
 
 ## 15. Authentication & Authorization
-**Status: TODO**
+**Status: DONE**
 
-- [ ] Login page
-- [ ] API key or JWT-based auth
-- [ ] Protected routes (redirect to login if unauthenticated)
-- [ ] User profile / settings page
-- [ ] Role-based access (admin vs read-only)
+- [x] Login page (email + password)
+- [x] Register page (creates user + first organization, becomes owner)
+- [x] Session cookie auth (HttpOnly JWT, 7-day expiry, SameSite=lax)
+- [x] API-key auth (`Authorization: Bearer ak_...`)
+- [x] Protected routes (middleware redirects unauthenticated users to /login)
+- [x] User profile / settings page
+- [x] Role-based access (owner, admin, member); only owners can demote/remove owners; never the last owner
+- [x] Multi-org support: create, switch, list members, list quotas
+- [x] Password change (Settings → Security)
+- [x] Password reset request + reset-via-token (anonymous /forgot-password + /reset-password)
+- [x] 2FA via TOTP (RFC 6238) with single-use 64-bit backup codes
+- [x] 2FA replay guard via users.last_totp_step
+- [x] 2FA Settings → Security panel: enable, verify, disable, regenerate-by-disable+enable
+- [x] Login page handles needs_2fa second-step flow (TOTP or backup code)
+- [x] Email invitation flow: create + list + revoke (Settings → Members) + anonymous /invitations/[token] accept page
+- [x] token_version invalidation: logout / password change / 2FA disable invalidate every outstanding cookie
+- [x] Per-org rate limit + per-IP auth-endpoint rate limit
+- [x] Per-org quotas (subscriptions, API keys) with advisory-locked atomic claim
+- [x] CSRF mitigation via SameSite=lax + JSON-only API
+- [x] SSRF defense on subscription URLs (private/loopback/CGNAT/IPv6 ULA blocked; inet_aton-aware)
+- [x] Webhook HMAC signing (X-AnyHook-Signature: t=...,v1=...)
+- [x] Backup-code peppering via BACKUP_CODE_PEPPER env
 
 ---
 
@@ -217,7 +238,7 @@
 | 2  | Subscription List & Management | DONE     |
 | 3  | Subscription Detail View       | DONE     |
 | 4  | Real-time Status Indicators    | DONE     |
-| 5  | Edit/Update Subscription       | TODO     |
+| 5  | Edit/Update Subscription       | DONE     |
 | 6  | Dashboard Analytics & Metrics  | DONE     |
 | 7  | Webhook Delivery Logs          | DONE     |
 | 8  | Notifications & Alerts         | TODO     |
@@ -225,8 +246,8 @@
 | 10 | Error Handling & Resilience    | PARTIAL  |
 | 11 | Bulk Operations                | TODO     |
 | 12 | Export & Import                | TODO     |
-| 13 | Testing & Quality              | TODO     |
+| 13 | Testing & Quality              | PARTIAL  |
 | 14 | Performance Optimizations      | TODO     |
-| 15 | Authentication & Authorization | TODO     |
+| 15 | Authentication & Authorization | DONE     |
 
-**Completed: 6/15 | Partial: 2/15 | Remaining: 7/15**
+**Completed: 9/15 | Partial: 3/15 | Remaining: 3/15**

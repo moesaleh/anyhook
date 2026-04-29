@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { Sidebar } from "@/components/sidebar";
 import { ErrorBoundary } from "@/components/error-boundary";
 import { OfflineBanner } from "@/components/offline-banner";
+import { DlqAlert } from "@/components/dlq-alert";
 import { AuthProvider } from "@/lib/auth-context";
 import { ThemeProvider, THEME_INIT_SCRIPT } from "@/lib/theme";
 import { ToastProvider } from "@/lib/toast";
@@ -36,6 +37,7 @@ export default function RootLayout({
               <Sidebar />
               <main className="flex-1 min-h-screen overflow-auto">
                 <OfflineBanner />
+                <DlqAlert />
                 <ErrorBoundary>{children}</ErrorBoundary>
               </main>
             </AuthProvider>

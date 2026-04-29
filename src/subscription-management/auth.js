@@ -981,9 +981,18 @@ function mountAuthRoutes(
         [userId, hash, expiresAt]
       );
 
-      // If SMTP is configured, send the email and OMIT the raw token from
-      // the response. Without SMTP, fall back to returning the token so the
-      // dashboard / curl flow still works in dev.
+      // Token disclosure rules — anonymous endpoint, attacker may be the
+      // requester, so we are deliberately strict:
+      //   reason='no_transport'  : no SMTP configured (dev mode). Return
+      //                            the raw token so the dashboard / curl
+      //                            can complete the flow.
+      //   delivered=true         : email sent. OMIT the token. The user
+      //                            gets it from their inbox.
+      //   reason='smtp_error'    : SMTP configured but errored. OMIT the
+      //                            token — an attacker who can degrade
+      //                            SMTP egress would otherwise read the
+      //                            token from the response. The user
+      //                            simply retries.
       const resetUrl = `${baseUrl}/auth/password/reset?token=${encodeURIComponent(raw)}`;
       let delivery = { delivered: false, reason: 'no_transport' };
       if (email.enabled) {
@@ -998,9 +1007,10 @@ function mountAuthRoutes(
         });
       }
 
+      const includeToken = !delivery.delivered && delivery.reason === 'no_transport';
       res.status(200).json({
         message: 'If that email is registered, a reset link has been generated',
-        ...(delivery.delivered ? {} : { token: raw, expires_at: expiresAt }),
+        ...(includeToken ? { token: raw, expires_at: expiresAt } : {}),
         email_sent: delivery.delivered,
       });
     } catch (err) {
@@ -1108,8 +1118,12 @@ function mountAuthRoutes(
           ]
         );
 
-        // Try to email the invitee if SMTP is configured. On success,
-        // omit the raw token from the response (delivered via email).
+        // Same disclosure rule as /auth/password/reset-request — only
+        // return the raw token when no SMTP transport is configured (dev
+        // mode). Authenticated admin endpoint, but an attacker who has
+        // somehow stolen an admin session AND can degrade SMTP egress
+        // would otherwise harvest invite tokens from the response. On
+        // smtp_error the admin retries (creates a new invitation).
         const inviteUrl = `${baseUrl}/invitations/${raw}`;
         let delivery = { delivered: false, reason: 'no_transport' };
         if (email.enabled) {
@@ -1123,13 +1137,23 @@ function mountAuthRoutes(
           });
         }
 
+        const includeToken = !delivery.delivered && delivery.reason === 'no_transport';
+        let message;
+        if (delivery.delivered) {
+          message = 'Invitation created and emailed.';
+        } else if (delivery.reason === 'no_transport') {
+          message = 'Invitation created. Save the token — it is shown only once.';
+        } else {
+          message = 'Invitation created but email delivery failed. Revoke and retry.';
+        }
         res.status(201).json({
           ...result.rows[0],
-          ...(delivery.delivered ? {} : { token: raw }),
+          ...(includeToken ? { token: raw } : {}),
           email_sent: delivery.delivered,
-          message: delivery.delivered
-            ? 'Invitation created and emailed.'
-            : 'Invitation created. Save the token — it is shown only once.',
+          ...(delivery.reason && delivery.reason !== 'no_transport'
+            ? { delivery_error: delivery.reason }
+            : {}),
+          message,
         });
       } catch (err) {
         log.error('Create invitation failed:', err);

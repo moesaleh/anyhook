@@ -102,6 +102,10 @@ function createApp({
   rateLimit,
   authRateLimit,
   requireAdminKey,
+  // Optional: inject a pre-built email transport. If omitted, the SMTP
+  // env vars (SMTP_HOST, etc.) are read via makeEmailTransport. Tests
+  // pass a fake to exercise delivered/no_transport/smtp_error branches.
+  emailTransport,
 }) {
   const app = express();
 
@@ -170,15 +174,17 @@ function createApp({
     limit: parseInt(process.env.ORG_MAX_API_KEYS, 10) || undefined,
   });
 
-  // SMTP transport — no-op when SMTP_HOST unset (dev / tests).
-  const emailTransport = makeEmailTransport({ log });
+  // SMTP transport — no-op when SMTP_HOST unset (dev / tests). Tests
+  // can pass a pre-built `emailTransport` to simulate delivered /
+  // smtp_error / no_transport branches.
+  const transport = emailTransport || makeEmailTransport({ log });
 
   const { requireAuth } = mountAuthRoutes(app, {
     pool,
     rateLimit,
     authRateLimit,
     apiKeyQuota,
-    emailTransport,
+    emailTransport: transport,
     quotaLimits: {
       subscriptions: parseInt(process.env.ORG_MAX_SUBSCRIPTIONS, 10) || 100,
       apiKeys: parseInt(process.env.ORG_MAX_API_KEYS, 10) || 10,

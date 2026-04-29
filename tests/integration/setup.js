@@ -118,7 +118,7 @@ function noopAdmin() {
 let pool;
 let app;
 
-async function setupTestApp() {
+async function setupTestApp({ emailTransport } = {}) {
   if (!TEST_DATABASE_URL) {
     throw new Error('TEST_DATABASE_URL must be set to run integration tests');
   }
@@ -153,6 +153,7 @@ async function setupTestApp() {
     log,
     rateLimit,
     authRateLimit,
+    emailTransport,
     // Admin endpoints aren't exercised by the auth/tenancy suite; reject
     // anything that hits them so a typo can't accidentally exercise them.
     requireAdminKey: (req, res) =>
@@ -160,6 +161,39 @@ async function setupTestApp() {
   });
 
   return { app, pool };
+}
+
+/**
+ * Helper to build a fake email transport with controllable behavior.
+ *
+ *   { mode: 'no_transport' } — enabled:false (default; same as production
+ *                              when SMTP_HOST is unset).
+ *   { mode: 'delivered' }    — enabled:true; every send returns delivered:true.
+ *   { mode: 'smtp_error' }   — enabled:true; every send returns
+ *                              delivered:false, reason:'smtp_error'.
+ *
+ * The returned object also captures the calls in `.calls` for
+ * assertion. Used by the password-reset / invitations integration
+ * suites to exercise token-disclosure rules in each branch.
+ */
+function fakeEmailTransport({ mode = 'no_transport' } = {}) {
+  const calls = [];
+  const transport = {
+    enabled: mode !== 'no_transport',
+    from: 'noreply@anyhook.test',
+    calls,
+    async send(args) {
+      calls.push(args);
+      if (mode === 'delivered') {
+        return { delivered: true, messageId: `<test-${calls.length}@anyhook.test>` };
+      }
+      if (mode === 'smtp_error') {
+        return { delivered: false, reason: 'smtp_error', error: 'forced test failure' };
+      }
+      return { delivered: false, reason: 'no_transport' };
+    },
+  };
+  return transport;
 }
 
 async function teardownTestApp() {
@@ -202,5 +236,6 @@ module.exports = {
   cleanDatabase,
   describeIfPg,
   getSessionCookie,
+  fakeEmailTransport,
   TEST_DATABASE_URL,
 };

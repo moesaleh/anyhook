@@ -5,6 +5,7 @@ const {
   cleanDatabase,
   describeIfPg,
   getSessionCookie,
+  fakeEmailTransport,
 } = require('./setup');
 
 describeIfPg('password change + reset (integration)', () => {
@@ -113,6 +114,71 @@ describeIfPg('password change + reset (integration)', () => {
         .send({ email: 'PW@example.com' });
       expect(res.status).toBe(200);
       expect(res.body.token).toBeDefined();
+    });
+  });
+
+  describe('POST /auth/password/reset-request — token disclosure rules', () => {
+    // The default integration app has no email transport (== no_transport
+    // mode), so the previous suite covers that branch. These two cases
+    // mount fresh apps with the other transport modes.
+
+    let oldApp;
+
+    beforeAll(() => {
+      oldApp = global.__app__; // not actually shared; just structural
+      void oldApp;
+    });
+
+    it('omits the token when SMTP delivers successfully', async () => {
+      await teardownTestApp();
+      const transport = fakeEmailTransport({ mode: 'delivered' });
+      ({ app } = await setupTestApp({ emailTransport: transport }));
+      await cleanDatabase();
+      // Re-register since cleanDatabase wiped users.
+      const reg = await request(app)
+        .post('/auth/register')
+        .send({ email: 'ok@example.com', password: 'oldpassword123' });
+      // Re-set the outer cookie so the afterEach / following describes
+      // continue to work.
+      cookie = getSessionCookie(reg.headers['set-cookie']);
+
+      const res = await request(app)
+        .post('/auth/password/reset-request')
+        .send({ email: 'ok@example.com' });
+      expect(res.status).toBe(200);
+      expect(res.body.token).toBeUndefined();
+      expect(res.body.email_sent).toBe(true);
+      expect(transport.calls.length).toBe(1);
+      expect(transport.calls[0].to).toBe('ok@example.com');
+    });
+
+    it('omits the token when SMTP errors (anonymous-callable hardening)', async () => {
+      await teardownTestApp();
+      const transport = fakeEmailTransport({ mode: 'smtp_error' });
+      ({ app } = await setupTestApp({ emailTransport: transport }));
+      await cleanDatabase();
+      const reg = await request(app)
+        .post('/auth/register')
+        .send({ email: 'fail@example.com', password: 'oldpassword123' });
+      cookie = getSessionCookie(reg.headers['set-cookie']);
+
+      const res = await request(app)
+        .post('/auth/password/reset-request')
+        .send({ email: 'fail@example.com' });
+      expect(res.status).toBe(200);
+      // Critical security assertion: SMTP failure must NOT leak the
+      // token to the anonymous caller. An attacker who can degrade SMTP
+      // egress would otherwise harvest reset tokens via the API.
+      expect(res.body.token).toBeUndefined();
+      expect(res.body.email_sent).toBe(false);
+      expect(transport.calls.length).toBe(1);
+    });
+
+    afterAll(async () => {
+      // Restore the default (no-transport) app for any subsequent
+      // suites that might run after.
+      await teardownTestApp();
+      ({ app } = await setupTestApp());
     });
   });
 

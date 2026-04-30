@@ -31,11 +31,18 @@ export default function RootLayout({
         <script dangerouslySetInnerHTML={{ __html: THEME_INIT_SCRIPT }} />
       </head>
       <body className="min-h-full flex font-sans">
+        {/* Keyboard skip target — hidden until focused, see globals.css */}
+        <a href="#main-content" className="skip-link">
+          Skip to main content
+        </a>
         <ThemeProvider>
           <ToastProvider>
             <AuthProvider>
               <Sidebar />
-              <main className="flex-1 min-h-screen overflow-auto">
+              <main
+                id="main-content"
+                className="flex-1 min-h-screen overflow-auto"
+              >
                 <OfflineBanner />
                 <DlqAlert />
                 <ErrorBoundary>{children}</ErrorBoundary>

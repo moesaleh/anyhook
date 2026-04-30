@@ -186,6 +186,7 @@ export default function SubscriptionDetailPage() {
                 }
                 className="text-neutral-400 hover:text-neutral-600 dark:hover:text-neutral-300"
                 title="Copy ID"
+                aria-label="Copy subscription ID"
               >
                 {copied === "id" ? (
                   <Check className="h-3.5 w-3.5 text-emerald-500" />
@@ -412,6 +413,7 @@ function OverviewTab({
                     onCopy(subscription.args.endpoint_url, "endpoint")
                   }
                   className="text-neutral-400 hover:text-neutral-600 dark:hover:text-neutral-300 flex-shrink-0"
+                  aria-label="Copy endpoint URL"
                 >
                   {copied === "endpoint" ? (
                     <Check className="h-3 w-3 text-emerald-500" />
@@ -451,6 +453,7 @@ function OverviewTab({
                   onClick={() => onCopy(subscription.webhook_url, "webhook")}
                   className="text-neutral-400 hover:text-neutral-600 dark:hover:text-neutral-300 flex-shrink-0"
                   title="Copy webhook URL"
+                  aria-label="Copy webhook URL"
                 >
                   {copied === "webhook" ? (
                     <Check className="h-3 w-3 text-emerald-500" />

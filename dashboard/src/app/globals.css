@@ -37,6 +37,43 @@ html {
   scroll-behavior: smooth;
 }
 
+/*
+ * Global focus-visible style. Many ad-hoc buttons / links throughout
+ * the app don't carry their own focus-visible classes; without this
+ * the keyboard focus ring is invisible and the dashboard fails the
+ * "WCAG 2.1 Focus Visible" criterion. Targets only the keyboard-
+ * focus pseudo-class so mouse clicks don't paint a ring.
+ */
+:focus-visible {
+  outline: 2px solid #6366f1; /* indigo-500 */
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/*
+ * Skip-to-content link: visually hidden until focused, then visible
+ * at the top-left of the viewport. Lets keyboard users bypass the
+ * sidebar nav and jump straight to <main>.
+ */
+.skip-link {
+  position: absolute;
+  top: -40px;
+  left: 8px;
+  z-index: 100;
+  padding: 6px 12px;
+  background: #4f46e5; /* indigo-600 */
+  color: #fff;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 500;
+  text-decoration: none;
+  transition: top 0.2s;
+}
+
+.skip-link:focus {
+  top: 8px;
+}
+
 /* Custom scrollbar */
 ::-webkit-scrollbar {
   width: 6px;

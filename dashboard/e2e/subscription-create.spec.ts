@@ -169,26 +169,42 @@ test.describe("/subscriptions delete dialog", () => {
         body: JSON.stringify({ statuses: [], checked_at: new Date().toISOString() }),
       })
     );
-    await page.route("**/subscriptions", (route) =>
-      route.fulfill({
+    // Backend now returns one of two shapes: a flat array (legacy) or
+    // a paginated envelope when `?page=` is present. The list page
+    // uses the paginated form; the dashboard home still uses the
+    // flat array. Distinguish by URL query.
+    const sub = {
+      subscription_id: "11111111-2222-3333-4444-555555555555",
+      organization_id: FAKE_ORG.id,
+      connection_type: "graphql",
+      args: {
+        endpoint_url: "wss://api.example.com/graphql",
+        query: "subscription { x }",
+      },
+      webhook_url: "https://hooks.example.com/in",
+      status: "active",
+      created_at: new Date().toISOString(),
+    };
+    await page.route("**/subscriptions**", (route) => {
+      const url = new URL(route.request().url());
+      if (url.searchParams.has("page")) {
+        return route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({
+            subscriptions: [sub],
+            total: 1,
+            page: 1,
+            pages: 1,
+          }),
+        });
+      }
+      return route.fulfill({
         status: 200,
         contentType: "application/json",
-        body: JSON.stringify([
-          {
-            subscription_id: "11111111-2222-3333-4444-555555555555",
-            organization_id: FAKE_ORG.id,
-            connection_type: "graphql",
-            args: {
-              endpoint_url: "wss://api.example.com/graphql",
-              query: "subscription { x }",
-            },
-            webhook_url: "https://hooks.example.com/in",
-            status: "active",
-            created_at: new Date().toISOString(),
-          },
-        ]),
-      })
-    );
+        body: JSON.stringify([sub]),
+      });
+    });
   });
 
   test("confirm deletes the subscription via /unsubscribe", async ({ page }) => {

@@ -726,6 +726,36 @@ export async function fetchSubscriptions(): Promise<Subscription[]> {
   return res.json();
 }
 
+export interface SubscriptionPage {
+  subscriptions: Subscription[];
+  total: number;
+  page: number;
+  pages: number;
+}
+
+/**
+ * Paginated variant — opt into server-side paging when the org has
+ * more than a few hundred subscriptions. Backend supports an ILIKE
+ * `search` query that matches subscription_id / webhook_url /
+ * args.endpoint_url; passing an empty string is the same as no
+ * search at all.
+ */
+export async function fetchSubscriptionsPage(
+  page: number,
+  limit = 25,
+  search = ""
+): Promise<SubscriptionPage> {
+  const params = new URLSearchParams({
+    page: String(Math.max(1, page)),
+    limit: String(Math.min(100, Math.max(1, limit))),
+  });
+  if (search.trim()) params.set("search", search.trim());
+  const res = await apiFetch(`/subscriptions?${params}`);
+  checkAuth(res);
+  if (!res.ok) throw new Error("Failed to fetch subscriptions");
+  return res.json();
+}
+
 export async function fetchSubscription(id: string): Promise<Subscription> {
   const res = await apiFetch(`/subscriptions/${id}`);
   checkAuth(res);

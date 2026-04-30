@@ -1,26 +1,58 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, type ChangeEvent } from "react";
 import Link from "next/link";
-import { Plus, AlertCircle, Download, RefreshCw, Upload } from "lucide-react";
+import { useRouter, useSearchParams } from "next/navigation";
+import {
+  Plus,
+  AlertCircle,
+  ChevronLeft,
+  ChevronRight,
+  Download,
+  RefreshCw,
+  Search,
+  Upload,
+} from "lucide-react";
 import { SubscriptionTable } from "@/components/subscription-table";
 import { DeleteDialog } from "@/components/delete-dialog";
 import { EmptyState } from "@/components/empty-state";
 import { LiveIndicator } from "@/components/live-indicator";
 import { ImportDialog } from "@/components/import-dialog";
 import {
-  fetchSubscriptions,
+  fetchSubscriptionsPage,
   fetchAllStatuses,
   deleteSubscription,
 } from "@/lib/api";
-import type { Subscription } from "@/lib/api";
+import type { Subscription, SubscriptionPage } from "@/lib/api";
 import { useToast } from "@/lib/toast";
+import { useDebounced } from "@/lib/utils";
 import { downloadFile, exportAsCsv, exportAsJson } from "@/lib/export";
 
 const POLL_INTERVAL = 10000;
+const PAGE_SIZE = 25;
 
+/**
+ * Subscriptions list — server-side paginated.
+ *
+ * URL is the source of truth for `page` + `search` so the back button
+ * + sharing-a-link both work as expected. The table component still
+ * handles in-memory status filtering + sort within the current page;
+ * server-side ordering is fixed at created_at DESC.
+ *
+ * Status filter (connected/disconnected/active) lives client-side
+ * because "connected" is a Redis-cache fact, not a DB column.
+ */
 export default function SubscriptionsPage() {
-  const [subscriptions, setSubscriptions] = useState<Subscription[]>([]);
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const initialPage = Math.max(1, parseInt(searchParams.get("page") || "1", 10) || 1);
+  const initialSearch = searchParams.get("q") || "";
+
+  const [page, setPage] = useState(initialPage);
+  const [searchInput, setSearchInput] = useState(initialSearch);
+  const debouncedSearch = useDebounced(searchInput, 250);
+
+  const [data, setData] = useState<SubscriptionPage | null>(null);
   const [connectedIds, setConnectedIds] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -33,16 +65,30 @@ export default function SubscriptionsPage() {
   const [showImport, setShowImport] = useState(false);
   const toast = useToast();
 
+  // Sync page + search to URL whenever they change.
+  useEffect(() => {
+    const params = new URLSearchParams();
+    if (page > 1) params.set("page", String(page));
+    if (debouncedSearch.trim()) params.set("q", debouncedSearch.trim());
+    const qs = params.toString();
+    router.replace(qs ? `/subscriptions?${qs}` : "/subscriptions");
+  }, [page, debouncedSearch, router]);
+
+  // Reset to page 1 whenever the search term changes (settled value).
+  useEffect(() => {
+    setPage(1);
+  }, [debouncedSearch]);
+
   const loadData = useCallback(
     async (showRefresh = false) => {
       try {
         if (showRefresh) setRefreshing(true);
         setError(null);
-        const [subs, statuses] = await Promise.all([
-          fetchSubscriptions(),
+        const [pageResult, statuses] = await Promise.all([
+          fetchSubscriptionsPage(page, PAGE_SIZE, debouncedSearch),
           fetchAllStatuses().catch(() => null),
         ]);
-        setSubscriptions(subs);
+        setData(pageResult);
         if (statuses) {
           setConnectedIds(
             new Set(
@@ -60,7 +106,7 @@ export default function SubscriptionsPage() {
         setRefreshing(false);
       }
     },
-    []
+    [page, debouncedSearch]
   );
 
   useEffect(() => {
@@ -73,73 +119,8 @@ export default function SubscriptionsPage() {
     return () => clearInterval(interval);
   }, [isPolling, loadData]);
 
-  async function handleDelete(id: string) {
+  function handleDelete(id: string) {
     setDeleteTarget(id);
-  }
-
-  function timestampedFilename(ext: "json" | "csv") {
-    const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, -5);
-    return `anyhook-subscriptions-${ts}.${ext}`;
-  }
-
-  function handleExport(format: "json" | "csv") {
-    if (subscriptions.length === 0) {
-      toast.info("Nothing to export — no subscriptions in this organization");
-      return;
-    }
-    if (format === "json") {
-      downloadFile(
-        exportAsJson(subscriptions),
-        timestampedFilename("json"),
-        "application/json"
-      );
-    } else {
-      downloadFile(
-        exportAsCsv(subscriptions),
-        timestampedFilename("csv"),
-        "text/csv"
-      );
-    }
-    toast.success(
-      `Exported ${subscriptions.length} subscription${subscriptions.length === 1 ? "" : "s"}`,
-      `Format: ${format.toUpperCase()}`
-    );
-  }
-
-  async function handleBulkDelete(ids: string[]) {
-    if (ids.length === 0) return;
-    setBulkDeleting(true);
-    // Fire deletes in parallel; collect successes/failures so partial
-    // outcomes still update the UI cleanly.
-    const results = await Promise.allSettled(ids.map((id) => deleteSubscription(id)));
-    const succeeded: string[] = [];
-    let failed = 0;
-    results.forEach((r, i) => {
-      if (r.status === "fulfilled") succeeded.push(ids[i]);
-      else failed++;
-    });
-    if (succeeded.length > 0) {
-      const succeededSet = new Set(succeeded);
-      setSubscriptions((prev) =>
-        prev.filter((s) => !succeededSet.has(s.subscription_id))
-      );
-      setConnectedIds((prev) => {
-        const next = new Set(prev);
-        succeededSet.forEach((id) => next.delete(id));
-        return next;
-      });
-    }
-    if (failed === 0) {
-      toast.success(`Deleted ${succeeded.length} subscription${succeeded.length === 1 ? "" : "s"}`);
-    } else if (succeeded.length === 0) {
-      toast.error(`Failed to delete ${failed} subscription${failed === 1 ? "" : "s"}`);
-    } else {
-      toast.error(
-        `Deleted ${succeeded.length} of ${ids.length} subscriptions`,
-        `${failed} delete${failed === 1 ? "" : "s"} failed.`
-      );
-    }
-    setBulkDeleting(false);
   }
 
   async function confirmDelete() {
@@ -148,15 +129,9 @@ export default function SubscriptionsPage() {
     const idShort = deleteTarget.slice(0, 8);
     try {
       await deleteSubscription(deleteTarget);
-      setSubscriptions((prev) =>
-        prev.filter((s) => s.subscription_id !== deleteTarget)
-      );
-      setConnectedIds((prev) => {
-        const next = new Set(prev);
-        next.delete(deleteTarget);
-        return next;
-      });
       toast.success(`Subscription ${idShort}… deleted`);
+      // Refresh to pick up the new total / page contents.
+      await loadData(true);
     } catch (err) {
       toast.error(
         "Failed to delete subscription",
@@ -168,14 +143,74 @@ export default function SubscriptionsPage() {
     }
   }
 
+  async function handleBulkDelete(ids: string[]) {
+    if (ids.length === 0) return;
+    setBulkDeleting(true);
+    const results = await Promise.allSettled(ids.map((id) => deleteSubscription(id)));
+    const succeeded = results.filter((r) => r.status === "fulfilled").length;
+    const failed = ids.length - succeeded;
+    if (failed === 0) {
+      toast.success(`Deleted ${succeeded} subscription${succeeded === 1 ? "" : "s"}`);
+    } else if (succeeded === 0) {
+      toast.error(`Failed to delete ${failed} subscription${failed === 1 ? "" : "s"}`);
+    } else {
+      toast.error(
+        `Deleted ${succeeded} of ${ids.length} subscriptions`,
+        `${failed} delete${failed === 1 ? "" : "s"} failed.`
+      );
+    }
+    setBulkDeleting(false);
+    await loadData(true);
+  }
+
+  function timestampedFilename(ext: "json" | "csv") {
+    const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, -5);
+    return `anyhook-subscriptions-${ts}.${ext}`;
+  }
+
+  /**
+   * Export operates on the CURRENT PAGE only — the API is paginated
+   * server-side and we don't want to silently fetch all pages on a
+   * single Export click. For an org-wide export, the operator should
+   * use the API directly with a high `?limit=`.
+   */
+  function handleExport(format: "json" | "csv") {
+    if (!data || data.subscriptions.length === 0) {
+      toast.info("Nothing to export on this page");
+      return;
+    }
+    if (format === "json") {
+      downloadFile(
+        exportAsJson(data.subscriptions),
+        timestampedFilename("json"),
+        "application/json"
+      );
+    } else {
+      downloadFile(
+        exportAsCsv(data.subscriptions),
+        timestampedFilename("csv"),
+        "text/csv"
+      );
+    }
+    toast.success(
+      `Exported ${data.subscriptions.length} subscription${data.subscriptions.length === 1 ? "" : "s"}`,
+      `Format: ${format.toUpperCase()} · current page only`
+    );
+  }
+
+  const total = data?.total ?? 0;
+  const pages = data?.pages ?? 1;
+  const subscriptions: Subscription[] = data?.subscriptions ?? [];
+
   return (
     <div className="p-6 lg:p-8 max-w-7xl mx-auto">
-      {/* Header */}
       <div className="flex items-center justify-between mb-6">
         <div>
           <h1 className="text-2xl font-bold tracking-tight">Subscriptions</h1>
           <p className="text-sm text-neutral-500 mt-1">
-            Manage all your webhook subscriptions
+            {total > 0
+              ? `${total} total · page ${page} of ${pages}`
+              : "Manage all your webhook subscriptions"}
           </p>
         </div>
         <div className="flex items-center gap-3">
@@ -183,8 +218,7 @@ export default function SubscriptionsPage() {
             onClick={() => setShowImport(true)}
             className="inline-flex items-center gap-2 rounded-lg border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-950 px-3 py-2.5 text-sm font-medium hover:bg-neutral-50 dark:hover:bg-neutral-900 transition-colors"
           >
-            <Upload className="h-4 w-4" />
-            Import
+            <Upload className="h-4 w-4" /> Import
           </button>
           <ExportMenu
             disabled={subscriptions.length === 0}
@@ -195,9 +229,7 @@ export default function SubscriptionsPage() {
             disabled={refreshing}
             className="inline-flex items-center gap-2 rounded-lg border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-950 px-3 py-2.5 text-sm font-medium hover:bg-neutral-50 dark:hover:bg-neutral-900 transition-colors"
           >
-            <RefreshCw
-              className={`h-4 w-4 ${refreshing ? "animate-spin" : ""}`}
-            />
+            <RefreshCw className={`h-4 w-4 ${refreshing ? "animate-spin" : ""}`} />
             Refresh
           </button>
           <Link
@@ -210,7 +242,19 @@ export default function SubscriptionsPage() {
         </div>
       </div>
 
-      {/* Live Indicator */}
+      {/* Server-side search bar */}
+      <div className="mb-4 relative">
+        <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-neutral-400" />
+        <input
+          type="text"
+          value={searchInput}
+          onChange={(e: ChangeEvent<HTMLInputElement>) => setSearchInput(e.target.value)}
+          placeholder="Search by ID, webhook URL, or endpoint..."
+          aria-label="Search subscriptions"
+          className="w-full rounded-lg border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-950 pl-9 pr-4 py-2 text-sm placeholder:text-neutral-400 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+        />
+      </div>
+
       <div className="mb-6">
         <LiveIndicator
           lastUpdated={lastUpdated}
@@ -234,16 +278,53 @@ export default function SubscriptionsPage() {
           </div>
         </div>
       ) : subscriptions.length === 0 && !error ? (
-        <EmptyState />
+        debouncedSearch.trim() ? (
+          <div className="rounded-xl border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-950 p-12 text-center text-sm text-neutral-500">
+            No subscriptions match <span className="font-mono">{debouncedSearch}</span>.
+          </div>
+        ) : (
+          <EmptyState />
+        )
       ) : (
-        <SubscriptionTable
-          subscriptions={subscriptions}
-          connectedIds={connectedIds}
-          onDelete={handleDelete}
-          deleting={deleting}
-          onBulkDelete={handleBulkDelete}
-          bulkDeleting={bulkDeleting}
-        />
+        <>
+          <SubscriptionTable
+            subscriptions={subscriptions}
+            connectedIds={connectedIds}
+            onDelete={handleDelete}
+            deleting={deleting}
+            onBulkDelete={handleBulkDelete}
+            bulkDeleting={bulkDeleting}
+          />
+
+          {/* Server-side pagination footer */}
+          {pages > 1 && (
+            <div className="flex items-center justify-between mt-4 text-sm text-neutral-500">
+              <span>
+                Showing {(page - 1) * PAGE_SIZE + 1}–
+                {Math.min(page * PAGE_SIZE, total)} of {total}
+              </span>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => setPage((p) => Math.max(1, p - 1))}
+                  disabled={page === 1}
+                  className="inline-flex items-center gap-1 rounded-lg border border-neutral-200 dark:border-neutral-800 px-3 py-1.5 text-sm hover:bg-neutral-50 dark:hover:bg-neutral-900 disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  <ChevronLeft className="h-4 w-4" /> Prev
+                </button>
+                <span aria-live="polite">
+                  Page {page} of {pages}
+                </span>
+                <button
+                  onClick={() => setPage((p) => Math.min(pages, p + 1))}
+                  disabled={page === pages}
+                  className="inline-flex items-center gap-1 rounded-lg border border-neutral-200 dark:border-neutral-800 px-3 py-1.5 text-sm hover:bg-neutral-50 dark:hover:bg-neutral-900 disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  Next <ChevronRight className="h-4 w-4" />
+                </button>
+              </div>
+            </div>
+          )}
+        </>
       )}
 
       <DeleteDialog
@@ -263,10 +344,6 @@ export default function SubscriptionsPage() {
   );
 }
 
-/**
- * Tiny dropdown for the JSON / CSV export choice. Closes on outside
- * click + Escape. No third-party menu lib.
- */
 function ExportMenu({
   disabled,
   onExport,

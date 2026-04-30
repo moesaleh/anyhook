@@ -183,7 +183,12 @@ paths:
   # ---- Service ---------------------------------------------------------------
   /health:
     get:
-      summary: Liveness + dependency check
+      summary: Readiness probe — checks downstream deps
+      description: |
+        Returns 200 with `{status: ok}` only when Postgres + Redis are
+        reachable. Returns 503 with `{status: degraded}` otherwise. Use
+        this for load-balancer readiness checks and for the dashboard's
+        ServiceHealth panel.
       security: []
       responses:
         '200':
@@ -201,6 +206,26 @@ paths:
                       postgres: { type: string, enum: [connected, disconnected] }
                       redis: { type: string, enum: [connected, disconnected] }
         '503': { description: Postgres or Redis unreachable }
+
+  /health/live:
+    get:
+      summary: Liveness probe — process responsiveness only
+      description: |
+        Always returns 200 as long as the Express event loop can answer.
+        Doesn't touch Postgres / Redis, so a transient dep blip won't
+        cause a container-orchestrator liveness check to restart the
+        process. docker-compose's container healthcheck targets this
+        endpoint.
+      security: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [ok] }
+                  timestamp: { type: string, format: date-time }
 
   # /metrics is no longer served on the public API port. It moved to the
   # internal METRICS_PORT (default 9090) for all three services so that

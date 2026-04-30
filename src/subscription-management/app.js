@@ -216,7 +216,20 @@ function createApp({
   // leaked route names + latency histograms to anyone who reached the API
   // host. See docs/openapi.yaml + .env.example for the new setup.
 
-  // Health check
+  // Liveness probe — does the process answer? Doesn't probe deps.
+  // Used by docker-compose's healthcheck so a Postgres/Redis blip
+  // doesn't cascade the entire stack to "unhealthy" + restart loops.
+  // (Container orchestrators want liveness ≠ readiness for exactly
+  // this reason: restart-on-liveness, drop-from-LB-on-readiness.)
+  app.get('/health/live', (req, res) => {
+    res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
+  });
+
+  // Readiness probe — checks downstream deps. The dashboard's
+  // ServiceHealth panel hits this so users see real connectivity
+  // status. Returns 503 (degraded) when any dep is down so a load
+  // balancer / readiness probe pulls the pod from rotation while
+  // leaving the container running for liveness purposes.
   app.get('/health', async (req, res) => {
     const health = { status: 'ok', timestamp: new Date().toISOString(), services: {} };
     try {

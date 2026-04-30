@@ -1,0 +1,211 @@
+# Prometheus alerting rules for AnyHook.
+#
+# Drop this file in your prometheus.yml's `rule_files:` list:
+#
+#   rule_files:
+#     - /etc/prometheus/anyhook/alerts.yml
+#
+# Each alert maps to a runbook entry in docs/RUNBOOK.md. The labels
+# block carries severity (page / ticket / info) so an Alertmanager
+# route can split paging vs ticketing destinations.
+
+groups:
+  - name: anyhook.api
+    interval: 30s
+    rules:
+      - alert: AnyHookAPIDown
+        expr: up{job=~"anyhook-subscription-management"} == 0
+        for: 2m
+        labels:
+          severity: page
+          service: subscription-management
+        annotations:
+          summary: "subscription-management is down"
+          description: |
+            The subscription-management API has been unreachable for >2m.
+            Check container status, /health/live (no-deps liveness),
+            and /health (deps readiness). Postgres or Redis blips do
+            NOT trigger this alert any more (commit d43b6bc split
+            liveness from readiness).
+          runbook: "docs/RUNBOOK.md#anyhook-api-down"
+
+      - alert: AnyHookAPILatencyHigh
+        # p95 of http_request_duration_seconds across all routes
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (
+              rate(http_request_duration_seconds_bucket{job="anyhook-subscription-management"}[5m])
+            )
+          ) > 2
+        for: 10m
+        labels:
+          severity: ticket
+          service: subscription-management
+        annotations:
+          summary: "Subscription API p95 latency >2s for 10m"
+          description: |
+            Sustained tail latency on the API. Likely Postgres pressure
+            (slow query, lock contention, IOPS throttling) or Redis
+            saturation. Inspect pg_stat_activity + Redis SLOWLOG.
+          runbook: "docs/RUNBOOK.md#anyhook-api-latency-high"
+
+      - alert: AnyHookAPIErrorRate
+        expr: |
+          sum(
+            rate(http_request_duration_seconds_count{job="anyhook-subscription-management",status_code=~"5.."}[5m])
+          )
+          /
+          sum(
+            rate(http_request_duration_seconds_count{job="anyhook-subscription-management"}[5m])
+          )
+          > 0.05
+        for: 5m
+        labels:
+          severity: page
+          service: subscription-management
+        annotations:
+          summary: "API 5xx rate >5% for 5m"
+          description: |
+            Sustained 5xx rate. Most often: Kafka producer failures
+            (now mitigated by the outbox commit 12f1185 — but a stuck
+            outbox can still cause downstream pain), DB pool exhaustion,
+            or a regression in a hot handler.
+          runbook: "docs/RUNBOOK.md#anyhook-api-error-rate"
+
+  - name: anyhook.dispatcher
+    interval: 30s
+    rules:
+      - alert: AnyHookDispatcherDown
+        expr: up{job="anyhook-webhook-dispatcher"} == 0
+        for: 2m
+        labels:
+          severity: page
+          service: webhook-dispatcher
+        annotations:
+          summary: "webhook-dispatcher is down"
+          description: |
+            The webhook-dispatcher container is not scraping. Webhook
+            deliveries, the retry queue drainer, the outbox drainer,
+            and the notification retry poller all live in this process
+            — every minute it's down means events buffer in Kafka and
+            DLQ alerts go silent.
+          runbook: "docs/RUNBOOK.md#anyhook-dispatcher-down"
+
+      - alert: AnyHookOutboxBacklogGrowing
+        # The outbox is meant to drain in seconds. A growing backlog
+        # means producer.send is failing or the dispatcher is too slow.
+        expr: |
+          (
+            count_over_time(
+              outbox_pending_total{job="anyhook-webhook-dispatcher"}[5m]
+            ) > 0
+          )
+          and
+          (
+            outbox_pending_total{job="anyhook-webhook-dispatcher"} > 100
+          )
+        for: 10m
+        labels:
+          severity: page
+          service: webhook-dispatcher
+        annotations:
+          summary: "Outbox backlog >100 rows for 10m"
+          description: |
+            The outbox_events drainer is falling behind. Connector
+            won't see subscription_events / unsubscribe_events /
+            update_events for new rows until the drainer catches up.
+            Check: Kafka broker reachability, dispatcher pod count vs
+            partition count, OUTBOX_BATCH_SIZE.
+          runbook: "docs/RUNBOOK.md#anyhook-outbox-backlog"
+
+      - alert: AnyHookWebhookFailureRate
+        # Window: 10m. >50% failure rate is "something systematically
+        # broken" not "one flaky receiver".
+        expr: |
+          sum(
+            rate(webhook_deliveries_total{status=~"failed|dlq"}[10m])
+          )
+          /
+          sum(
+            rate(webhook_deliveries_total[10m])
+          )
+          > 0.5
+        for: 10m
+        labels:
+          severity: ticket
+          service: webhook-dispatcher
+        annotations:
+          summary: "Webhook delivery failure rate >50% for 10m"
+          description: |
+            Half the org's webhooks are failing. Could be a single bad
+            receiver dragging the average (check by-subscription
+            breakdown in delivery_events) or a network egress issue.
+          runbook: "docs/RUNBOOK.md#anyhook-webhook-failures"
+
+      - alert: AnyHookRetryQueueGrowing
+        expr: webhook_pending_retries{job="anyhook-webhook-dispatcher"} > 1000
+        for: 15m
+        labels:
+          severity: ticket
+          service: webhook-dispatcher
+        annotations:
+          summary: "Retry queue >1000 rows for 15m"
+          description: |
+            Sustained retry-queue growth. Likely a popular subscription
+            with a permanently-failing receiver; the queue caps each
+            event at 6 retries over 24h, so >1000 means a high-volume
+            ingest is hitting failed deliveries.
+          runbook: "docs/RUNBOOK.md#anyhook-retry-queue-growing"
+
+  - name: anyhook.connector
+    interval: 30s
+    rules:
+      - alert: AnyHookConnectorDown
+        expr: up{job="anyhook-subscription-connector"} == 0
+        for: 2m
+        labels:
+          severity: page
+          service: subscription-connector
+        annotations:
+          summary: "subscription-connector is down"
+          description: |
+            No subscription_events / update_events / unsubscribe_events
+            are being processed. New subscriptions won't open and
+            updates won't apply. Source-side (GraphQL/WebSocket)
+            connections established by the down pod are dead too.
+          runbook: "docs/RUNBOOK.md#anyhook-connector-down"
+
+      - alert: AnyHookConnectorEventErrors
+        expr: |
+          sum(rate(connector_subscription_events_total{outcome="error"}[10m]))
+          /
+          sum(rate(connector_subscription_events_total[10m]))
+          > 0.1
+        for: 10m
+        labels:
+          severity: ticket
+          service: subscription-connector
+        annotations:
+          summary: "Connector handler error rate >10% for 10m"
+          description: |
+            More than 10% of subscription_events / update_events /
+            unsubscribe_events are erroring at handle time. Check the
+            log for the failing topic + subscription_id.
+          runbook: "docs/RUNBOOK.md#anyhook-connector-event-errors"
+
+  - name: anyhook.deps
+    interval: 30s
+    rules:
+      - alert: AnyHookEventLoopLagHigh
+        expr: |
+          nodejs_eventloop_lag_p99_seconds{job=~"anyhook-.*"} > 0.5
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Node.js event-loop lag p99 >500ms"
+          description: |
+            A worker is starving the event loop. CPU-bound work or
+            sync I/O somewhere; profile to find the offending call.
+          runbook: "docs/RUNBOOK.md#anyhook-event-loop-lag"

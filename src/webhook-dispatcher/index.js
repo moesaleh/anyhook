@@ -31,6 +31,16 @@ const pendingRetriesGauge = new promClient.Gauge({
   name: 'webhook_pending_retries',
   help: 'Current size of the pending_retries queue',
 });
+const outboxPendingGauge = new promClient.Gauge({
+  name: 'outbox_pending_total',
+  help: 'Outbox rows pending publish to Kafka, grouped by topic',
+  labelNames: ['topic'],
+});
+const notificationAttemptsGauge = new promClient.Gauge({
+  name: 'notification_attempts_pending_total',
+  help: 'notification_attempts rows pending or in retry, grouped by status',
+  labelNames: ['status'],
+});
 
 function parseBrokers(envValue) {
   return (envValue || 'localhost:9092')
@@ -779,6 +789,41 @@ async function pollOutbox() {
       [String(OUTBOX_LOCK_TIMEOUT_MS)]
     )
     .catch(err => log.error('Outbox stale-lock sweep failed:', err.message));
+
+  // Update the per-topic backlog gauge. Cheap GROUP BY; runs every
+  // poll cycle so the alert (outbox_pending_total > 100) sees fresh
+  // data. Eventual consistency is fine for a metric.
+  pool
+    .query(
+      `SELECT topic, COUNT(*)::int AS n
+       FROM outbox_events
+       WHERE delivered_at IS NULL
+       GROUP BY topic`
+    )
+    .then(r => {
+      outboxPendingGauge.reset();
+      for (const row of r.rows) {
+        outboxPendingGauge.set({ topic: row.topic }, row.n);
+      }
+    })
+    .catch(() => {});
+
+  // Same for notification_attempts — surfaces the "alerts pending
+  // retry" signal that the dashboard / alerts can use.
+  pool
+    .query(
+      `SELECT status, COUNT(*)::int AS n
+       FROM notification_attempts
+       WHERE status IN ('pending', 'failed')
+       GROUP BY status`
+    )
+    .then(r => {
+      notificationAttemptsGauge.reset();
+      for (const row of r.rows) {
+        notificationAttemptsGauge.set({ status: row.status }, row.n);
+      }
+    })
+    .catch(() => {});
 
   let claimed;
   try {

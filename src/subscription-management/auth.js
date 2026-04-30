@@ -41,6 +41,7 @@ const {
 } = require('../lib/password-reset');
 const { slugify } = require('../lib/slug');
 const { encrypt: encryptSecret, decrypt: decryptSecret } = require('../lib/envelope');
+const { isValidUrl } = require('../lib/url-validation');
 
 const log = createLogger('auth');
 
@@ -53,24 +54,20 @@ const log = createLogger('auth');
  */
 async function readTotpSecret(pool, userId, storedValue) {
   if (!storedValue) return { plaintext: null, persistRotation: () => {} };
-  let plaintext;
-  let neededRotation;
-  try {
-    ({ plaintext, neededRotation } = decryptSecret(storedValue));
-  } catch (err) {
-    // Tampered or undecryptable — surface to the caller.
-    throw err;
-  }
+  // decryptSecret throws on tampered / undecryptable data — let it
+  // bubble; the caller treats that as a bad-code outcome.
+  const { plaintext, neededRotation } = decryptSecret(storedValue);
   const persistRotation = async () => {
     if (!neededRotation) return;
     try {
       const reEncrypted = encryptSecret(plaintext);
       // Race-tolerant: only update if the value still matches what we
       // read. Avoids clobbering a fresh enrollment that landed since.
-      await pool.query(
-        'UPDATE users SET totp_secret = $1 WHERE id = $2 AND totp_secret = $3',
-        [reEncrypted, userId, storedValue]
-      );
+      await pool.query('UPDATE users SET totp_secret = $1 WHERE id = $2 AND totp_secret = $3', [
+        reEncrypted,
+        userId,
+        storedValue,
+      ]);
     } catch (e) {
       log.error('Failed to persist re-encrypted TOTP secret', e.message);
     }
@@ -1023,6 +1020,177 @@ function mountAuthRoutes(
         res.status(500).json({ error: 'Remove member failed' });
       } finally {
         client.release();
+      }
+    }
+  );
+
+  // --- Notification preferences ---
+  //
+  // Owner/admin manages email + Slack-webhook destinations for org-
+  // level alerts. The webhook-dispatcher fans out DLQ events to each
+  // enabled preference via lib/notifications.js.
+
+  const VALID_NOTIFICATION_CHANNELS = ['email', 'slack'];
+  const VALID_NOTIFICATION_EVENTS = ['dlq'];
+  const EMAIL_RE = /^.+@.+\..+$/;
+
+  function validateNotificationDestination(channel, destination) {
+    if (typeof destination !== 'string' || destination.length === 0) {
+      return 'destination is required';
+    }
+    if (channel === 'email') {
+      return EMAIL_RE.test(destination) ? null : 'destination must be a valid email';
+    }
+    if (channel === 'slack') {
+      // Slack webhook URLs are public-routable HTTPS. Reuse the same
+      // SSRF-safe URL validator as webhooks (rejects private/loopback
+      // by default; ALLOW_PRIVATE_WEBHOOK_TARGETS opt-out for dev).
+      return isValidUrl(destination, { allowedProtocols: ['https:', 'http:'] })
+        ? null
+        : 'destination must be a public https URL';
+    }
+    return 'unknown channel';
+  }
+
+  // GET /organizations/current/notifications
+  app.get('/organizations/current/notifications', requireAuth, rl, async (req, res) => {
+    try {
+      const r = await pool.query(
+        `SELECT id, channel, destination, events, enabled, created_at, updated_at
+         FROM notification_preferences
+         WHERE organization_id = $1
+         ORDER BY created_at DESC`,
+        [req.auth.organizationId]
+      );
+      res.status(200).json(r.rows);
+    } catch (err) {
+      log.error('List notification preferences failed:', err);
+      res.status(500).json({ error: 'List notification preferences failed' });
+    }
+  });
+
+  // POST /organizations/current/notifications
+  app.post(
+    '/organizations/current/notifications',
+    requireAuth,
+    rl,
+    requireRole('owner', 'admin'),
+    async (req, res) => {
+      const { channel, destination, events, enabled } = req.body || {};
+      if (!VALID_NOTIFICATION_CHANNELS.includes(channel)) {
+        return res
+          .status(400)
+          .json({ error: `channel must be one of: ${VALID_NOTIFICATION_CHANNELS.join(', ')}` });
+      }
+      const destErr = validateNotificationDestination(channel, destination);
+      if (destErr) return res.status(400).json({ error: destErr });
+      const evList = Array.isArray(events) && events.length > 0 ? events : ['dlq'];
+      for (const e of evList) {
+        if (!VALID_NOTIFICATION_EVENTS.includes(e)) {
+          return res.status(400).json({ error: `unknown event: ${e}` });
+        }
+      }
+      try {
+        const r = await pool.query(
+          `INSERT INTO notification_preferences
+             (organization_id, channel, destination, events, enabled, created_by_user_id)
+           VALUES ($1, $2, $3, $4, $5, $6)
+           RETURNING id, channel, destination, events, enabled, created_at, updated_at`,
+          [
+            req.auth.organizationId,
+            channel,
+            destination,
+            evList,
+            enabled !== false,
+            req.auth.userId,
+          ]
+        );
+        res.status(201).json(r.rows[0]);
+      } catch (err) {
+        log.error('Create notification preference failed:', err);
+        res.status(500).json({ error: 'Create notification preference failed' });
+      }
+    }
+  );
+
+  // PUT /organizations/current/notifications/:id — toggle enabled or
+  // change destination. channel is immutable (delete + recreate).
+  app.put(
+    '/organizations/current/notifications/:id',
+    requireAuth,
+    rl,
+    requireRole('owner', 'admin'),
+    async (req, res) => {
+      const { destination, events, enabled } = req.body || {};
+      // Look up the existing row to validate destination against its channel.
+      const existing = await pool.query(
+        `SELECT channel FROM notification_preferences
+         WHERE id = $1 AND organization_id = $2`,
+        [req.params.id, req.auth.organizationId]
+      );
+      if (existing.rowCount === 0) {
+        return res.status(404).json({ error: 'Notification preference not found' });
+      }
+      const channel = existing.rows[0].channel;
+      if (destination !== undefined) {
+        const destErr = validateNotificationDestination(channel, destination);
+        if (destErr) return res.status(400).json({ error: destErr });
+      }
+      if (events !== undefined) {
+        if (!Array.isArray(events) || events.length === 0) {
+          return res.status(400).json({ error: 'events must be a non-empty array' });
+        }
+        for (const e of events) {
+          if (!VALID_NOTIFICATION_EVENTS.includes(e)) {
+            return res.status(400).json({ error: `unknown event: ${e}` });
+          }
+        }
+      }
+      try {
+        const r = await pool.query(
+          `UPDATE notification_preferences
+           SET destination = COALESCE($1, destination),
+               events = COALESCE($2, events),
+               enabled = COALESCE($3, enabled),
+               updated_at = NOW()
+           WHERE id = $4 AND organization_id = $5
+           RETURNING id, channel, destination, events, enabled, created_at, updated_at`,
+          [
+            destination !== undefined ? destination : null,
+            events !== undefined ? events : null,
+            enabled !== undefined ? enabled : null,
+            req.params.id,
+            req.auth.organizationId,
+          ]
+        );
+        res.status(200).json(r.rows[0]);
+      } catch (err) {
+        log.error('Update notification preference failed:', err);
+        res.status(500).json({ error: 'Update notification preference failed' });
+      }
+    }
+  );
+
+  // DELETE /organizations/current/notifications/:id
+  app.delete(
+    '/organizations/current/notifications/:id',
+    requireAuth,
+    rl,
+    requireRole('owner', 'admin'),
+    async (req, res) => {
+      try {
+        const r = await pool.query(
+          `DELETE FROM notification_preferences
+           WHERE id = $1 AND organization_id = $2`,
+          [req.params.id, req.auth.organizationId]
+        );
+        if (r.rowCount === 0) {
+          return res.status(404).json({ error: 'Notification preference not found' });
+        }
+        res.status(200).json({ message: 'Notification preference deleted' });
+      } catch (err) {
+        log.error('Delete notification preference failed:', err);
+        res.status(500).json({ error: 'Delete notification preference failed' });
       }
     }
   );

@@ -31,6 +31,7 @@ import { cn, formatDate } from "@/lib/utils";
 import { TwoFactorPanel } from "@/components/two-factor-panel";
 import { ChangePasswordForm } from "@/components/change-password-form";
 import { InvitationsPanel } from "@/components/invitations-panel";
+import { NotificationsPanel } from "@/components/notifications-panel";
 
 export default function SettingsPage() {
   const { user, organization, organizations, refresh } = useAuth();
@@ -87,6 +88,7 @@ export default function SettingsPage() {
         <div className="space-y-6">
           <ChangePasswordForm />
           <TwoFactorPanel />
+          <NotificationsPanel />
         </div>
       )}
     </div>

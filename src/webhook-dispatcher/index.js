@@ -10,6 +10,8 @@ const { createLogger } = require('../lib/logger');
 const { startMetricsServer } = require('../lib/metrics-server');
 const { signRequest } = require('../lib/webhook-signature');
 const { subscriptionCacheKey } = require('../lib/subscription-cache');
+const { dispatchNotification } = require('../lib/notifications');
+const { makeEmailTransport } = require('../lib/email');
 
 const log = createLogger('webhook-dispatcher');
 
@@ -55,6 +57,11 @@ const pool = new Pool({
 
 // Internal HTTP for /metrics + /health on METRICS_PORT (default 9090).
 const metricsServer = startMetricsServer({ logger: log });
+
+// Email transport for DLQ notifications. Reads SMTP_* env at startup;
+// no-op in dev where SMTP_HOST is unset. Slack notifications go via
+// axios direct so they don't depend on this transport.
+const emailTransport = makeEmailTransport({ log });
 
 // Connect Redis + PG, start the retry poller, then connect Kafka clients.
 redisClient.on('error', err => log.error('Redis Client Error', err));
@@ -675,6 +682,18 @@ async function sendToDLQ(subscriptionId, organizationId, webhookUrl, data, event
   } catch (err) {
     log.error('Error sending to Dead Letter Queue (DLQ)', err);
   }
+  // Out-of-band notifications (email / Slack) for any prefs the org
+  // has registered. Best-effort — failures are logged inside the
+  // dispatcher and don't propagate.
+  dispatchNotification({
+    pool,
+    emailTransport,
+    organizationId,
+    eventName: 'dlq',
+    payload: { subscriptionId, webhookUrl, eventId },
+  }).catch(err => {
+    log.error('Notification dispatch threw:', err.message);
+  });
 }
 
 // Graceful shutdown — stop the retry poller, disconnect kafkajs clients,

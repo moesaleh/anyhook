@@ -519,6 +519,71 @@ export async function removeOrgMember(userId: string): Promise<void> {
   }
 }
 
+/* --- Notification preferences --- */
+
+export type NotificationChannel = "email" | "slack";
+
+export interface NotificationPreference {
+  id: string;
+  channel: NotificationChannel;
+  destination: string;
+  events: string[];
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export async function fetchNotifications(): Promise<NotificationPreference[]> {
+  const res = await apiFetch("/organizations/current/notifications");
+  checkAuth(res);
+  if (!res.ok) throw new Error("Failed to load notifications");
+  return res.json();
+}
+
+export async function createNotification(data: {
+  channel: NotificationChannel;
+  destination: string;
+  events?: string[];
+  enabled?: boolean;
+}): Promise<NotificationPreference> {
+  const res = await apiFetch("/organizations/current/notifications", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || "Create notification failed");
+  }
+  return res.json();
+}
+
+export async function updateNotification(
+  id: string,
+  data: { destination?: string; events?: string[]; enabled?: boolean }
+): Promise<NotificationPreference> {
+  const res = await apiFetch(`/organizations/current/notifications/${id}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || "Update notification failed");
+  }
+  return res.json();
+}
+
+export async function deleteNotification(id: string): Promise<void> {
+  const res = await apiFetch(`/organizations/current/notifications/${id}`, {
+    method: "DELETE",
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || "Delete notification failed");
+  }
+}
+
 /* --- Invitations --- */
 
 export interface Invitation {

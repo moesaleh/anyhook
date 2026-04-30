@@ -21,13 +21,14 @@
     "react-dom": "^19.2.5"
   },
   "devDependencies": {
+    "@axe-core/playwright": "^4.11.2",
+    "@playwright/test": "^1.48.0",
     "@tailwindcss/postcss": "^4.2.4",
+    "@testing-library/jest-dom": "^6.5.0",
+    "@testing-library/react": "^16.0.1",
     "@types/node": "^22.10.7",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
-    "@playwright/test": "^1.48.0",
-    "@testing-library/jest-dom": "^6.5.0",
-    "@testing-library/react": "^16.0.1",
     "@vitest/coverage-v8": "^2.1.0",
     "eslint": "^9.36.0",
     "eslint-config-next": "^16.2.4",

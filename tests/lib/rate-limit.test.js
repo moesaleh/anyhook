@@ -1,4 +1,16 @@
-const { makeRateLimit, DEFAULTS, defaultKeyFn, ipKeyFn } = require('../../src/lib/rate-limit');
+const {
+  makeRateLimit,
+  DEFAULTS,
+  defaultKeyFn,
+  ipKeyFn,
+  _resetOverrideCache,
+} = require('../../src/lib/rate-limit');
+
+beforeEach(() => {
+  // Each test starts with an empty override cache so cached values
+  // from a prior test can't leak across.
+  _resetOverrideCache();
+});
 
 /**
  * In-memory mock Redis. Just enough surface for the rate-limit module:
@@ -230,6 +242,78 @@ describe('rate-limit middleware', () => {
     });
     expect(nextCalled).toBe(true);
     expect(Object.keys(redis.counts).length).toBe(0);
+  });
+});
+
+describe('per-org override cache', () => {
+  function mockPoolWithOverride(rows) {
+    let calls = 0;
+    return {
+      get calls() {
+        return calls;
+      },
+      async query() {
+        calls++;
+        // Real pg.Result includes rowCount; the middleware branches on it.
+        return { rows, rowCount: rows.length };
+      },
+    };
+  }
+
+  it('caches the override row across requests for the same org', async () => {
+    const redis = mockRedis();
+    const pool = mockPoolWithOverride([
+      { rate_limit_requests: 5, rate_limit_window_sec: 60 },
+    ]);
+    const mw = makeRateLimit({ redisClient: redis, limit: 999, windowSec: 60, pool });
+
+    await mw(mockReq('org-1'), mockRes(), () => {});
+    await mw(mockReq('org-1'), mockRes(), () => {});
+    await mw(mockReq('org-1'), mockRes(), () => {});
+
+    // Three requests, one PG roundtrip thanks to the cache.
+    expect(pool.calls).toBe(1);
+  });
+
+  it('caches the negative result (no override) too', async () => {
+    const redis = mockRedis();
+    const pool = mockPoolWithOverride([]); // 0 rows
+    const mw = makeRateLimit({ redisClient: redis, limit: 999, windowSec: 60, pool });
+
+    await mw(mockReq('org-1'), mockRes(), () => {});
+    await mw(mockReq('org-1'), mockRes(), () => {});
+    expect(pool.calls).toBe(1);
+  });
+
+  it('isolates the cache per org', async () => {
+    const redis = mockRedis();
+    const pool = mockPoolWithOverride([{ rate_limit_requests: 7, rate_limit_window_sec: 30 }]);
+    const mw = makeRateLimit({ redisClient: redis, limit: 999, windowSec: 60, pool });
+
+    await mw(mockReq('org-1'), mockRes(), () => {});
+    await mw(mockReq('org-2'), mockRes(), () => {});
+    // One lookup per distinct org, even with the same row content.
+    expect(pool.calls).toBe(2);
+  });
+
+  it('applies the cached override to subsequent requests', async () => {
+    const redis = mockRedis();
+    // Pool returns a tight limit of 2.
+    const pool = mockPoolWithOverride([
+      { rate_limit_requests: 2, rate_limit_window_sec: 60 },
+    ]);
+    const mw = makeRateLimit({
+      redisClient: redis,
+      limit: 999, // env default would allow many; the override should win
+      windowSec: 60,
+      pool,
+    });
+
+    await mw(mockReq('org-1'), mockRes(), () => {}); // count=1
+    await mw(mockReq('org-1'), mockRes(), () => {}); // count=2
+    const blocked = mockRes();
+    await mw(mockReq('org-1'), blocked, () => {}); // count=3 → over
+    expect(blocked.statusCode).toBe(429);
   });
 });
 

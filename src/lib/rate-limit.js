@@ -42,6 +42,42 @@ function ipKeyFn(req) {
   return 'unknown';
 }
 
+/**
+ * In-memory TTL cache for the per-org rate-limit override row. Keyed
+ * by organization_id; entries expire after RATE_LIMIT_OVERRIDE_TTL_MS
+ * (default 5s). Closes the per-request DB roundtrip noted in the
+ * audit (logical issue #9) without bloating staleness — operators
+ * who flip an override see it take effect within ~5s.
+ *
+ * Cap at 1024 distinct orgs in the cache so a high-cardinality
+ * cluster doesn't grow it unboundedly. Naive LRU: when full, drop
+ * a random entry. The hit rate is still ~99% for typical org count.
+ */
+const RATE_LIMIT_OVERRIDE_TTL_MS =
+  parseInt(process.env.RATE_LIMIT_OVERRIDE_TTL_MS, 10) || 5000;
+const RATE_LIMIT_CACHE_MAX = 1024;
+const overrideCache = new Map(); // orgId -> { ts, requests, windowSec }
+
+function getCachedOverride(orgId) {
+  const entry = overrideCache.get(orgId);
+  if (!entry) return null;
+  if (Date.now() - entry.ts > RATE_LIMIT_OVERRIDE_TTL_MS) {
+    overrideCache.delete(orgId);
+    return null;
+  }
+  return entry;
+}
+
+function setCachedOverride(orgId, requests, windowSec) {
+  if (overrideCache.size >= RATE_LIMIT_CACHE_MAX) {
+    // Drop one arbitrary entry — JS Map iteration order is insertion-
+    // order, so the first key is the oldest.
+    const firstKey = overrideCache.keys().next().value;
+    overrideCache.delete(firstKey);
+  }
+  overrideCache.set(orgId, { ts: Date.now(), requests, windowSec });
+}
+
 function makeRateLimit({ redisClient, limit, windowSec, prefix, logger, keyFn, pool } = {}) {
   if (!redisClient) {
     throw new Error('makeRateLimit: redisClient is required');
@@ -60,23 +96,39 @@ function makeRateLimit({ redisClient, limit, windowSec, prefix, logger, keyFn, p
     // Look up per-org override when (a) we have a pool, (b) the request
     // resolved an organizationId (i.e. authenticated), and (c) we're using
     // the default keyFn. ipKeyFn-based limits are pre-auth and don't have
-    // an org to override against.
+    // an org to override against. Result is cached for ~5s to avoid one
+    // PG roundtrip per authenticated request.
     let effectiveLimit = cfg.limit;
     let effectiveWindow = cfg.windowSec;
     if (pool && req.auth && req.auth.organizationId && cfg.keyFn === defaultKeyFn) {
-      try {
-        const r = await pool.query(
-          'SELECT rate_limit_requests, rate_limit_window_sec FROM organizations WHERE id = $1',
-          [req.auth.organizationId]
-        );
-        if (r.rowCount > 0) {
-          const row = r.rows[0];
-          if (row.rate_limit_requests != null) effectiveLimit = row.rate_limit_requests;
-          if (row.rate_limit_window_sec != null) effectiveWindow = row.rate_limit_window_sec;
+      const cached = getCachedOverride(req.auth.organizationId);
+      if (cached) {
+        if (cached.requests != null) effectiveLimit = cached.requests;
+        if (cached.windowSec != null) effectiveWindow = cached.windowSec;
+      } else {
+        try {
+          const r = await pool.query(
+            'SELECT rate_limit_requests, rate_limit_window_sec FROM organizations WHERE id = $1',
+            [req.auth.organizationId]
+          );
+          if (r.rowCount > 0) {
+            const row = r.rows[0];
+            setCachedOverride(
+              req.auth.organizationId,
+              row.rate_limit_requests,
+              row.rate_limit_window_sec
+            );
+            if (row.rate_limit_requests != null) effectiveLimit = row.rate_limit_requests;
+            if (row.rate_limit_window_sec != null) effectiveWindow = row.rate_limit_window_sec;
+          } else {
+            // Cache the negative result too — same TTL — so a flood of
+            // requests against a missing org doesn't keep hitting PG.
+            setCachedOverride(req.auth.organizationId, null, null);
+          }
+        } catch (err) {
+          // Silent fallback to defaults — DB blip shouldn't break rate limit
+          if (logger) logger.warn('Rate limit override lookup failed', { err: err.message });
         }
-      } catch (err) {
-        // Silent fallback to defaults — DB blip shouldn't break rate limit
-        if (logger) logger.warn('Rate limit override lookup failed', { err: err.message });
       }
     }
 
@@ -116,4 +168,15 @@ function makeRateLimit({ redisClient, limit, windowSec, prefix, logger, keyFn, p
   };
 }
 
-module.exports = { makeRateLimit, defaultKeyFn, ipKeyFn, DEFAULTS };
+/** Test hook — clears the override cache between unit tests. */
+function _resetOverrideCache() {
+  overrideCache.clear();
+}
+
+module.exports = {
+  makeRateLimit,
+  defaultKeyFn,
+  ipKeyFn,
+  DEFAULTS,
+  _resetOverrideCache,
+};

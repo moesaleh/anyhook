@@ -10,7 +10,7 @@ const { createLogger } = require('../lib/logger');
 const { startMetricsServer } = require('../lib/metrics-server');
 const { signRequest } = require('../lib/webhook-signature');
 const { subscriptionCacheKey } = require('../lib/subscription-cache');
-const { dispatchNotification } = require('../lib/notifications');
+const { dispatchNotification, pollNotificationAttempts } = require('../lib/notifications');
 const { makeEmailTransport } = require('../lib/email');
 
 const log = createLogger('webhook-dispatcher');
@@ -87,6 +87,23 @@ redisClient.on('error', err => log.error('Redis Client Error', err));
       log.info(
         `Outbox poller started (interval=${OUTBOX_POLL_INTERVAL_MS}ms, batch=${OUTBOX_BATCH_SIZE})`
       );
+      // Notification retry poller — picks up email/Slack alerts that
+      // failed on first send (transient SMTP outage, Slack 429, etc.)
+      // and retries with backoff (1m → 5m → 30m → 2h → DLQ).
+      notificationPollerHandle = setInterval(
+        () =>
+          pollNotificationAttempts({
+            pool,
+            emailTransport,
+            workerId: WORKER_ID,
+            batchSize: NOTIFICATION_BATCH_SIZE,
+            lockTimeoutMs: NOTIFICATION_LOCK_TIMEOUT_MS,
+          }).catch(err => log.error('Notification poll failed:', err.message)),
+        NOTIFICATION_POLL_INTERVAL_MS
+      );
+      log.info(
+        `Notification poller started (interval=${NOTIFICATION_POLL_INTERVAL_MS}ms, batch=${NOTIFICATION_BATCH_SIZE})`
+      );
     } catch (err) {
       log.error(
         'Webhook dispatcher: PostgreSQL unavailable (retry queue + delivery logging disabled):',
@@ -154,6 +171,17 @@ const OUTBOX_POLL_INTERVAL_MS = parseInt(process.env.OUTBOX_POLL_INTERVAL_MS, 10
 const OUTBOX_BATCH_SIZE = parseInt(process.env.OUTBOX_BATCH_SIZE, 10) || 50;
 const OUTBOX_LOCK_TIMEOUT_MS = parseInt(process.env.OUTBOX_LOCK_TIMEOUT_MS, 10) || 60 * 1000;
 let outboxPollerHandle = null;
+
+// Notification retry poller — drains notification_attempts rows whose
+// previous send failed but max_attempts hasn't been hit. Same FOR
+// UPDATE SKIP LOCKED + stale-lock pattern.
+const NOTIFICATION_POLL_INTERVAL_MS =
+  parseInt(process.env.NOTIFICATION_POLL_INTERVAL_MS, 10) || 60 * 1000;
+const NOTIFICATION_BATCH_SIZE =
+  parseInt(process.env.NOTIFICATION_BATCH_SIZE, 10) || 25;
+const NOTIFICATION_LOCK_TIMEOUT_MS =
+  parseInt(process.env.NOTIFICATION_LOCK_TIMEOUT_MS, 10) || 5 * 60 * 1000;
+let notificationPollerHandle = null;
 
 /**
  * Truncate a value to a max string length for storage.
@@ -800,6 +828,10 @@ async function shutdown(signal) {
   if (outboxPollerHandle) {
     clearInterval(outboxPollerHandle);
     outboxPollerHandle = null;
+  }
+  if (notificationPollerHandle) {
+    clearInterval(notificationPollerHandle);
+    notificationPollerHandle = null;
   }
   const forceExit = setTimeout(() => {
     log.error('Shutdown timeout exceeded, forcing exit');

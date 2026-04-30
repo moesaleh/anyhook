@@ -6,6 +6,7 @@ import { DlqAlert } from "@/components/dlq-alert";
 import { AuthProvider } from "@/lib/auth-context";
 import { ThemeProvider, THEME_INIT_SCRIPT } from "@/lib/theme";
 import { ToastProvider } from "@/lib/toast";
+import { ServiceWorkerRegistrar } from "@/components/service-worker-registrar";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -35,6 +36,7 @@ export default function RootLayout({
         <a href="#main-content" className="skip-link">
           Skip to main content
         </a>
+        <ServiceWorkerRegistrar />
         <ThemeProvider>
           <ToastProvider>
             <AuthProvider>

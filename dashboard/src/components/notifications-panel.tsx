@@ -16,8 +16,10 @@ import {
   createNotification,
   updateNotification,
   deleteNotification,
+  NOTIFICATION_EVENT_LABELS,
   type NotificationPreference,
   type NotificationChannel,
+  type NotificationEvent,
 } from "@/lib/api";
 import { useToast } from "@/lib/toast";
 import { cn, formatDate } from "@/lib/utils";
@@ -143,8 +145,19 @@ export function NotificationsPanel() {
               )}
               <div className="flex-1 min-w-0">
                 <div className="text-sm font-mono break-all">{p.destination}</div>
-                <div className="text-[10px] text-neutral-500 capitalize">
-                  {p.channel} · added {formatDate(p.created_at)}
+                <div className="text-[10px] text-neutral-500 capitalize flex items-center gap-1.5 flex-wrap">
+                  <span>
+                    {p.channel} · added {formatDate(p.created_at)}
+                  </span>
+                  <span>·</span>
+                  <span className="normal-case">
+                    {p.events
+                      .map(
+                        (ev) =>
+                          NOTIFICATION_EVENT_LABELS[ev as NotificationEvent] || ev
+                      )
+                      .join(", ")}
+                  </span>
                 </div>
               </div>
               <button
@@ -196,13 +209,33 @@ function CreateForm({
 }) {
   const [channel, setChannel] = useState<NotificationChannel>("email");
   const [destination, setDestination] = useState("");
+  const [events, setEvents] = useState<Set<NotificationEvent>>(
+    new Set(["dlq"])
+  );
   const [submitting, setSubmitting] = useState(false);
+
+  function toggleEvent(e: NotificationEvent) {
+    setEvents((prev) => {
+      const next = new Set(prev);
+      if (next.has(e)) next.delete(e);
+      else next.add(e);
+      return next;
+    });
+  }
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
+    if (events.size === 0) {
+      onError("Pick at least one event to subscribe to");
+      return;
+    }
     setSubmitting(true);
     try {
-      await createNotification({ channel, destination: destination.trim() });
+      await createNotification({
+        channel,
+        destination: destination.trim(),
+        events: [...events],
+      });
       onCreated();
     } catch (err) {
       onError(err instanceof Error ? err.message : "Failed to add destination");
@@ -244,6 +277,22 @@ function CreateForm({
           className="w-full rounded-lg border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-950 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
         />
       </div>
+      <fieldset className="w-full">
+        <legend className="block text-xs font-medium mb-1.5">Events</legend>
+        <div className="flex flex-wrap gap-3 text-xs">
+          {(Object.keys(NOTIFICATION_EVENT_LABELS) as NotificationEvent[]).map((ev) => (
+            <label key={ev} className="inline-flex items-center gap-1.5">
+              <input
+                type="checkbox"
+                checked={events.has(ev)}
+                onChange={() => toggleEvent(ev)}
+                className="h-3.5 w-3.5 rounded border-neutral-300 dark:border-neutral-700"
+              />
+              <span>{NOTIFICATION_EVENT_LABELS[ev]}</span>
+            </label>
+          ))}
+        </div>
+      </fieldset>
       <button
         type="submit"
         disabled={submitting || !destination.trim()}

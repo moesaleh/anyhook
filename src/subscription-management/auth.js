@@ -1031,7 +1031,18 @@ function mountAuthRoutes(
   // enabled preference via lib/notifications.js.
 
   const VALID_NOTIFICATION_CHANNELS = ['email', 'slack'];
-  const VALID_NOTIFICATION_EVENTS = ['dlq'];
+  // Event taxonomy:
+  //   dlq            - per-event terminal failure; webhook moved to DLQ
+  //                    after retry policy exhausted.
+  //   failed         - non-DLQ permanent failures (e.g. subscription
+  //                    deleted between schedule and retry — see
+  //                    processClaimedRetry's "subscription deleted
+  //                    before retry" branch in webhook-dispatcher).
+  //   quota_warning  - org has crossed the configurable warn threshold
+  //                    against its subscription quota; informational
+  //                    so the operator can request a higher cap before
+  //                    new /subscribe calls start 429-ing.
+  const VALID_NOTIFICATION_EVENTS = ['dlq', 'failed', 'quota_warning'];
   const EMAIL_RE = /^.+@.+\..+$/;
 
   function validateNotificationDestination(channel, destination) {

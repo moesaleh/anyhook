@@ -522,6 +522,12 @@ export async function removeOrgMember(userId: string): Promise<void> {
 /* --- Notification preferences --- */
 
 export type NotificationChannel = "email" | "slack";
+export type NotificationEvent = "dlq" | "failed" | "quota_warning";
+export const NOTIFICATION_EVENT_LABELS: Record<NotificationEvent, string> = {
+  dlq: "Dead-letter queue",
+  failed: "Other delivery failure",
+  quota_warning: "Quota warning (80%)",
+};
 
 export interface NotificationPreference {
   id: string;

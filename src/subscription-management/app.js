@@ -172,24 +172,42 @@ function createApp({
     next();
   });
 
+  // SMTP transport — no-op when SMTP_HOST unset (dev / tests). Tests
+  // can pass a pre-built `emailTransport` to simulate delivered /
+  // smtp_error / no_transport branches. Defined before the quota
+  // middleware so the quota-warning callback can capture it.
+  const transport = emailTransport || makeEmailTransport({ log });
+
   // Per-org standing quotas. Tunable via env; default 100 subs / 10 active
   // API keys per org. These run BEFORE the create handler, returning 429
-  // with X-Quota-Limit / X-Quota-Used headers when at the cap.
+  // with X-Quota-Limit / X-Quota-Used headers when at the cap. The
+  // quota-warning notification path fires when an org crosses 80% of
+  // its cap (cooldown via organizations.last_quota_warning_at).
   const subscriptionQuota = makeSubscriptionQuotaCheck({
     pool,
     log,
     limit: parseInt(process.env.ORG_MAX_SUBSCRIPTIONS, 10) || undefined,
+    notifyQuotaWarning: (organizationId, used, effectiveLimit) => {
+      dispatchNotification({
+        pool,
+        emailTransport: transport,
+        organizationId,
+        eventName: 'quota_warning',
+        payload: {
+          subscriptionId: '(quota)',
+          webhookUrl: '(quota)',
+          eventId: '(quota)',
+          used,
+          limit: effectiveLimit,
+        },
+      }).catch(err => log.error('quota_warning dispatch threw:', err.message));
+    },
   });
   const apiKeyQuota = makeApiKeyQuotaCheck({
     pool,
     log,
     limit: parseInt(process.env.ORG_MAX_API_KEYS, 10) || undefined,
   });
-
-  // SMTP transport — no-op when SMTP_HOST unset (dev / tests). Tests
-  // can pass a pre-built `emailTransport` to simulate delivered /
-  // smtp_error / no_transport branches.
-  const transport = emailTransport || makeEmailTransport({ log });
 
   const { requireAuth } = mountAuthRoutes(app, {
     pool,

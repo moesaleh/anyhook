@@ -42,7 +42,22 @@ const DEFAULTS = {
 const ADVISORY_LOCK_KEY_QUOTAS = 8472394;
 const ADVISORY_LOCK_KEY_API_KEYS = 8472395;
 
-function makeSubscriptionQuotaCheck({ pool, log, limit = DEFAULTS.subscriptions } = {}) {
+/**
+ * Threshold at which a quota_warning notification is fired (when the
+ * caller wired notifyQuotaWarning + the org has notification_preferences
+ * subscribed to that event). 80% feels like a useful "still time to
+ * raise the cap before users hit 429". Configurable per-instance via
+ * the quotaWarningThreshold option.
+ */
+const DEFAULT_QUOTA_WARNING_THRESHOLD = 0.8;
+
+function makeSubscriptionQuotaCheck({
+  pool,
+  log,
+  limit = DEFAULTS.subscriptions,
+  notifyQuotaWarning,
+  quotaWarningThreshold = DEFAULT_QUOTA_WARNING_THRESHOLD,
+} = {}) {
   if (!pool) throw new Error('makeSubscriptionQuotaCheck: pool is required');
   return async function subscriptionQuota(req, res, next) {
     if (!req.auth || !req.auth.organizationId) return next();
@@ -103,6 +118,40 @@ function makeSubscriptionQuotaCheck({ pool, log, limit = DEFAULTS.subscriptions 
           limit: effectiveLimit,
         });
       }
+
+      // Fire a quota_warning notification once an org crosses the
+      // configured threshold. Cooldown is enforced atomically via a
+      // conditional UPDATE on organizations.last_quota_warning_at —
+      // only one concurrent request "wins" the slot, so back-to-back
+      // /subscribe calls don't spam the operator.
+      if (
+        notifyQuotaWarning &&
+        effectiveLimit > 0 &&
+        used / effectiveLimit >= quotaWarningThreshold
+      ) {
+        try {
+          const claim = await lockClient.query(
+            `UPDATE organizations
+             SET last_quota_warning_at = NOW()
+             WHERE id = $1
+               AND (last_quota_warning_at IS NULL
+                    OR last_quota_warning_at < NOW() - INTERVAL '1 hour')
+             RETURNING 1`,
+            [req.auth.organizationId]
+          );
+          if (claim.rowCount > 0) {
+            // Fire-and-forget — don't block the API on notification IO.
+            try {
+              notifyQuotaWarning(req.auth.organizationId, used, effectiveLimit);
+            } catch (e) {
+              if (log) log.error('quota_warning callback threw', { err: e.message });
+            }
+          }
+        } catch (err) {
+          if (log) log.error('quota_warning claim failed', { err: err.message });
+        }
+      }
+
       return next();
     } catch (err) {
       if (log) log.error('Subscription quota check failed (failing open)', { err: err.message });

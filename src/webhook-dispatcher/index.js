@@ -617,6 +617,20 @@ async function processClaimedRetry(row) {
       errorMessage: 'Subscription deleted before retry could complete',
       requestBody: row.request_body,
     });
+    // Fire a 'failed' notification — distinct from DLQ. Operators
+    // who only want delivery-policy-exhausted alerts (DLQ) can leave
+    // the 'failed' event off their notification_preferences.
+    dispatchNotification({
+      pool,
+      emailTransport,
+      organizationId: row.organization_id,
+      eventName: 'failed',
+      payload: {
+        subscriptionId: row.subscription_id,
+        webhookUrl: '(subscription deleted)',
+        eventId: row.event_id,
+      },
+    }).catch(err => log.error('failed-event notification dispatch threw:', err.message));
     return;
   }
 

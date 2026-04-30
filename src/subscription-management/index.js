@@ -14,7 +14,7 @@ const redis = require('@redis/client');
 const { Kafka, logLevel } = require('kafkajs');
 const { exec } = require('child_process');
 const { createLogger } = require('../lib/logger');
-const { makeRateLimit, ipKeyFn } = require('../lib/rate-limit');
+const { makeRateLimit, ipKeyFn, userOrgKeyFn } = require('../lib/rate-limit');
 const { startMetricsServer } = require('../lib/metrics-server');
 const { createApp } = require('./app');
 
@@ -52,11 +52,19 @@ const admin = kafka.admin();
 
 // --- Middlewares (need redisClient already constructed) ---
 
+// RATE_LIMIT_PER_USER=true switches the keyFn from per-org to per-user-
+// per-org so a noisy admin polling the dashboard doesn't consume the
+// whole org's budget. API-key auth (no userId) still falls back to
+// per-org so a robot can't bypass the limit. Per-user limits also
+// preclude the per-org override lookup (no per-user override row),
+// so only enable when the per-user shape matches the product policy.
+const RATE_LIMIT_PER_USER = process.env.RATE_LIMIT_PER_USER === 'true';
 const rateLimit = makeRateLimit({
   redisClient,
   pool, // enables per-org override lookup against organizations.rate_limit_*
   limit: parseInt(process.env.RATE_LIMIT_REQUESTS, 10) || undefined,
   windowSec: parseInt(process.env.RATE_LIMIT_WINDOW_SEC, 10) || undefined,
+  keyFn: RATE_LIMIT_PER_USER ? userOrgKeyFn : undefined,
   logger: log,
 });
 

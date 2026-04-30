@@ -2,6 +2,7 @@ const {
   makeRateLimit,
   DEFAULTS,
   defaultKeyFn,
+  userOrgKeyFn,
   ipKeyFn,
   _resetOverrideCache,
 } = require('../../src/lib/rate-limit');
@@ -325,6 +326,33 @@ describe('defaultKeyFn (per-organization)', () => {
   it('returns falsy when req.auth is missing', () => {
     expect(defaultKeyFn({})).toBeFalsy();
     expect(defaultKeyFn({ auth: null })).toBeFalsy();
+  });
+});
+
+describe('userOrgKeyFn (per-user-per-org composite)', () => {
+  it('returns "<orgId>:<userId>" for cookie-authenticated requests', () => {
+    expect(
+      userOrgKeyFn({ auth: { organizationId: 'org-1', userId: 'user-A' } })
+    ).toBe('org-1:user-A');
+  });
+
+  it('falls back to org-only for API-key auth (no userId)', () => {
+    expect(
+      userOrgKeyFn({ auth: { organizationId: 'org-1', userId: null, via: 'api_key' } })
+    ).toBe('org-1');
+  });
+
+  it('returns null when no organization is resolved', () => {
+    expect(userOrgKeyFn({})).toBe(null);
+    expect(userOrgKeyFn({ auth: null })).toBe(null);
+  });
+
+  it('two users in the same org get distinct keys', () => {
+    expect(
+      userOrgKeyFn({ auth: { organizationId: 'org-1', userId: 'user-A' } })
+    ).not.toBe(
+      userOrgKeyFn({ auth: { organizationId: 'org-1', userId: 'user-B' } })
+    );
   });
 });
 

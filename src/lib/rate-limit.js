@@ -30,6 +30,24 @@ function defaultKeyFn(req) {
   return req.auth && req.auth.organizationId;
 }
 
+/**
+ * Per-user-per-org composite key. A noisy admin polling /subscriptions
+ * every second won't consume the whole org's budget; each member is
+ * counted independently, falling back to the org-only bucket for
+ * API-key-authenticated requests (which have no userId).
+ *
+ * Wire this in by passing { keyFn: userOrgKeyFn } to makeRateLimit at
+ * the bootstrap site (subscription-management/index.js) when the
+ * RATE_LIMIT_PER_USER env flag is on.
+ */
+function userOrgKeyFn(req) {
+  if (!req.auth || !req.auth.organizationId) return null;
+  if (req.auth.userId) {
+    return `${req.auth.organizationId}:${req.auth.userId}`;
+  }
+  return req.auth.organizationId;
+}
+
 function ipKeyFn(req) {
   const xff = req.headers && req.headers['x-forwarded-for'];
   if (typeof xff === 'string' && xff.length > 0) {
@@ -94,13 +112,16 @@ function makeRateLimit({ redisClient, limit, windowSec, prefix, logger, keyFn, p
     if (!subject) return next();
 
     // Look up per-org override when (a) we have a pool, (b) the request
-    // resolved an organizationId (i.e. authenticated), and (c) we're using
-    // the default keyFn. ipKeyFn-based limits are pre-auth and don't have
-    // an org to override against. Result is cached for ~5s to avoid one
-    // PG roundtrip per authenticated request.
+    // resolved an organizationId (i.e. authenticated), and (c) we're
+    // using a keyFn that's tied to an org (defaultKeyFn or
+    // userOrgKeyFn — both produce per-org budgets).
+    // ipKeyFn-based limits are pre-auth and don't have an org to
+    // override against. Result is cached for ~5s to avoid one PG
+    // roundtrip per authenticated request.
     let effectiveLimit = cfg.limit;
     let effectiveWindow = cfg.windowSec;
-    if (pool && req.auth && req.auth.organizationId && cfg.keyFn === defaultKeyFn) {
+    const orgScopedKey = cfg.keyFn === defaultKeyFn || cfg.keyFn === userOrgKeyFn;
+    if (pool && req.auth && req.auth.organizationId && orgScopedKey) {
       const cached = getCachedOverride(req.auth.organizationId);
       if (cached) {
         if (cached.requests != null) effectiveLimit = cached.requests;
@@ -176,6 +197,7 @@ function _resetOverrideCache() {
 module.exports = {
   makeRateLimit,
   defaultKeyFn,
+  userOrgKeyFn,
   ipKeyFn,
   DEFAULTS,
   _resetOverrideCache,

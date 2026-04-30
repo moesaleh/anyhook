@@ -907,13 +907,41 @@ paths:
     get:
       tags: [Subscriptions]
       summary: List the active org's subscriptions (webhook_secret stripped)
+      description: |
+        Two response shapes for backwards compat:
+          - WITHOUT a `?page=` query: returns a flat array (legacy).
+          - WITH `?page=` (and optional `?limit=`, `?search=`):
+            returns a paginated envelope with `total`, `page`, `pages`.
+        Pick the paginated form when an org has more than a few hundred
+        subscriptions; the legacy form returns ALL rows.
+      parameters:
+        - in: query
+          name: page
+          schema: { type: integer, minimum: 1 }
+          description: 1-based page number (omit to get the legacy array shape)
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 100, default: 25 }
+        - in: query
+          name: search
+          schema: { type: string }
+          description: ILIKE match against subscription_id / webhook_url / args.endpoint_url
       responses:
         '200':
           content:
             application/json:
               schema:
-                type: array
-                items: { $ref: '#/components/schemas/Subscription' }
+                oneOf:
+                  - type: array
+                    items: { $ref: '#/components/schemas/Subscription' }
+                  - type: object
+                    properties:
+                      subscriptions:
+                        type: array
+                        items: { $ref: '#/components/schemas/Subscription' }
+                      total: { type: integer }
+                      page: { type: integer }
+                      pages: { type: integer }
     delete:
       tags: [Admin]
       summary: Wipe ALL subscriptions across all orgs (super-admin only)

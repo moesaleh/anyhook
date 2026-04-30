@@ -500,14 +500,65 @@ function createApp({
     }
   });
 
-  // List org's subscriptions
+  // List org's subscriptions.
+  //
+  // Backwards-compatible response shape:
+  //   - No `?page=` provided  -> array of subscriptions (legacy).
+  //   - `?page=N` provided    -> { subscriptions, total, page, pages }
+  //                              envelope, paginated server-side.
+  // Optional `?limit=L` (default 25, max 100) controls page size.
+  // Optional `?search=q` does a case-insensitive ILIKE across
+  // subscription_id / webhook_url / args->>'endpoint_url'.
+  //
+  // The dashboard's subscription list opts into the paginated form so
+  // a 10k-subscription org doesn't pay 5MB of JSON per refresh.
   app.get('/subscriptions', requireAuth, rateLimit, async (req, res) => {
+    const paged = req.query.page !== undefined;
     try {
-      const result = await pool.query(
-        'SELECT * FROM subscriptions WHERE organization_id = $1 ORDER BY created_at DESC',
-        [req.auth.organizationId]
+      if (!paged) {
+        // Legacy path — full array.
+        const result = await pool.query(
+          'SELECT * FROM subscriptions WHERE organization_id = $1 ORDER BY created_at DESC',
+          [req.auth.organizationId]
+        );
+        return res.status(200).json(result.rows.map(withoutSecret));
+      }
+
+      const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+      const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 25));
+      const offset = (page - 1) * limit;
+      const search = typeof req.query.search === 'string' ? req.query.search.trim() : '';
+
+      const params = [req.auth.organizationId];
+      let where = 'WHERE organization_id = $1';
+      if (search.length > 0) {
+        params.push(`%${search}%`);
+        where +=
+          ` AND (subscription_id::text ILIKE $${params.length}` +
+          ` OR webhook_url ILIKE $${params.length}` +
+          ` OR (args->>'endpoint_url') ILIKE $${params.length})`;
+      }
+
+      const countResult = await pool.query(
+        `SELECT COUNT(*)::int AS total FROM subscriptions ${where}`,
+        params
       );
-      res.status(200).json(result.rows.map(withoutSecret));
+      const total = countResult.rows[0].total;
+
+      const dataParams = [...params, limit, offset];
+      const dataResult = await pool.query(
+        `SELECT * FROM subscriptions ${where}
+         ORDER BY created_at DESC
+         LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+        dataParams
+      );
+
+      res.status(200).json({
+        subscriptions: dataResult.rows.map(withoutSecret),
+        total,
+        page,
+        pages: Math.max(1, Math.ceil(total / limit)),
+      });
     } catch (err) {
       log.error(err);
       errorResponse(res, 500, 'Failed to retrieve subscriptions');

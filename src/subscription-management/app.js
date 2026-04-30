@@ -30,6 +30,7 @@ const {
   subscriptionIdFromKey,
   SUBSCRIPTION_KEY_PATTERN,
 } = require('../lib/subscription-cache');
+const { enqueueOutbox } = require('../lib/outbox');
 const { mountAuthRoutes } = require('./auth');
 
 // Read OpenAPI spec at module load. Errors during read fall back to a
@@ -105,7 +106,9 @@ function errorResponse(res, statusCode, message) {
 function createApp({
   pool,
   redisClient,
-  producer,
+  // eslint-disable-next-line no-unused-vars
+  producer, // kept in signature for caller compatibility — Kafka publishes
+  //          now flow through the outbox, drained by the dispatcher.
   admin,
   log,
   rateLimit,
@@ -579,12 +582,19 @@ function createApp({
   //      every active GraphQL/WebSocket source connected to a sub that
   //      no longer exists.
   app.delete('/subscriptions', requireAdminKey, async (req, res) => {
+    const client = await pool.connect();
     try {
-      const deleted = await pool.query('DELETE FROM subscriptions RETURNING subscription_id');
+      await client.query('BEGIN');
+      const deleted = await client.query('DELETE FROM subscriptions RETURNING subscription_id');
+      // Atomic outbox enqueue per deleted row so the connector
+      // eventually sees an unsubscribe_events message for each.
+      for (const row of deleted.rows) {
+        await enqueueOutbox(client, 'unsubscribe_events', row.subscription_id, row.subscription_id);
+      }
+      await client.query('COMMIT');
 
-      // Best-effort: clear sub:* keys + emit unsubscribe events. We
-      // don't fail the API call if any of these fail (operator wanted
-      // a wipe; rolling back the DB delete is worse).
+      // Best-effort cache clear. The DB delete already happened; if
+      // Redis is down the workers fall back to PG anyway.
       let cursor = 0;
       const cacheKeys = [];
       do {
@@ -599,18 +609,6 @@ function createApp({
         await Promise.allSettled(cacheKeys.map(k => redisClient.del(k)));
       }
 
-      if (deleted.rowCount > 0) {
-        const events = deleted.rows.map(r => ({
-          key: r.subscription_id,
-          value: r.subscription_id,
-        }));
-        try {
-          await producer.send({ topic: 'unsubscribe_events', messages: events });
-        } catch (kafkaErr) {
-          log.error('Admin wipe: failed to publish unsubscribe_events', kafkaErr.message);
-        }
-      }
-
       log.info(`Admin wipe: rows=${deleted.rowCount}, redis_keys_cleared=${cacheKeys.length}`);
       res.status(200).json({
         message: 'All subscriptions deleted',
@@ -618,8 +616,11 @@ function createApp({
         redis_keys_cleared: cacheKeys.length,
       });
     } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
       log.error('Error deleting all subscriptions:', err);
       errorResponse(res, 500, 'Failed to delete subscriptions');
+    } finally {
+      client.release();
     }
   });
 
@@ -642,7 +643,8 @@ function createApp({
     }
   });
 
-  // Update subscription (org-scoped) — publishes update_events on success
+  // Update subscription (org-scoped) — atomically inserts the
+  // update_events row into the outbox alongside the UPDATE.
   app.put('/subscriptions/:id', requireAuth, rateLimit, async (req, res) => {
     const { id } = req.params;
     const validationErrors = validateSubscriptionInput(req.body);
@@ -650,8 +652,10 @@ function createApp({
       return errorResponse(res, 400, validationErrors.join('; '));
     }
     const { connection_type, args, webhook_url } = req.body;
+    const client = await pool.connect();
     try {
-      const result = await pool.query(
+      await client.query('BEGIN');
+      const result = await client.query(
         `UPDATE subscriptions
            SET connection_type = $1, args = $2, webhook_url = $3
            WHERE subscription_id = $4 AND organization_id = $5
@@ -659,35 +663,27 @@ function createApp({
         [connection_type, args, webhook_url, id, req.auth.organizationId]
       );
       if (result.rows.length === 0) {
+        await client.query('ROLLBACK');
         return errorResponse(res, 404, 'Subscription not found');
       }
-      await redisClient.set(subscriptionCacheKey(id), JSON.stringify(result.rows[0]));
+      // key=id so all events for this subscription land on the same
+      // partition → the same connector pod handles them in order.
+      await enqueueOutbox(client, 'update_events', id, id);
+      await client.query('COMMIT');
+
+      // Best-effort cache write.
       try {
-        // key=id so all events for this subscription land on the same
-        // partition → the same connector pod handles them in order.
-        await producer.send({
-          topic: 'update_events',
-          messages: [{ key: id, value: id }],
-        });
-      } catch (kafkaErr) {
-        // Symmetric with POST /subscribe: signal the failure to the
-        // caller. The DB and Redis are now ahead of the connector
-        // (which won't receive the update_events message and will
-        // keep using the old config). Returning 200 here would let
-        // the dashboard claim "saved" while the live connection
-        // silently runs the previous config.
-        log.error(`[Update API] - Failed to publish update_events for ${id}`, kafkaErr);
-        return errorResponse(
-          res,
-          500,
-          'Subscription updated in DB but Kafka publish failed; ' +
-            'connector still running previous config until reconciled'
-        );
+        await redisClient.set(subscriptionCacheKey(id), JSON.stringify(result.rows[0]));
+      } catch (redisErr) {
+        log.error(`[Update API] - Redis SET failed for ${id}:`, redisErr.message);
       }
       res.status(200).json(withoutSecret(result.rows[0]));
     } catch (err) {
-      log.error(err);
+      await client.query('ROLLBACK').catch(() => {});
+      log.error('Update subscription failed:', err);
       errorResponse(res, 500, 'Failed to update subscription');
+    } finally {
+      client.release();
     }
   });
 
@@ -705,37 +701,33 @@ function createApp({
       `[Subscribe API] - Incoming request to create subscription. Connection Type: ${connection_type}, Webhook URL: ${webhook_url}, Org: ${req.auth.organizationId}`
     );
 
+    // Subscription row + outbox row in a single transaction. Once
+    // commit returns, the Kafka publish is guaranteed to happen
+    // (eventually) via the outbox worker; no more 500-on-Kafka path.
+    const client = await pool.connect();
     try {
-      const result = await pool.query(
+      await client.query('BEGIN');
+      const result = await client.query(
         `INSERT INTO subscriptions
            (subscription_id, organization_id, connection_type, args, webhook_url, webhook_secret)
          VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
         [subscriptionId, req.auth.organizationId, connection_type, args, webhook_url, webhookSecret]
       );
+      await enqueueOutbox(client, 'subscription_events', subscriptionId, subscriptionId);
+      await client.query('COMMIT');
 
       log.info(
-        `[Subscribe API] - Subscription saved to PostgreSQL. Subscription ID: ${subscriptionId}`
+        `[Subscribe API] - Subscription + outbox row committed. Subscription ID: ${subscriptionId}`
       );
-      await redisClient.set(subscriptionCacheKey(subscriptionId), JSON.stringify(result.rows[0]));
-      log.info(`[Subscribe API] - Subscription saved to Redis. Subscription ID: ${subscriptionId}`);
 
+      // Best-effort cache write — the dispatcher's PG fallback handles
+      // a Redis miss at delivery time (commit fa475fb).
       try {
-        await producer.send({
-          topic: 'subscription_events',
-          messages: [{ key: subscriptionId, value: subscriptionId }],
-        });
-        log.info(
-          `[Subscribe API] - Subscription published to Kafka. Subscription ID: ${subscriptionId}`
-        );
-      } catch (kafkaErr) {
+        await redisClient.set(subscriptionCacheKey(subscriptionId), JSON.stringify(result.rows[0]));
+      } catch (redisErr) {
         log.error(
-          `[Subscribe API] - Failed to publish subscription_events for ${subscriptionId}`,
-          kafkaErr
-        );
-        return errorResponse(
-          res,
-          500,
-          'Subscription created in DB but Kafka publish failed; connector will not open until reconciled'
+          `[Subscribe API] - Redis SET failed for ${subscriptionId} (will fall back to PG):`,
+          redisErr.message
         );
       }
 
@@ -745,8 +737,11 @@ function createApp({
         message: 'Subscription created. Save webhook_secret — it is shown only once.',
       });
     } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
       log.error(`[Subscribe API] - Error creating subscription:`, err);
       errorResponse(res, 500, 'Failed to create subscription');
+    } finally {
+      client.release();
     }
   });
 
@@ -860,21 +855,11 @@ function createApp({
             subscriptionCacheKey(subscriptionId),
             JSON.stringify(insRes.rows[0])
           );
-          try {
-            await producer.send({
-              topic: 'subscription_events',
-              messages: [{ key: subscriptionId, value: subscriptionId }],
-            });
-          } catch (kafkaErr) {
-            // Same trade-off as per-row /subscribe: DB is the source
-            // of truth. We log + record the entry as successful since
-            // the row is in DB; an operator can reconcile by running
-            // /redis/reload + a Kafka backfill if needed.
-            log.error(
-              `[Bulk Subscribe] - Kafka publish failed for ${subscriptionId}`,
-              kafkaErr.message
-            );
-          }
+          // Atomic outbox enqueue alongside the row insert. The
+          // surrounding lockClient already holds the per-org advisory
+          // lock — the INSERT and the outbox enqueue land on the same
+          // pg session, so they commit together.
+          await enqueueOutbox(lockClient, 'subscription_events', subscriptionId, subscriptionId);
           results.push({ index: i, subscriptionId, webhook_secret: webhookSecret });
         } catch (err) {
           log.error(`[Bulk Subscribe] - Failed entry ${i}`, err.message);
@@ -894,7 +879,9 @@ function createApp({
     }
   });
 
-  // Unsubscribe (org-scoped)
+  // Unsubscribe (org-scoped) — DELETE + outbox enqueue in one tx so a
+  // Kafka outage no longer leaves the connector still streaming a
+  // subscription whose row is gone.
   app.post('/unsubscribe', requireAuth, rateLimit, async (req, res) => {
     const { subscription_id } = req.body;
     if (!subscription_id || typeof subscription_id !== 'string') {
@@ -903,32 +890,29 @@ function createApp({
     log.info(
       `[Unsubscribe API] - Incoming request to delete subscription. Subscription ID: ${subscription_id}, Org: ${req.auth.organizationId}`
     );
+    const client = await pool.connect();
     try {
-      const deleteResult = await pool.query(
+      await client.query('BEGIN');
+      const deleteResult = await client.query(
         `DELETE FROM subscriptions WHERE subscription_id = $1 AND organization_id = $2`,
         [subscription_id, req.auth.organizationId]
       );
       if (deleteResult.rowCount === 0) {
+        await client.query('ROLLBACK');
         return errorResponse(res, 404, 'Subscription not found');
       }
+      await enqueueOutbox(client, 'unsubscribe_events', subscription_id, subscription_id);
+      await client.query('COMMIT');
       log.info(
-        `[Unsubscribe API] - Subscription deleted from PostgreSQL. Subscription ID: ${subscription_id}`
+        `[Unsubscribe API] - Subscription + outbox row committed. Subscription ID: ${subscription_id}`
       );
-      try {
-        await producer.send({
-          topic: 'unsubscribe_events',
-          messages: [{ key: subscription_id, value: subscription_id }],
-        });
-      } catch (kafkaErr) {
-        log.error(
-          `[Unsubscribe API] - Failed to publish unsubscribe_events for ${subscription_id}`,
-          kafkaErr
-        );
-      }
       res.status(200).json({ message: 'Unsubscribed successfully' });
     } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
       log.error(`[Unsubscribe API] - Error deleting subscription:`, err);
       errorResponse(res, 500, 'Failed to unsubscribe');
+    } finally {
+      client.release();
     }
   });
 

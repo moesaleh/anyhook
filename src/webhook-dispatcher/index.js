@@ -81,6 +81,12 @@ redisClient.on('error', err => log.error('Redis Client Error', err));
       log.info(
         `Retry poller started (interval=${RETRY_POLL_INTERVAL_MS}ms, batch=${RETRY_BATCH_SIZE}, worker=${WORKER_ID})`
       );
+      // Outbox drainer — same FOR UPDATE SKIP LOCKED pattern.
+      outboxPollerHandle = setInterval(pollOutbox, OUTBOX_POLL_INTERVAL_MS);
+      pollOutbox();
+      log.info(
+        `Outbox poller started (interval=${OUTBOX_POLL_INTERVAL_MS}ms, batch=${OUTBOX_BATCH_SIZE})`
+      );
     } catch (err) {
       log.error(
         'Webhook dispatcher: PostgreSQL unavailable (retry queue + delivery logging disabled):',
@@ -137,6 +143,17 @@ const RETRY_BATCH_SIZE = parseInt(process.env.RETRY_BATCH_SIZE, 10) || 25;
 const RETRY_LOCK_TIMEOUT_MS = parseInt(process.env.RETRY_LOCK_TIMEOUT_MS, 10) || 5 * 60 * 1000;
 const WORKER_ID = `${require('os').hostname()}-${process.pid}`;
 let retryPollerHandle = null;
+
+// Outbox drainer (outbox_events table). The /subscribe + /unsubscribe +
+// PUT /subscriptions + bulk + admin-wipe endpoints write Kafka publishes
+// into the outbox inside their DB transaction; this worker drains the
+// outbox to Kafka. Crash mid-publish leaves the row locked_at-stale;
+// the next sweep reclaims via the lock-timeout — same pattern as
+// pending_retries.
+const OUTBOX_POLL_INTERVAL_MS = parseInt(process.env.OUTBOX_POLL_INTERVAL_MS, 10) || 1000;
+const OUTBOX_BATCH_SIZE = parseInt(process.env.OUTBOX_BATCH_SIZE, 10) || 50;
+const OUTBOX_LOCK_TIMEOUT_MS = parseInt(process.env.OUTBOX_LOCK_TIMEOUT_MS, 10) || 60 * 1000;
+let outboxPollerHandle = null;
 
 /**
  * Truncate a value to a max string length for storage.
@@ -696,6 +713,81 @@ async function sendToDLQ(subscriptionId, organizationId, webhookUrl, data, event
   });
 }
 
+/**
+ * Outbox drainer.
+ *
+ * Hot loop:
+ *   1. Stale-lock sweep: any row locked_at < now - OUTBOX_LOCK_TIMEOUT
+ *      gets unlocked (a previous worker crashed mid-publish).
+ *   2. Claim a batch with FOR UPDATE SKIP LOCKED.
+ *   3. For each row: producer.send. On success → mark delivered.
+ *      On failure → unlock + bump attempts + record last_error so the
+ *      next sweep retries.
+ *
+ * Multi-pod safe via SKIP LOCKED + locked_by tracking.
+ */
+async function pollOutbox() {
+  // Stale-lock sweep — fire and forget; if it fails we still try to claim.
+  pool
+    .query(
+      `UPDATE outbox_events
+       SET locked_at = NULL, locked_by = NULL
+       WHERE delivered_at IS NULL AND locked_at IS NOT NULL
+         AND locked_at < NOW() - ($1::text || ' milliseconds')::interval`,
+      [String(OUTBOX_LOCK_TIMEOUT_MS)]
+    )
+    .catch(err => log.error('Outbox stale-lock sweep failed:', err.message));
+
+  let claimed;
+  try {
+    const result = await pool.query(
+      `WITH due AS (
+          SELECT id FROM outbox_events
+          WHERE delivered_at IS NULL AND locked_at IS NULL
+          ORDER BY created_at
+          LIMIT $1
+          FOR UPDATE SKIP LOCKED
+       )
+       UPDATE outbox_events o
+       SET locked_at = NOW(), locked_by = $2
+       FROM due
+       WHERE o.id = due.id
+       RETURNING o.*`,
+      [OUTBOX_BATCH_SIZE, WORKER_ID]
+    );
+    claimed = result.rows;
+  } catch (err) {
+    log.error('Outbox claim failed:', err.message);
+    return;
+  }
+  if (claimed.length === 0) return;
+
+  for (const row of claimed) {
+    try {
+      await producer.send({
+        topic: row.topic,
+        messages: [{ key: row.message_key, value: row.message_value }],
+      });
+      await pool.query(
+        'UPDATE outbox_events SET delivered_at = NOW(), locked_at = NULL, locked_by = NULL WHERE id = $1',
+        [row.id]
+      );
+    } catch (err) {
+      log.error(`Outbox publish failed for row ${row.id}:`, err.message);
+      // Unlock + bump attempts + record error. Next sweep retries.
+      await pool
+        .query(
+          `UPDATE outbox_events
+           SET locked_at = NULL, locked_by = NULL,
+               attempts = attempts + 1, last_error = $1
+           WHERE id = $2`,
+          [String(err.message).slice(0, 500), row.id]
+        )
+        .catch(() => {});
+    }
+  }
+}
+
 // Graceful shutdown — stop the retry poller, disconnect kafkajs clients,
 // close Redis + PG, exit. Stopping the poller first means in-flight retries
 // finish; new ones won't be claimed.
@@ -704,6 +796,10 @@ async function shutdown(signal) {
   if (retryPollerHandle) {
     clearInterval(retryPollerHandle);
     retryPollerHandle = null;
+  }
+  if (outboxPollerHandle) {
+    clearInterval(outboxPollerHandle);
+    outboxPollerHandle = null;
   }
   const forceExit = setTimeout(() => {
     log.error('Shutdown timeout exceeded, forcing exit');

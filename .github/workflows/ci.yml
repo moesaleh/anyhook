@@ -7,10 +7,15 @@ on:
     branches: [main]
   workflow_dispatch:
 
-# GITHUB_TOKEN needs `packages: write` to push images to GHCR.
+# GITHUB_TOKEN needs `packages: write` to push images to GHCR. The publish
+# job additionally needs `security-events: write` so the Trivy scan can upload
+# SARIF to the Security tab, and `id-token: write` so cosign can keyless-sign
+# (only used when COSIGN_PRIVATE_KEY isn't set).
 permissions:
   contents: read
   packages: write
+  security-events: write
+  id-token: write
 
 jobs:
   # Lint + syntax-check the backend on every push & PR.
@@ -60,7 +65,12 @@ jobs:
           node-version: '22'
           cache: 'npm'
       - run: npm ci
-      - name: Run all tests with coverage
+      # `npm run test:coverage` is `jest --coverage`. The coverageThreshold in
+      # jest.config.js makes jest exit non-zero when coverage drops below the
+      # floor, and because this is a plain `run:` step that non-zero exit fails
+      # the job. Do NOT wrap this in `|| true`, `continue-on-error`, or pipe it
+      # into anything that masks the exit code — the threshold is the gate.
+      - name: Run all tests with coverage (coverage threshold gates the job)
         run: npm run test:coverage
         env:
           # JWT helpers refuse to run with a short or missing secret.
@@ -126,6 +136,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build & push backend image
+        id: build-backend
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -137,8 +148,15 @@ jobs:
             ghcr.io/moesaleh/anyhook:sha-${{ github.sha }}
           cache-from: type=gha,scope=backend
           cache-to: type=gha,mode=max,scope=backend
+          # Emit an SPDX SBOM + provenance attestation alongside the image in
+          # the registry (buildkit attaches these to the manifest). The
+          # standalone anchore/sbom-action step below also publishes an SBOM as
+          # a build artifact for consumers that don't read OCI attestations.
+          sbom: true
+          provenance: mode=max
 
       - name: Build & push dashboard image
+        id: build-dashboard
         uses: docker/build-push-action@v6
         with:
           context: ./dashboard
@@ -149,3 +167,220 @@ jobs:
             ghcr.io/moesaleh/anyhook-dashboard:sha-${{ github.sha }}
           cache-from: type=gha,scope=dashboard
           cache-to: type=gha,mode=max,scope=dashboard
+          sbom: true
+          provenance: mode=max
+
+      # --- Supply-chain: vulnerability scan + SBOM + optional signing --------
+      # Scan the just-pushed backend image. Fails the job on any fixable
+      # HIGH/CRITICAL CVE so a vulnerable image can't progress to deploy.
+      # `exit-code: 1` is what turns findings into a hard gate; `ignore-unfixed`
+      # avoids failing on CVEs with no available patch (noise we can't action).
+      - name: Scan backend image (Trivy, fail on HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ghcr.io/moesaleh/anyhook:sha-${{ github.sha }}
+          format: table
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+          vuln-type: os,library
+
+      - name: Scan dashboard image (Trivy, fail on HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ghcr.io/moesaleh/anyhook-dashboard:sha-${{ github.sha }}
+          format: table
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+          vuln-type: os,library
+
+      # SBOM as a downloadable artifact (SPDX JSON) for each image. Uses syft
+      # under the hood; uploaded to the workflow run so it's retrievable for
+      # audit / dependency-tracking ingestion.
+      - name: Generate SBOM — backend (syft via anchore/sbom-action)
+        uses: anchore/sbom-action@v0
+        with:
+          image: ghcr.io/moesaleh/anyhook:sha-${{ github.sha }}
+          format: spdx-json
+          artifact-name: sbom-backend-spdx.json
+          output-file: ${{ runner.temp }}/sbom-backend-spdx.json
+
+      - name: Generate SBOM — dashboard (syft via anchore/sbom-action)
+        uses: anchore/sbom-action@v0
+        with:
+          image: ghcr.io/moesaleh/anyhook-dashboard:sha-${{ github.sha }}
+          format: spdx-json
+          artifact-name: sbom-dashboard-spdx.json
+          output-file: ${{ runner.temp }}/sbom-dashboard-spdx.json
+
+      # Optional image signing. Only runs when COSIGN_PRIVATE_KEY is configured;
+      # the `if:` keeps the job green for forks/contributors without the secret.
+      # We sign the immutable digests (not the mutable :sha-/:latest tags).
+      - name: Check for cosign signing key
+        id: cosign-key
+        run: |
+          if [ -n "${{ secrets.COSIGN_PRIVATE_KEY }}" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "COSIGN_PRIVATE_KEY not set — skipping image signing."
+          fi
+
+      - name: Install cosign
+        if: steps.cosign-key.outputs.enabled == 'true'
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign + attest images (cosign)
+        if: steps.cosign-key.outputs.enabled == 'true'
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+          BACKEND_DIGEST: ${{ steps.build-backend.outputs.digest }}
+          DASHBOARD_DIGEST: ${{ steps.build-dashboard.outputs.digest }}
+        run: |
+          set -euo pipefail
+          cosign sign --yes --key env://COSIGN_PRIVATE_KEY \
+            "ghcr.io/moesaleh/anyhook@${BACKEND_DIGEST}"
+          cosign sign --yes --key env://COSIGN_PRIVATE_KEY \
+            "ghcr.io/moesaleh/anyhook-dashboard@${DASHBOARD_DIGEST}"
+
+  # Gated production deploy. Runs only after a successful publish, and only on
+  # push to main / manual dispatch. The `environment: production` binding means
+  # GitHub holds this job until a required reviewer approves it; with no
+  # reviewers/secrets configured it simply no-ops (every step is guarded on the
+  # DEPLOY_SSH_HOST secret), so the workflow stays green out of the box.
+  #
+  # Flow: pull the :sha-<commit> images, run DB migrations as a discrete
+  # one-shot step FIRST, then a health-gated rolling update with rollback.
+  deploy:
+    name: Deploy (production)
+    runs-on: ubuntu-latest
+    needs: [publish]
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      # Single switch the rest of the job reads. When DEPLOY_SSH_HOST is unset
+      # (the default), `enabled=false` and every deploy step is skipped, so the
+      # job is a no-op pass rather than a failure.
+      - name: Resolve deploy target
+        id: target
+        env:
+          DEPLOY_SSH_HOST: ${{ secrets.DEPLOY_SSH_HOST }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          set -euo pipefail
+          if [ -n "${DEPLOY_SSH_HOST:-}" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "Deploy target configured — proceeding with migrate + rollout."
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "DEPLOY_SSH_HOST not set — skipping deploy (no-op)."
+          fi
+          if [ -n "${DATABASE_URL:-}" ]; then
+            echo "has_db=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_db=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::DATABASE_URL not set — migration step will be skipped."
+          fi
+
+      # --- Step 1: migrations as a discrete pre-deploy step (P1-9) -----------
+      # Run migrations exactly once per release BEFORE rolling the app pods, so
+      # there's no multi-pod migrate race and a failed migration aborts the
+      # deploy before any new app container starts. node-pg-migrate is a
+      # devDependency (pruned from the runtime image), so we run it from a fresh
+      # checkout via `npx` rather than inside the published image.
+      - name: Set up Node for migrations
+        if: steps.target.outputs.has_db == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install migration deps
+        if: steps.target.outputs.has_db == 'true'
+        run: npm ci
+
+      - name: Run database migrations (npx node-pg-migrate up)
+        if: steps.target.outputs.has_db == 'true'
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: npx node-pg-migrate up
+
+      # --- Step 2: health-gated rolling update over SSH (P2-10) --------------
+      # Pull the immutable :sha-<commit> tag and `up -d` on the host, then poll
+      # /health (readiness — probes Postgres + Redis). If it never goes green,
+      # roll back to :latest and fail the deploy.
+      #
+      # Rollback note: images are also tagged :latest and :sha-<commit>; a bad
+      # release can be reverted by re-deploying the previous commit's :sha tag
+      # (re-run this job from that commit) or, on the host, repointing the
+      # compose IMAGE_TAG to the last-known-good sha and `up -d`.
+      - name: Configure SSH
+        if: steps.target.outputs.enabled == 'true'
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_SSH_HOST: ${{ secrets.DEPLOY_SSH_HOST }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "$DEPLOY_SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Pull :sha images + rolling update + health gate
+        if: steps.target.outputs.enabled == 'true'
+        env:
+          DEPLOY_SSH_HOST: ${{ secrets.DEPLOY_SSH_HOST }}
+          DEPLOY_SSH_USER: ${{ secrets.DEPLOY_SSH_USER }}
+          # Directory on the host that holds docker-compose.yml + .env.
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          IMAGE_TAG: sha-${{ github.sha }}
+          # Port /health listens on (subscription-management readiness).
+          HEALTH_URL: ${{ secrets.DEPLOY_HEALTH_URL }}
+        run: |
+          set -euo pipefail
+          DEPLOY_USER="${DEPLOY_SSH_USER:-deploy}"
+          DEPLOY_DIR="${DEPLOY_PATH:-/opt/anyhook}"
+          HEALTH="${HEALTH_URL:-http://localhost:3001/health}"
+
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes \
+            "${DEPLOY_USER}@${DEPLOY_SSH_HOST}" \
+            "IMAGE_TAG='${IMAGE_TAG}' DEPLOY_DIR='${DEPLOY_DIR}' HEALTH='${HEALTH}' bash -s" <<'REMOTE'
+          set -euo pipefail
+          cd "${DEPLOY_DIR}"
+
+          # Record the currently-running backend tag so we can roll back.
+          PREV_TAG="$(docker inspect --format '{{ index .Config.Image }}' anyhook-subscription 2>/dev/null || echo 'latest')"
+          echo "Previous backend image: ${PREV_TAG}"
+
+          # Pin compose to the new immutable tag, pull, and roll.
+          export IMAGE_TAG
+          docker compose pull
+          docker compose up -d
+
+          # Health gate: poll /health (readiness) for up to ~2 minutes.
+          ok=0
+          for i in $(seq 1 24); do
+            if curl -fsS --max-time 5 "${HEALTH}" >/dev/null 2>&1; then
+              ok=1
+              echo "Health check passed on attempt ${i}."
+              break
+            fi
+            echo "Health check attempt ${i} failed; retrying in 5s..."
+            sleep 5
+          done
+
+          if [ "${ok}" -ne 1 ]; then
+            echo "Health gate FAILED — rolling back to ${PREV_TAG}."
+            export IMAGE_TAG="${PREV_TAG##*:}"
+            docker compose pull
+            docker compose up -d
+            exit 1
+          fi
+
+          echo "Deploy succeeded; new images healthy."
+          REMOTE

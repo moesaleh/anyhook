@@ -9,7 +9,7 @@ import {
   Clock,
   Hash,
 } from "lucide-react";
-import { cn, formatDate } from "@/lib/utils";
+import { cn } from "@/lib/utils";
 import { DeliveryStatusBadge } from "./delivery-status-badge";
 import { PayloadViewer } from "./payload-viewer";
 import { fetchDeliveries } from "@/lib/api";
@@ -263,6 +263,14 @@ function DeliveryRow({
   formatLatency: (ms: number | null) => string;
   httpStatusColor: (code: number | null) => string;
 }) {
+  // Stable id so the disclosure button can point aria-controls at the panel.
+  const panelId = `delivery-detail-${delivery.delivery_id}`;
+  const label = `${isExpanded ? "Collapse" : "Expand"} delivery ${delivery.event_id.slice(0, 8)} details`;
+
+  // The row stays mouse-clickable for convenience, but the real keyboard-
+  // operable disclosure is the <button> in the chevron cell (focusable,
+  // Enter/Space, aria-expanded). Clicking that button stops propagation so it
+  // doesn't also fire the row's onClick and cancel its own toggle.
   return (
     <>
       <tr
@@ -270,11 +278,24 @@ function DeliveryRow({
         onClick={onToggle}
       >
         <td className="px-3 py-2.5 text-center">
-          {isExpanded ? (
-            <ChevronDown className="h-3.5 w-3.5 text-neutral-400 inline" />
-          ) : (
-            <ChevronRight className="h-3.5 w-3.5 text-neutral-400 inline" />
-          )}
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              onToggle();
+            }}
+            aria-expanded={isExpanded}
+            aria-controls={panelId}
+            aria-label={label}
+            title={label}
+            className="inline-flex items-center justify-center rounded p-0.5 text-neutral-400 hover:text-neutral-600 dark:hover:text-neutral-300 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+          >
+            {isExpanded ? (
+              <ChevronDown className="h-3.5 w-3.5" />
+            ) : (
+              <ChevronRight className="h-3.5 w-3.5" />
+            )}
+          </button>
         </td>
         <td className="px-3 py-2.5 text-xs text-neutral-600 dark:text-neutral-400 font-mono whitespace-nowrap">
           {new Date(delivery.created_at).toLocaleString()}
@@ -307,7 +328,11 @@ function DeliveryRow({
       </tr>
       {isExpanded && (
         <tr>
-          <td colSpan={8} className="px-6 py-4 bg-neutral-50/50 dark:bg-neutral-900/30">
+          <td
+            id={panelId}
+            colSpan={8}
+            className="px-6 py-4 bg-neutral-50/50 dark:bg-neutral-900/30"
+          >
             <PayloadViewer
               requestBody={delivery.request_body}
               responseBody={delivery.response_body}

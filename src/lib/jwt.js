@@ -12,11 +12,23 @@ const ISSUER = 'anyhook';
 const DEFAULT_EXPIRES_IN = '7d';
 const MIN_SECRET_LENGTH = 32;
 
+// The .env.example placeholder is intentionally >=32 chars, so the length
+// gate alone would happily boot a copy-pasted deploy with a public signing
+// key (forgeable session cookies). Reject the known placeholder prefix so
+// even an unedited example fails fast at startup.
+const PLACEHOLDER_SECRET_PREFIX = 'please_change_me';
+
 function getJwtSecret() {
   const secret = process.env.JWT_SECRET;
   if (!secret || secret.length < MIN_SECRET_LENGTH) {
     throw new Error(
       `JWT_SECRET must be set to a value at least ${MIN_SECRET_LENGTH} characters long`
+    );
+  }
+  if (secret.trim().toLowerCase().startsWith(PLACEHOLDER_SECRET_PREFIX)) {
+    throw new Error(
+      'JWT_SECRET is still set to the .env.example placeholder — generate a real ' +
+        "one with: node -e \"console.log(require('crypto').randomBytes(48).toString('base64url'))\""
     );
   }
   return secret;

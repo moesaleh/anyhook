@@ -157,6 +157,30 @@ function isPrivateOrLoopbackHost(hostname) {
   return false;
 }
 
+/**
+ * Classify a single resolved IP literal (the form `dns.lookup` returns:
+ * dotted-decimal IPv4 or canonical/compressed IPv6 — no inet_aton tricks,
+ * no brackets) as private/loopback/link-local/CGNAT/IMDS.
+ *
+ * This is the connect-time counterpart of isPrivateOrLoopbackHost: that
+ * function defends a *hostname* (and so must handle every encoding bypass),
+ * whereas this one is fed already-resolved addresses by ssrf-guard and so
+ * only needs to recognise the canonical literal forms. It delegates to the
+ * exact same IPv4/IPv6 classifiers, so the two paths can never disagree on
+ * which ranges are blocked.
+ *
+ * Returns true (block) for anything it cannot positively classify as a
+ * public address — fail-closed, since an unrecognised literal at connect
+ * time is safer treated as untrusted.
+ */
+function isPrivateIp(addr) {
+  if (!addr || typeof addr !== 'string') return true;
+  // Reuse the hostname classifier: it strips brackets/zone-ids, handles
+  // ::1 / :: / fe80:: / fc:: / fd::, decodes IPv4-mapped IPv6, and runs the
+  // dotted-decimal form through the same isPrivateIPv4Number gate.
+  return isPrivateOrLoopbackHost(addr);
+}
+
 const DEFAULT_PROTOCOLS = ['http:', 'https:', 'ws:', 'wss:'];
 
 function isValidUrl(str, options = {}) {
@@ -181,9 +205,13 @@ function isValidUrl(str, options = {}) {
 
 module.exports = {
   isPrivateOrLoopbackHost,
+  // Connect-time classifier for already-resolved IP literals — consumed by
+  // src/lib/ssrf-guard.js to re-check each DNS-resolved address.
+  isPrivateIp,
   isValidUrl,
   DEFAULT_PROTOCOLS,
   // exported for unit tests
   parseInetAtonIPv4,
   ipv6EmbeddedIPv4,
+  isPrivateIPv4Number,
 };

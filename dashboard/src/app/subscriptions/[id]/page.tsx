@@ -32,6 +32,7 @@ import { LiveIndicator } from "@/components/live-indicator";
 import { DeliveryStatsCard } from "@/components/delivery-stats";
 import { DeliveryTable } from "@/components/delivery-table";
 import { DeleteDialog } from "@/components/delete-dialog";
+import { useVisiblePolling } from "@/lib/use-visible-polling";
 import { cn, formatDate, formatUptime } from "@/lib/utils";
 import type { Subscription, SubscriptionStatus, DeliveryStats } from "@/lib/api";
 
@@ -81,11 +82,9 @@ export default function SubscriptionDetailPage() {
     loadData();
   }, [loadData]);
 
-  useEffect(() => {
-    if (!isPolling) return;
-    const interval = setInterval(loadData, POLL_INTERVAL);
-    return () => clearInterval(interval);
-  }, [isPolling, loadData]);
+  // `isPolling` is the user's Live/Paused intent (toggle below); the
+  // hook gates the actual interval on that AND tab visibility.
+  useVisiblePolling(loadData, POLL_INTERVAL, { enabled: isPolling });
 
   async function handleCopy(text: string, key: string) {
     try {

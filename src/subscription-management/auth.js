@@ -208,7 +208,7 @@ function noopMiddleware(req, res, next) {
 
 function mountAuthRoutes(
   app,
-  { pool, rateLimit, authRateLimit, apiKeyQuota, quotaLimits, emailTransport }
+  { pool, redisClient, rateLimit, authRateLimit, apiKeyQuota, quotaLimits, emailTransport }
 ) {
   const requireAuth = makeRequireAuth({ pool });
   const rl = rateLimit || noopMiddleware;
@@ -223,6 +223,89 @@ function mountAuthRoutes(
     },
   };
   const baseUrl = (process.env.DASHBOARD_URL || 'http://localhost:3000').replace(/\/$/, '');
+
+  // --- Per-account login/2FA throttling (defense-in-depth on top of the
+  // per-IP authRateLimit). The IP limit slows a single source; this
+  // counter follows a *targeted* account across rotating IPs (the
+  // credential-stuffing / password-spray case), enforcing a temporary
+  // lockout once too many failures stack up for one identity within a
+  // window.
+  //
+  // Redis-backed and best-effort: the counter only engages when a
+  // redisClient is wired through (production via createApp). Without it
+  // (tests / unconfigured), every helper is a no-op so behavior is
+  // unchanged. Any Redis error fails OPEN — a cache blip must never lock
+  // a legitimate user out (mirrors rate-limit.js).
+  //
+  // Keyed by a stable subject: the resolved user id where we have it
+  // (verify-login, post-password-match), else the normalized email
+  // (pre-resolution login). The email path runs the same INCR whether or
+  // not the account exists, so it leaks nothing about which emails are
+  // registered — the existing dummy-hash enumeration defense stays intact.
+  const LOGIN_FAIL_MAX = parseInt(process.env.LOGIN_FAIL_MAX, 10) || 10;
+  const LOGIN_FAIL_WINDOW_SEC = parseInt(process.env.LOGIN_FAIL_WINDOW_SEC, 10) || 900; // 15m
+  const loginFailKey = subject => `login:fail:${subject}`;
+
+  // Returns { locked, retryAfter } when the subject is currently over the
+  // failure threshold, else { locked: false }. retryAfter is the TTL left
+  // on the counter (seconds) so the client knows when to try again.
+  async function loginLockState(subject) {
+    if (!redisClient || !subject) return { locked: false };
+    const key = loginFailKey(subject);
+    try {
+      const countRaw = await redisClient.get(key);
+      const count = Number(countRaw) || 0;
+      if (count < LOGIN_FAIL_MAX) return { locked: false };
+      // ttl() may be unavailable on minimal clients — fall back to the
+      // full window so we still return a sane Retry-After.
+      let ttl = LOGIN_FAIL_WINDOW_SEC;
+      if (typeof redisClient.ttl === 'function') {
+        const t = await redisClient.ttl(key);
+        if (Number.isFinite(t) && t > 0) ttl = t;
+      }
+      return { locked: true, retryAfter: ttl };
+    } catch (err) {
+      log.error('Login lock check failed (failing open):', err.message);
+      return { locked: false };
+    }
+  }
+
+  // Increment the failure counter for a subject, (re)arming the window
+  // TTL on the first failure. Best-effort; swallows Redis errors.
+  async function recordLoginFailure(subject) {
+    if (!redisClient || !subject) return;
+    const key = loginFailKey(subject);
+    try {
+      const count = await redisClient.incr(key);
+      if (count === 1) {
+        await redisClient.expire(key, LOGIN_FAIL_WINDOW_SEC);
+      }
+    } catch (err) {
+      log.error('Login failure record failed:', err.message);
+    }
+  }
+
+  // Clear the counter on a successful authentication so a user who
+  // eventually gets it right isn't penalized by earlier typos.
+  async function clearLoginFailures(subject) {
+    if (!redisClient || !subject) return;
+    try {
+      await redisClient.del(loginFailKey(subject));
+    } catch (err) {
+      log.error('Login failure clear failed:', err.message);
+    }
+  }
+
+  // Standard lockout response — 429 + Retry-After, deliberately vague so
+  // it reads the same for a real and a non-existent account.
+  function sendLoginLocked(res, retryAfter) {
+    res.setHeader('Retry-After', String(Math.max(0, retryAfter || LOGIN_FAIL_WINDOW_SEC)));
+    return res.status(429).json({
+      error: 'Too many failed attempts. Try again later.',
+      retryAfter: Math.max(0, retryAfter || LOGIN_FAIL_WINDOW_SEC),
+    });
+  }
+
   // Limits used by the read-only /quotas endpoint. The middleware-side
   // limits are baked in at construction time; this echoes them so the
   // dashboard can show "X/Y used" without scraping headers from every call.
@@ -252,7 +335,7 @@ function mountAuthRoutes(
         email,
       ]);
       if (existing.rowCount > 0) {
-        await client.query('ROLLBACK');
+        await client.query('ROLLBACK').catch(() => {});
         return res.status(409).json({ error: 'Email already registered' });
       }
 
@@ -304,7 +387,7 @@ function mountAuthRoutes(
         organization: { id: org.id, name: org.name, slug: org.slug, role: 'owner' },
       });
     } catch (err) {
-      await client.query('ROLLBACK');
+      await client.query('ROLLBACK').catch(() => {});
       log.error('Registration failed:', err);
       res.status(500).json({ error: 'Registration failed' });
     } finally {
@@ -351,8 +434,21 @@ function mountAuthRoutes(
     if (!email || !password) {
       return res.status(400).json({ error: 'Email and password are required' });
     }
+    // Per-account counter is keyed by the normalized email at this stage
+    // (the user id isn't known yet). Same key whether the account exists
+    // or not, so it can't be used to enumerate registered emails. Guard
+    // for a non-string email (the body is untrusted) so deriving the key
+    // can't throw before the existing query-based validation runs.
+    const emailSubject = typeof email === 'string' ? email.toLowerCase() : null;
 
     try {
+      // Lockout gate BEFORE the (expensive, timing-padded) password verify
+      // so a spray that's already over the threshold gets bounced cheaply.
+      const lock = await loginLockState(emailSubject);
+      if (lock.locked) {
+        return sendLoginLocked(res, lock.retryAfter);
+      }
+
       const userResult = await pool.query(
         `SELECT id, email, name, password_hash, totp_secret, totp_enabled_at, token_version
          FROM users WHERE LOWER(email) = LOWER($1)`,
@@ -362,10 +458,16 @@ function mountAuthRoutes(
       const stored = userResult.rowCount > 0 ? userResult.rows[0].password_hash : dummyHash;
       const ok = await verifyPassword(password, stored);
       if (userResult.rowCount === 0 || !ok) {
+        // Count the failed attempt against the account. Fire-and-forget so
+        // the 401 timing stays constant regardless of the counter state.
+        recordLoginFailure(emailSubject).catch(() => {});
         return res.status(401).json({ error: 'Invalid email or password' });
       }
 
       const user = userResult.rows[0];
+      // Password was correct — clear the password-stage counter. If 2FA is
+      // enabled the TOTP stage has its own per-user counter (keyed by id).
+      clearLoginFailures(emailSubject).catch(() => {});
 
       if (user.totp_enabled_at) {
         const pendingToken = signEphemeralToken(
@@ -393,7 +495,17 @@ function mountAuthRoutes(
     if (!claims || claims.purpose !== '2fa-pending' || !claims.sub) {
       return res.status(401).json({ error: 'Invalid or expired pending token' });
     }
+    // The TOTP stage gets its own per-user counter (keyed by the resolved
+    // user id from the pending token) so a stolen-password attacker who's
+    // stuck on the second factor is locked out independently of the
+    // password stage.
+    const failSubject = claims.sub;
     try {
+      const lock = await loginLockState(failSubject);
+      if (lock.locked) {
+        return sendLoginLocked(res, lock.retryAfter);
+      }
+
       const userResult = await pool.query(
         `SELECT id, email, name, totp_secret, totp_enabled_at, token_version, last_totp_step
          FROM users WHERE id = $1`,
@@ -418,6 +530,9 @@ function mountAuthRoutes(
         if (matchedStep !== null) {
           const last = user.last_totp_step != null ? Number(user.last_totp_step) : -1;
           if (matchedStep <= last) {
+            // A replayed (already-used) code still counts as a failed
+            // second-factor attempt for throttling purposes.
+            recordLoginFailure(failSubject).catch(() => {});
             return res.status(401).json({ error: 'Code already used; wait for a new one' });
           }
           // Persist the highest step we've accepted. Race-safe: the
@@ -432,6 +547,7 @@ function mountAuthRoutes(
           // Background-migrate the secret to the current encryption
           // format if it was on legacy plaintext / OLD key.
           persistRotation().catch(() => {});
+          clearLoginFailures(failSubject).catch(() => {});
           return completeLogin(res, user);
         }
       }
@@ -454,19 +570,24 @@ function mountAuthRoutes(
             [user.id, newHash, oldHash]
           );
           if (r.rowCount === 0) {
-            await client.query('ROLLBACK');
+            await client.query('ROLLBACK').catch(() => {});
+            recordLoginFailure(failSubject).catch(() => {});
             return res.status(401).json({ error: 'Invalid 2FA code' });
           }
           await client.query('UPDATE backup_codes SET used_at = NOW() WHERE id = $1', [
             r.rows[0].id,
           ]);
           await client.query('COMMIT');
+          clearLoginFailures(failSubject).catch(() => {});
           return completeLogin(res, user);
         } finally {
           client.release();
         }
       }
 
+      // Neither a valid TOTP nor a valid backup code (e.g. malformed code,
+      // or a 6-digit code that didn't match any step) — count it.
+      recordLoginFailure(failSubject).catch(() => {});
       return res.status(401).json({ error: 'Invalid 2FA code' });
     } catch (err) {
       log.error('2FA verify-login failed:', err);
@@ -559,16 +680,16 @@ function mountAuthRoutes(
         [req.auth.userId]
       );
       if (userResult.rowCount === 0) {
-        await client.query('ROLLBACK');
+        await client.query('ROLLBACK').catch(() => {});
         return res.status(404).json({ error: 'User not found' });
       }
       const row = userResult.rows[0];
       if (row.totp_enabled_at) {
-        await client.query('ROLLBACK');
+        await client.query('ROLLBACK').catch(() => {});
         return res.status(409).json({ error: '2FA is already enabled' });
       }
       if (!row.totp_secret) {
-        await client.query('ROLLBACK');
+        await client.query('ROLLBACK').catch(() => {});
         return res
           .status(400)
           .json({ error: 'No pending enrollment — call /auth/2fa/setup first' });
@@ -577,7 +698,7 @@ function mountAuthRoutes(
         await readTotpSecret(pool, req.auth.userId, row.totp_secret);
       const matchedStep = verifyTotpAndGetStep(totpSecretSetup, code);
       if (matchedStep === null) {
-        await client.query('ROLLBACK');
+        await client.query('ROLLBACK').catch(() => {});
         return res.status(401).json({ error: 'Invalid 2FA code' });
       }
       // The pending secret was encrypted under the current key by
@@ -609,7 +730,7 @@ function mountAuthRoutes(
         message: 'Save these backup codes — they are shown only once.',
       });
     } catch (err) {
-      await client.query('ROLLBACK');
+      await client.query('ROLLBACK').catch(() => {});
       log.error('2FA verify-setup failed:', err);
       res.status(500).json({ error: '2FA verify-setup failed' });
     } finally {
@@ -838,7 +959,7 @@ function mountAuthRoutes(
         await client.query('COMMIT');
         res.status(201).json({ ...orgResult.rows[0], role: 'owner' });
       } catch (err) {
-        await client.query('ROLLBACK');
+        await client.query('ROLLBACK').catch(() => {});
         log.error('Create organization failed:', err);
         res.status(500).json({ error: 'Create organization failed' });
       } finally {
@@ -904,7 +1025,7 @@ function mountAuthRoutes(
           [email]
         );
         if (userResult.rowCount === 0) {
-          await client.query('ROLLBACK');
+          await client.query('ROLLBACK').catch(() => {});
           return res
             .status(404)
             .json({ error: 'No user with that email; they must register first' });
@@ -922,7 +1043,7 @@ function mountAuthRoutes(
         if (existing.rowCount > 0 && existing.rows[0].role === 'owner' && targetRole !== 'owner') {
           // Demotion of an existing owner.
           if (req.auth.role !== 'owner') {
-            await client.query('ROLLBACK');
+            await client.query('ROLLBACK').catch(() => {});
             return res.status(403).json({
               error: "Only owners can change an owner's role",
             });
@@ -933,7 +1054,7 @@ function mountAuthRoutes(
             [req.auth.organizationId]
           );
           if (owners.rows[0].n <= 1) {
-            await client.query('ROLLBACK');
+            await client.query('ROLLBACK').catch(() => {});
             return res.status(400).json({
               error: 'Cannot demote the last owner; promote someone else first',
             });
@@ -949,7 +1070,7 @@ function mountAuthRoutes(
         await client.query('COMMIT');
         res.status(201).json({ user_id: targetUserId, role: targetRole });
       } catch (err) {
-        await client.query('ROLLBACK');
+        await client.query('ROLLBACK').catch(() => {});
         log.error('Add member failed:', err);
         res.status(500).json({ error: 'Add member failed' });
       } finally {
@@ -986,12 +1107,12 @@ function mountAuthRoutes(
           [userId, req.auth.organizationId]
         );
         if (target.rowCount === 0) {
-          await client.query('ROLLBACK');
+          await client.query('ROLLBACK').catch(() => {});
           return res.status(404).json({ error: 'Member not found' });
         }
         const targetRole = target.rows[0].role;
         if (targetRole === 'owner' && req.auth.role !== 'owner') {
-          await client.query('ROLLBACK');
+          await client.query('ROLLBACK').catch(() => {});
           return res.status(403).json({ error: 'Only owners can remove an owner' });
         }
         if (targetRole === 'owner') {
@@ -1001,7 +1122,7 @@ function mountAuthRoutes(
             [req.auth.organizationId]
           );
           if (owners.rows[0].n <= 1) {
-            await client.query('ROLLBACK');
+            await client.query('ROLLBACK').catch(() => {});
             return res.status(400).json({
               error: 'Cannot remove the last owner; promote someone else first',
             });
@@ -1015,7 +1136,7 @@ function mountAuthRoutes(
         await client.query('COMMIT');
         res.status(200).json({ message: 'Member removed' });
       } catch (err) {
-        await client.query('ROLLBACK');
+        await client.query('ROLLBACK').catch(() => {});
         log.error('Remove member failed:', err);
         res.status(500).json({ error: 'Remove member failed' });
       } finally {
@@ -1385,16 +1506,16 @@ function mountAuthRoutes(
         [hash]
       );
       if (tokenResult.rowCount === 0) {
-        await client.query('ROLLBACK');
+        await client.query('ROLLBACK').catch(() => {});
         return res.status(404).json({ error: 'Invalid token' });
       }
       const row = tokenResult.rows[0];
       if (row.used_at) {
-        await client.query('ROLLBACK');
+        await client.query('ROLLBACK').catch(() => {});
         return res.status(410).json({ error: 'Token already used' });
       }
       if (new Date(row.expires_at) < new Date()) {
-        await client.query('ROLLBACK');
+        await client.query('ROLLBACK').catch(() => {});
         return res.status(410).json({ error: 'Token expired' });
       }
       const newHash = await hashPassword(new_password);
@@ -1418,7 +1539,7 @@ function mountAuthRoutes(
       await client.query('COMMIT');
       res.status(200).json({ message: 'Password reset' });
     } catch (err) {
-      await client.query('ROLLBACK');
+      await client.query('ROLLBACK').catch(() => {});
       log.error('Password reset failed:', err);
       res.status(500).json({ error: 'Password reset failed' });
     } finally {
@@ -1617,20 +1738,20 @@ function mountAuthRoutes(
         [hash]
       );
       if (inviteResult.rowCount === 0) {
-        await client.query('ROLLBACK');
+        await client.query('ROLLBACK').catch(() => {});
         return res.status(404).json({ error: 'Invitation not found' });
       }
       const inv = inviteResult.rows[0];
       if (inv.revoked_at) {
-        await client.query('ROLLBACK');
+        await client.query('ROLLBACK').catch(() => {});
         return res.status(410).json({ error: 'Invitation revoked' });
       }
       if (inv.accepted_at) {
-        await client.query('ROLLBACK');
+        await client.query('ROLLBACK').catch(() => {});
         return res.status(410).json({ error: 'Invitation already used' });
       }
       if (new Date(inv.expires_at) < new Date()) {
-        await client.query('ROLLBACK');
+        await client.query('ROLLBACK').catch(() => {});
         return res.status(410).json({ error: 'Invitation expired' });
       }
 
@@ -1641,7 +1762,7 @@ function mountAuthRoutes(
         inv.email,
       ]);
       if (existing.rowCount > 0) {
-        await client.query('ROLLBACK');
+        await client.query('ROLLBACK').catch(() => {});
         return res.status(409).json({
           error:
             'A user with this email already exists. Please log in and ask an org admin to add you.',
@@ -1680,7 +1801,7 @@ function mountAuthRoutes(
         organization: { ...orgResult.rows[0], role: inv.role },
       });
     } catch (err) {
-      await client.query('ROLLBACK');
+      await client.query('ROLLBACK').catch(() => {});
       log.error('Accept invitation failed:', err);
       res.status(500).json({ error: 'Accept invitation failed' });
     } finally {

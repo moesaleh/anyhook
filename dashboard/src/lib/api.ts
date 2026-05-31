@@ -44,6 +44,22 @@ export class OfflineError extends Error {
   }
 }
 
+/**
+ * Generic non-OK API response (any 4xx/5xx that isn't already mapped to a
+ * more specific class). Carries the HTTP status so callers can tell a 400
+ * from a 500 — previously every endpoint threw a plain `Error` and lost
+ * that. 401/403 still surface as the more specific `AuthError`, and 429 as
+ * `RateLimitError`, both of which extend `Error` like this one.
+ */
+export class ApiError extends Error {
+  status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
 function isMutating(method: string | undefined): boolean {
   if (!method) return false;
   const m = method.toUpperCase();
@@ -251,11 +267,49 @@ function checkAuth(res: Response): void {
   }
 }
 
+interface RequestOptions {
+  // When true (default) a 401/403 surfaces as AuthError so the auth
+  // context can redirect to /login. Endpoints that are reachable while
+  // logged-OUT (login / register / accept-invite / password reset /
+  // 2FA setup-and-verify-login / public invitation lookup) pass
+  // `auth: false` so a 401 from them reads as a normal failure (e.g.
+  // "Invalid credentials") rather than triggering a redirect.
+  auth?: boolean;
+  // Message used when the response body carries no `error` field.
+  fallbackMsg?: string;
+}
+
+/**
+ * The single fetch funnel every exported endpoint routes through.
+ *
+ * Runs `apiFetch` (which owns the offline short-circuit, read-vs-mutation
+ * timeout, and 429 -> RateLimitError mapping), optionally maps 401/403 to
+ * AuthError, then for any other non-OK status parses the JSON body and
+ * throws `ApiError(status, body.error || fallbackMsg)`. On success it
+ * returns the parsed JSON, tolerating an empty/204 body by resolving to
+ * `{}` — callers typed as `Promise<void>` simply ignore the value.
+ */
+async function request<T>(
+  path: string,
+  init?: RequestInit,
+  opts: RequestOptions = {}
+): Promise<T> {
+  const { auth = true, fallbackMsg = "Request failed" } = opts;
+  const res = await apiFetch(path, init);
+  if (auth) checkAuth(res);
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new ApiError(body?.error || fallbackMsg, res.status);
+  }
+  // Tolerate empty bodies (e.g. 204 No Content) so void endpoints don't
+  // blow up on `res.json()` parsing nothing.
+  return res.json().catch(() => ({})) as Promise<T>;
+}
+
 export async function fetchMe(): Promise<SessionResponse> {
-  const res = await apiFetch("/auth/me");
-  checkAuth(res);
-  if (!res.ok) throw new Error("Failed to load session");
-  return res.json();
+  return request<SessionResponse>("/auth/me", undefined, {
+    fallbackMsg: "Failed to load session",
+  });
 }
 
 /**
@@ -284,16 +338,15 @@ export function loginNeeds2fa(
 }
 
 export async function login(email: string, password: string): Promise<LoginResult> {
-  const res = await apiFetch("/auth/login", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ email, password }),
-  });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body.error || "Login failed");
-  }
-  return res.json();
+  return request<LoginResult>(
+    "/auth/login",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, password }),
+    },
+    { auth: false, fallbackMsg: "Login failed" }
+  );
 }
 
 /**
@@ -307,16 +360,15 @@ export async function verifyLogin2fa(
   pendingToken: string,
   code: string
 ): Promise<SessionResponse> {
-  const res = await apiFetch("/auth/2fa/verify-login", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ pending_token: pendingToken, code }),
-  });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body.error || "2FA verification failed");
-  }
-  return res.json();
+  return request<SessionResponse>(
+    "/auth/2fa/verify-login",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pending_token: pendingToken, code }),
+    },
+    { auth: false, fallbackMsg: "2FA verification failed" }
+  );
 }
 
 /* --- 2FA management (settings page) --- */
@@ -328,10 +380,9 @@ export interface TwoFactorStatus {
 }
 
 export async function fetch2faStatus(): Promise<TwoFactorStatus> {
-  const res = await apiFetch("/auth/2fa/status");
-  checkAuth(res);
-  if (!res.ok) throw new Error("Failed to load 2FA status");
-  return res.json();
+  return request<TwoFactorStatus>("/auth/2fa/status", undefined, {
+    fallbackMsg: "Failed to load 2FA status",
+  });
 }
 
 export interface TwoFactorSetup {
@@ -340,12 +391,13 @@ export interface TwoFactorSetup {
 }
 
 export async function start2faSetup(): Promise<TwoFactorSetup> {
-  const res = await apiFetch("/auth/2fa/setup", { method: "POST" });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body.error || "Failed to start 2FA setup");
-  }
-  return res.json();
+  // checkAuth deliberately skipped (the setup flow surfaces its own
+  // errors); preserved as `auth: false`.
+  return request<TwoFactorSetup>(
+    "/auth/2fa/setup",
+    { method: "POST" },
+    { auth: false, fallbackMsg: "Failed to start 2FA setup" }
+  );
 }
 
 export interface TwoFactorVerifySetup {
@@ -355,16 +407,16 @@ export interface TwoFactorVerifySetup {
 }
 
 export async function verify2faSetup(code: string): Promise<TwoFactorVerifySetup> {
-  const res = await apiFetch("/auth/2fa/verify-setup", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ code }),
-  });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body.error || "Failed to verify 2FA setup");
-  }
-  return res.json();
+  // checkAuth deliberately skipped (see start2faSetup).
+  return request<TwoFactorVerifySetup>(
+    "/auth/2fa/verify-setup",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ code }),
+    },
+    { auth: false, fallbackMsg: "Failed to verify 2FA setup" }
+  );
 }
 
 /* --- Password change + reset --- */
@@ -381,58 +433,55 @@ export interface PasswordResetRequest {
 }
 
 export async function requestPasswordReset(email: string): Promise<PasswordResetRequest> {
-  const res = await apiFetch("/auth/password/reset-request", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ email }),
-  });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body.error || "Reset request failed");
-  }
-  return res.json();
+  // Public flow (user is logged out) — skip the auth redirect mapping.
+  return request<PasswordResetRequest>(
+    "/auth/password/reset-request",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email }),
+    },
+    { auth: false, fallbackMsg: "Reset request failed" }
+  );
 }
 
 export async function resetPassword(token: string, newPassword: string): Promise<void> {
-  const res = await apiFetch("/auth/password/reset", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ token, new_password: newPassword }),
-  });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body.error || "Reset failed");
-  }
+  // Public flow (user is logged out) — skip the auth redirect mapping.
+  await request<void>(
+    "/auth/password/reset",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token, new_password: newPassword }),
+    },
+    { auth: false, fallbackMsg: "Reset failed" }
+  );
 }
 
 export async function changePassword(
   currentPassword: string,
   newPassword: string
 ): Promise<void> {
-  const res = await apiFetch("/auth/password/change", {
+  // Authenticated settings action — a 401 here means the session lapsed,
+  // so let it map to AuthError (and a login redirect) like every other
+  // authenticated endpoint.
+  await request<void>("/auth/password/change", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       current_password: currentPassword,
       new_password: newPassword,
     }),
-  });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body.error || "Password change failed");
-  }
+  }, { fallbackMsg: "Password change failed" });
 }
 
 export async function disable2fa(currentPassword: string, code: string): Promise<void> {
-  const res = await apiFetch("/auth/2fa/disable", {
+  // Authenticated settings action (see changePassword).
+  await request<void>("/auth/2fa/disable", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ current_password: currentPassword, code }),
-  });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body.error || "Failed to disable 2FA");
-  }
+  }, { fallbackMsg: "Failed to disable 2FA" });
 }
 
 export async function registerUser(data: {
@@ -441,82 +490,65 @@ export async function registerUser(data: {
   name?: string;
   organization_name?: string;
 }): Promise<SessionResponse> {
-  const res = await apiFetch("/auth/register", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(data),
-  });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body.error || "Registration failed");
-  }
-  return res.json();
+  // Public flow (user is logged out) — skip the auth redirect mapping.
+  return request<SessionResponse>(
+    "/auth/register",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    },
+    { auth: false, fallbackMsg: "Registration failed" }
+  );
 }
 
 export async function logout(): Promise<void> {
+  // Fire-and-forget: a failed logout still clears client state, so we
+  // deliberately don't route this through `request` / throw on non-OK.
   await apiFetch("/auth/logout", { method: "POST" });
 }
 
 export async function switchOrganization(
   organizationId: string
 ): Promise<{ organization_id: string }> {
-  const res = await apiFetch("/auth/switch-org", {
+  return request<{ organization_id: string }>("/auth/switch-org", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ organization_id: organizationId }),
-  });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body.error || "Failed to switch organization");
-  }
-  return res.json();
+  }, { fallbackMsg: "Failed to switch organization" });
 }
 
 export async function createOrganization(name: string): Promise<Organization> {
-  const res = await apiFetch("/organizations", {
+  return request<Organization>("/organizations", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ name }),
-  });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body.error || "Failed to create organization");
-  }
-  return res.json();
+  }, { fallbackMsg: "Failed to create organization" });
 }
 
 export async function fetchOrgMembers(): Promise<OrganizationMember[]> {
-  const res = await apiFetch("/organizations/current/members");
-  checkAuth(res);
-  if (!res.ok) throw new Error("Failed to load members");
-  return res.json();
+  return request<OrganizationMember[]>("/organizations/current/members", undefined, {
+    fallbackMsg: "Failed to load members",
+  });
 }
 
 export async function addOrgMember(
   email: string,
   role: "owner" | "admin" | "member" = "member"
 ): Promise<{ user_id: string; role: string }> {
-  const res = await apiFetch("/organizations/current/members", {
+  return request<{ user_id: string; role: string }>("/organizations/current/members", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ email, role }),
-  });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body.error || "Failed to add member");
-  }
-  return res.json();
+  }, { fallbackMsg: "Failed to add member" });
 }
 
 export async function removeOrgMember(userId: string): Promise<void> {
-  const res = await apiFetch(
+  await request<void>(
     `/organizations/current/members/${userId}`,
-    { method: "DELETE" }
+    { method: "DELETE" },
+    { fallbackMsg: "Failed to remove member" }
   );
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body.error || "Failed to remove member");
-  }
 }
 
 /* --- Notification preferences --- */
@@ -540,10 +572,11 @@ export interface NotificationPreference {
 }
 
 export async function fetchNotifications(): Promise<NotificationPreference[]> {
-  const res = await apiFetch("/organizations/current/notifications");
-  checkAuth(res);
-  if (!res.ok) throw new Error("Failed to load notifications");
-  return res.json();
+  return request<NotificationPreference[]>(
+    "/organizations/current/notifications",
+    undefined,
+    { fallbackMsg: "Failed to load notifications" }
+  );
 }
 
 export async function createNotification(data: {
@@ -552,42 +585,30 @@ export async function createNotification(data: {
   events?: string[];
   enabled?: boolean;
 }): Promise<NotificationPreference> {
-  const res = await apiFetch("/organizations/current/notifications", {
+  return request<NotificationPreference>("/organizations/current/notifications", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(data),
-  });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body.error || "Create notification failed");
-  }
-  return res.json();
+  }, { fallbackMsg: "Create notification failed" });
 }
 
 export async function updateNotification(
   id: string,
   data: { destination?: string; events?: string[]; enabled?: boolean }
 ): Promise<NotificationPreference> {
-  const res = await apiFetch(`/organizations/current/notifications/${id}`, {
+  return request<NotificationPreference>(`/organizations/current/notifications/${id}`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(data),
-  });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body.error || "Update notification failed");
-  }
-  return res.json();
+  }, { fallbackMsg: "Update notification failed" });
 }
 
 export async function deleteNotification(id: string): Promise<void> {
-  const res = await apiFetch(`/organizations/current/notifications/${id}`, {
-    method: "DELETE",
-  });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body.error || "Delete notification failed");
-  }
+  await request<void>(
+    `/organizations/current/notifications/${id}`,
+    { method: "DELETE" },
+    { fallbackMsg: "Delete notification failed" }
+  );
 }
 
 /* --- Invitations --- */
@@ -612,10 +633,11 @@ export interface CreatedInvitation extends Invitation {
 }
 
 export async function fetchInvitations(): Promise<Invitation[]> {
-  const res = await apiFetch("/organizations/current/invitations");
-  checkAuth(res);
-  if (!res.ok) throw new Error("Failed to load invitations");
-  return res.json();
+  return request<Invitation[]>(
+    "/organizations/current/invitations",
+    undefined,
+    { fallbackMsg: "Failed to load invitations" }
+  );
 }
 
 export async function createInvitation(data: {
@@ -623,26 +645,19 @@ export async function createInvitation(data: {
   role?: "owner" | "admin" | "member";
   expires_in_days?: number;
 }): Promise<CreatedInvitation> {
-  const res = await apiFetch("/organizations/current/invitations", {
+  return request<CreatedInvitation>("/organizations/current/invitations", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(data),
-  });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body.error || "Failed to create invitation");
-  }
-  return res.json();
+  }, { fallbackMsg: "Failed to create invitation" });
 }
 
 export async function revokeInvitation(id: string): Promise<void> {
-  const res = await apiFetch(`/organizations/current/invitations/${id}`, {
-    method: "DELETE",
-  });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body.error || "Failed to revoke invitation");
-  }
+  await request<void>(
+    `/organizations/current/invitations/${id}`,
+    { method: "DELETE" },
+    { fallbackMsg: "Failed to revoke invitation" }
+  );
 }
 
 export interface InvitationLookup {
@@ -654,12 +669,13 @@ export interface InvitationLookup {
 
 /** Anonymous: read-only lookup for the registration page. */
 export async function lookupInvitation(token: string): Promise<InvitationLookup> {
-  const res = await apiFetch(`/invitations/${encodeURIComponent(token)}`);
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body.error || "Invitation not found");
-  }
-  return res.json();
+  // Anonymous endpoint — a 401 isn't an auth-session failure, so skip the
+  // AuthError mapping (`auth: false`).
+  return request<InvitationLookup>(
+    `/invitations/${encodeURIComponent(token)}`,
+    undefined,
+    { auth: false, fallbackMsg: "Invitation not found" }
+  );
 }
 
 /** Anonymous: redeem an invitation token + create a user. */
@@ -668,68 +684,64 @@ export async function acceptInvite(data: {
   password: string;
   name?: string;
 }): Promise<SessionResponse> {
-  const res = await apiFetch("/auth/accept-invite", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(data),
-  });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body.error || "Failed to accept invitation");
-  }
-  return res.json();
+  // Anonymous endpoint (see lookupInvitation).
+  return request<SessionResponse>(
+    "/auth/accept-invite",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    },
+    { auth: false, fallbackMsg: "Failed to accept invitation" }
+  );
 }
 
 export async function fetchQuotas(): Promise<QuotasResponse> {
-  const res = await apiFetch("/organizations/current/quotas");
-  checkAuth(res);
-  if (!res.ok) throw new Error("Failed to load quotas");
-  return res.json();
+  return request<QuotasResponse>("/organizations/current/quotas", undefined, {
+    fallbackMsg: "Failed to load quotas",
+  });
 }
 
 export async function fetchApiKeys(): Promise<ApiKey[]> {
-  const res = await apiFetch("/organizations/current/api-keys");
-  checkAuth(res);
-  if (!res.ok) throw new Error("Failed to load API keys");
-  return res.json();
+  return request<ApiKey[]>("/organizations/current/api-keys", undefined, {
+    fallbackMsg: "Failed to load API keys",
+  });
 }
 
 export async function createApiKey(data: {
   name: string;
   expires_in_days?: number;
 }): Promise<CreatedApiKey> {
-  const res = await apiFetch("/organizations/current/api-keys", {
+  return request<CreatedApiKey>("/organizations/current/api-keys", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(data),
-  });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body.error || "Failed to create API key");
-  }
-  return res.json();
+  }, { fallbackMsg: "Failed to create API key" });
 }
 
 export async function revokeApiKey(id: string): Promise<void> {
-  const res = await apiFetch(`/organizations/current/api-keys/${id}`, {
-    method: "DELETE",
-  });
-  if (!res.ok) throw new Error("Failed to revoke API key");
+  await request<void>(
+    `/organizations/current/api-keys/${id}`,
+    { method: "DELETE" },
+    { fallbackMsg: "Failed to revoke API key" }
+  );
 }
 
 // --- Existing endpoints (now scoped to caller's org via cookie/api key) ---
 
 export async function fetchHealth(): Promise<HealthResponse> {
-  const res = await apiFetch("/health");
-  if (!res.ok) throw new Error("Health check failed");
-  return res.json();
+  // /health is unauthenticated — keep it out of the AuthError redirect
+  // path (`auth: false`), matching the original no-checkAuth behavior.
+  return request<HealthResponse>("/health", undefined, {
+    auth: false,
+    fallbackMsg: "Health check failed",
+  });
 }
 
 export async function fetchSubscriptions(): Promise<Subscription[]> {
-  const res = await apiFetch("/subscriptions");
-  checkAuth(res);
-  if (!res.ok) throw new Error("Failed to fetch subscriptions");
-  return res.json();
+  return request<Subscription[]>("/subscriptions", undefined, {
+    fallbackMsg: "Failed to fetch subscriptions",
+  });
 }
 
 export interface SubscriptionPage {
@@ -756,33 +768,29 @@ export async function fetchSubscriptionsPage(
     limit: String(Math.min(100, Math.max(1, limit))),
   });
   if (search.trim()) params.set("search", search.trim());
-  const res = await apiFetch(`/subscriptions?${params}`);
-  checkAuth(res);
-  if (!res.ok) throw new Error("Failed to fetch subscriptions");
-  return res.json();
+  return request<SubscriptionPage>(`/subscriptions?${params}`, undefined, {
+    fallbackMsg: "Failed to fetch subscriptions",
+  });
 }
 
 export async function fetchSubscription(id: string): Promise<Subscription> {
-  const res = await apiFetch(`/subscriptions/${id}`);
-  checkAuth(res);
-  if (!res.ok) throw new Error("Subscription not found");
-  return res.json();
+  return request<Subscription>(`/subscriptions/${id}`, undefined, {
+    fallbackMsg: "Subscription not found",
+  });
 }
 
 export async function fetchSubscriptionStatus(
   id: string
 ): Promise<SubscriptionStatus> {
-  const res = await apiFetch(`/subscriptions/${id}/status`);
-  checkAuth(res);
-  if (!res.ok) throw new Error("Failed to fetch status");
-  return res.json();
+  return request<SubscriptionStatus>(`/subscriptions/${id}/status`, undefined, {
+    fallbackMsg: "Failed to fetch status",
+  });
 }
 
 export async function fetchAllStatuses(): Promise<BulkStatusResponse> {
-  const res = await apiFetch("/subscriptions/status/all");
-  checkAuth(res);
-  if (!res.ok) throw new Error("Failed to fetch statuses");
-  return res.json();
+  return request<BulkStatusResponse>("/subscriptions/status/all", undefined, {
+    fallbackMsg: "Failed to fetch statuses",
+  });
 }
 
 export async function fetchDeliveries(
@@ -796,17 +804,15 @@ export async function fetchDeliveries(
     limit: String(limit),
     status,
   });
-  const res = await apiFetch(`/subscriptions/${id}/deliveries?${params}`);
-  checkAuth(res);
-  if (!res.ok) throw new Error("Failed to fetch deliveries");
-  return res.json();
+  return request<DeliveryPage>(`/subscriptions/${id}/deliveries?${params}`, undefined, {
+    fallbackMsg: "Failed to fetch deliveries",
+  });
 }
 
 export async function fetchDeliveryStats(id: string): Promise<DeliveryStats> {
-  const res = await apiFetch(`/subscriptions/${id}/deliveries/stats`);
-  checkAuth(res);
-  if (!res.ok) throw new Error("Failed to fetch delivery stats");
-  return res.json();
+  return request<DeliveryStats>(`/subscriptions/${id}/deliveries/stats`, undefined, {
+    fallbackMsg: "Failed to fetch delivery stats",
+  });
 }
 
 export interface DeliveryTimeseriesBucket {
@@ -826,17 +832,15 @@ export async function fetchDeliveryTimeseries(
   buckets = 24
 ): Promise<DeliveryTimeseries> {
   const params = new URLSearchParams({ range, buckets: String(buckets) });
-  const res = await apiFetch(`/deliveries/timeseries?${params}`);
-  checkAuth(res);
-  if (!res.ok) throw new Error("Failed to fetch delivery timeseries");
-  return res.json();
+  return request<DeliveryTimeseries>(`/deliveries/timeseries?${params}`, undefined, {
+    fallbackMsg: "Failed to fetch delivery timeseries",
+  });
 }
 
 export async function fetchGlobalDeliveryStats(): Promise<GlobalDeliveryStats> {
-  const res = await apiFetch("/deliveries/stats");
-  checkAuth(res);
-  if (!res.ok) throw new Error("Failed to fetch global delivery stats");
-  return res.json();
+  return request<GlobalDeliveryStats>("/deliveries/stats", undefined, {
+    fallbackMsg: "Failed to fetch global delivery stats",
+  });
 }
 
 export interface CreateSubscriptionResponse {
@@ -852,16 +856,11 @@ export async function createSubscription(data: {
   args: Record<string, unknown>;
   webhook_url: string;
 }): Promise<CreateSubscriptionResponse> {
-  const res = await apiFetch("/subscribe", {
+  return request<CreateSubscriptionResponse>("/subscribe", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(data),
-  });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body.error || "Failed to create subscription");
-  }
-  return res.json();
+  }, { fallbackMsg: "Failed to create subscription" });
 }
 
 export interface BulkSubscriptionEntry {
@@ -885,16 +884,11 @@ export interface BulkSubscriptionResponse {
 export async function createSubscriptionsBulk(
   subscriptions: BulkSubscriptionEntry[]
 ): Promise<BulkSubscriptionResponse> {
-  const res = await apiFetch("/subscribe/bulk", {
+  return request<BulkSubscriptionResponse>("/subscribe/bulk", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ subscriptions }),
-  });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body.error || "Bulk import failed");
-  }
-  return res.json();
+  }, { fallbackMsg: "Bulk import failed" });
 }
 
 export async function updateSubscription(
@@ -905,26 +899,17 @@ export async function updateSubscription(
     webhook_url: string;
   }
 ): Promise<Subscription> {
-  const res = await apiFetch(`/subscriptions/${id}`, {
+  return request<Subscription>(`/subscriptions/${id}`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(data),
-  });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body.error || "Failed to update subscription");
-  }
-  return res.json();
+  }, { fallbackMsg: "Failed to update subscription" });
 }
 
 export async function deleteSubscription(id: string): Promise<void> {
-  const res = await apiFetch("/unsubscribe", {
+  await request<void>("/unsubscribe", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ subscription_id: id }),
-  });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body.error || "Failed to delete subscription");
-  }
+  }, { fallbackMsg: "Failed to delete subscription" });
 }

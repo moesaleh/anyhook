@@ -21,10 +21,21 @@ const eslintConfig = defineConfig([
     "playwright.config.ts",
   ]),
   {
+    // eslint-config-next 16.x added very strict React Hooks rules. Rather than
+    // disabling them outright, they are downgraded to `warn` for the existing
+    // app/component/lib source — much of which legitimately fetches-on-mount
+    // via `setState` inside an effect, exposes context-bound helper components,
+    // or reads refs during render. These are surfaced (so they're visible in
+    // lint output and can be paid down) but don't hard-fail CI on patterns the
+    // codebase already relied on. Test files and tooling outside `src/` keep
+    // the default (error) severity.
+    //
+    // NOTE: keep this glob broad enough to cover every `src/` file using the
+    // fetch-on-mount pattern — narrowing it (e.g. app+lib only) silently
+    // promotes the same pattern in `src/components/**` to a build-breaking
+    // error.
+    files: ["src/**/*.{ts,tsx}"],
     rules: {
-      // eslint-config-next 16.x added very strict React Hooks rules that flag
-      // patterns the existing codebase uses heavily. Downgrade to warn so CI
-      // doesn't block; revisit if the patterns are actually causing bugs.
       "react-hooks/set-state-in-effect": "warn",
       "react-hooks/static-components": "warn",
       "react-hooks/refs": "warn",

@@ -1,29 +1,30 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useState } from "react";
 import { fetchHealth } from "@/lib/api";
 import type { HealthResponse } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { useVisiblePolling } from "@/lib/use-visible-polling";
 import { Database, HardDrive, AlertTriangle } from "lucide-react";
+
+const POLL_INTERVAL_MS = 30_000;
 
 export function ServiceHealth() {
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [error, setError] = useState(false);
 
-  useEffect(() => {
-    async function check() {
-      try {
-        const data = await fetchHealth();
-        setHealth(data);
-        setError(false);
-      } catch {
-        setError(true);
-      }
+  const check = useCallback(async () => {
+    try {
+      const data = await fetchHealth();
+      setHealth(data);
+      setError(false);
+    } catch {
+      setError(true);
     }
-    check();
-    const interval = setInterval(check, 30000);
-    return () => clearInterval(interval);
   }, []);
+
+  // Initial check + recurring recheck on a cadence; pauses on hidden tabs.
+  useVisiblePolling(check, POLL_INTERVAL_MS, { immediate: true });
 
   if (error) {
     return (

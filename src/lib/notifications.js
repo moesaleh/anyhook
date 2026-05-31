@@ -14,6 +14,7 @@
 
 const axios = require('axios');
 const { createLogger } = require('./logger');
+const { guardedAxiosConfig, SsrfBlockedError } = require('./ssrf-guard');
 
 const log = createLogger('notifications');
 
@@ -54,8 +55,9 @@ function formatEmailBody(event) {
     `Event ID:     ${event.eventId}`,
     event.organizationName ? `Organization: ${event.organizationName}` : null,
     ``,
-    `The original event has been published to the dlq_events Kafka topic`,
-    `for downstream processing. Investigate via the AnyHook dashboard.`,
+    `The original event is parked in the Dead Letter Queue (dlq_events) and`,
+    `will NOT be retried automatically — it awaits an operator redrive.`,
+    `Investigate and replay it via the AnyHook dashboard.`,
   ]
     .filter(line => line !== null)
     .join('\n');
@@ -73,17 +75,41 @@ async function sendEmailNotification(emailTransport, pref, event) {
 }
 
 async function sendSlackNotification(pref, event) {
-  // Slack webhooks are user-supplied URLs; we already validated at
-  // create-time that they're public-routable. axios timeouts cap the
-  // worst case at 10s per webhook so a slow Slack workspace doesn't
-  // stall the dispatcher.
+  // Slack webhooks are user-supplied URLs validated at create-time, but a
+  // create-time hostname check is defeated by DNS rebinding — the record can
+  // re-point at 169.254.169.254 (cloud IMDS) or an RFC1918 host before this
+  // request fires. Route the POST through the SSRF guard so we resolve the
+  // host NOW, reject any private/IMDS address, pin the socket to the vetted
+  // IP, and (critically) cap redirects at 0 so a 302 -> http://169.254...
+  // can't bounce us into an exfiltration sink. axios timeouts still cap the
+  // worst case at 10s per webhook so a slow Slack workspace doesn't stall
+  // the dispatcher.
+  let cfg;
   try {
-    const res = await axios.post(pref.destination, formatSlackPayload(event), {
+    cfg = await guardedAxiosConfig(pref.destination, {
       timeout: 10_000,
       headers: { 'Content-Type': 'application/json' },
     });
+  } catch (err) {
+    if (err instanceof SsrfBlockedError) {
+      // Blocked at resolve/validate time — never opened the socket. Surface a
+      // stable reason; log the host (never the full URL, which can embed a
+      // Slack webhook token) so an operator can see what was refused.
+      log.warn(
+        `Slack notification blocked by SSRF guard for pref ${pref.id}: ${err.reason}` +
+          (err.details?.host ? ` (host=${err.details.host})` : '')
+      );
+      return { delivered: false, reason: 'ssrf_blocked', error: err.reason };
+    }
+    return { delivered: false, reason: 'http_error', error: err.message };
+  }
+
+  try {
+    const res = await axios.post(pref.destination, formatSlackPayload(event), cfg);
     return { delivered: true, status: res.status };
   } catch (err) {
+    // With maxRedirects:0 a 3xx is rejected by axios rather than chased; treat
+    // it as a (non-)delivery result instead of following it to a private host.
     return {
       delivered: false,
       reason: 'http_error',
@@ -323,4 +349,11 @@ module.exports = {
   formatEmailBody,
   NOTIFICATION_RETRY_INTERVALS,
   NOTIFICATION_MAX_ATTEMPTS,
+  // Exported for the persistence/retry state-machine tests (P2-20): sendOnWire
+  // is the single wire seam both the synchronous dispatch and the retry poller
+  // go through, so a test can stub it to drive transient-failure -> backoff ->
+  // success/terminal deterministically without real network or SMTP. Not part
+  // of the public dispatch API; the dispatcher only imports the two pollers.
+  sendOnWire,
+  recordAttempt,
 };

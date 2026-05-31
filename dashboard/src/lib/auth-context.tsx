@@ -18,6 +18,7 @@ import {
   type User,
   type Organization,
 } from "./api";
+import { isPublicPath } from "./public-paths";
 
 interface AuthContextValue {
   user: User | null;
@@ -31,8 +32,6 @@ interface AuthContextValue {
 }
 
 const AuthContext = createContext<AuthContextValue | null>(null);
-
-const PUBLIC_PATHS = new Set(["/login", "/register"]);
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const router = useRouter();
@@ -50,8 +49,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     } catch (err) {
       if (err instanceof AuthError) {
         setSession(null);
-        // Only redirect if we're on a protected path
-        if (!PUBLIC_PATHS.has(pathname)) {
+        // Only redirect if we're on a protected path. Uses the same
+        // public-route table as the middleware so we never bounce a user
+        // off a genuinely public page (e.g. /forgot-password,
+        // /reset-password, /invitations/[token]).
+        if (!isPublicPath(pathname)) {
           router.replace("/login");
         }
       } else {

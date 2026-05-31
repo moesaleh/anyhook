@@ -70,22 +70,31 @@ AnyHook can be configured using environment variables. See [.env.example](.env.e
 
 ## 🏗️ Architecture
 
-AnyHook consists of three main components:
+AnyHook consists of three backend services (one Docker image, three process
+entry points) over a Kafka event bus, with PostgreSQL as the system of record
+and Redis as a hot cache:
 
-1. **Subscription Management**
-   - Handles subscription creation and deletion
-   - Manages subscription metadata
-   - Provides REST API endpoints
+1. **Subscription Management** — `src/subscription-management/index.js`
+   - Multi-tenant REST API (auth, organizations/members, subscriptions CRUD,
+     API keys, delivery history/stats, notification preferences, admin)
+   - Owns Kafka topic creation; writes Kafka publishes to the transactional
+     **outbox** inside the same DB transaction as the subscription row
+   - Enforces per-org quotas and rate limits
 
-2. **Subscription Connector**
-   - Manages connections to data sources
-   - Handles protocol-specific logic
-   - Ensures reliable data streaming
+2. **Subscription Connector** — `src/subscription-connector/index.js`
+   - Holds upstream GraphQL/WebSocket connections open
+   - Turns every source message into a `connection_events` Kafka record
+   - Consumes `subscription_events` / `update_events` / `unsubscribe_events`
 
-3. **Webhook Dispatcher**
-   - Delivers data to webhook endpoints
-   - Implements retry logic
-   - Manages failed delivery handling
+3. **Webhook Dispatcher** — `src/webhook-dispatcher/index.js`
+   - Signs (HMAC-SHA256) and POSTs payloads to webhook endpoints
+   - Runs the persistent **retry-queue**, **outbox drainer**, and
+     **notification-attempt** pollers (all `FOR UPDATE SKIP LOCKED`)
+   - Moves exhausted deliveries to the Dead Letter Queue
+
+> A fuller writeup — every Kafka topic, the outbox flow, the delivery
+> guarantee, scaling/HA constraints, and architecture decision records — is in
+> [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## 🤝 Contributing
 
@@ -112,79 +121,198 @@ Special thanks to all our contributors and the open source community!
 
 ## Overview
 
-The Subscription Proxy Server acts as an intermediary between external data sources (such as GraphQL and WebSocket connections) and webhook endpoints, dynamically managing subscriptions and forwarding data to webhooks in real-time. It is highly scalable, fault-tolerant, and capable of handling various connection types. The system is designed with three major components: Subscription Management, Subscription Connector, and Webhook Dispatcher, all integrated with Kafka, Redis, and PostgreSQL for event-driven messaging, caching, and persistence.
+AnyHook is a multi-tenant subscription proxy. A tenant (an **organization**)
+registers a subscription pointing at an upstream **source** (a GraphQL
+subscription or a WebSocket endpoint) and a **webhook URL**; AnyHook holds the
+upstream connection open and delivers every source message as a signed HTTP POST
+to the webhook, with a persistent retry ladder and a Dead Letter Queue for
+deliveries that exhaust their retries. It is built from three backend services
+(Subscription Management, Subscription Connector, Webhook Dispatcher) over a
+Kafka event bus, with PostgreSQL as the system of record, Redis as a hot cache,
+and a Next.js dashboard.
+
+> This section summarises the architecture. The authoritative, fuller version —
+> including the transactional outbox internals, scaling/HA constraints, and
+> architecture decision records — lives in
+> [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## Architecture
 
 The system is divided into the following components:
 
 ### 1. **Subscription Management Component**
-- **Role**: Handles the creation and deletion of subscriptions.
-- **Endpoints**:
-  - `/subscribe`: Creates a new subscription, stores it in PostgreSQL and Redis, and sends an event to Kafka.
-  - `/unsubscribe`: Deletes an existing subscription, removes it from PostgreSQL and Redis, and sends an event to Kafka.
-- **Persistence**: Subscriptions are stored in a PostgreSQL database and cached in Redis for fast access.
-- **Event-Driven Messaging**: Events are published to Kafka topics for further processing by the Subscription Connector.
+- **Role**: Multi-tenant REST API — auth, organizations/members, subscription
+  CRUD, API keys, delivery history/stats, notification preferences, and admin
+  endpoints. It is the **only** service that creates Kafka topics.
+- **Key endpoints**:
+  - `/subscribe`: Creates a subscription. In a single DB transaction it inserts
+    the subscription row **and** writes the Kafka publish into the transactional
+    outbox (`outbox_events`); then it warms the Redis cache. It does **not**
+    publish to Kafka inline.
+  - `/unsubscribe`, `PUT /subscriptions/:id`, bulk subscribe: same outbox
+    pattern, writing `unsubscribe_events` / `update_events` / `subscription_events`
+    rows atomically with the data change.
+- **Multi-tenancy**: every tenant query is scoped by `organization_id` from the
+  session/API key; per-org subscription/API-key **quotas** (advisory-locked) and
+  Redis **rate limiting** are enforced here.
+- **Persistence**: PostgreSQL is the system of record; Redis caches subscription
+  rows under the `sub:*` namespace for fast lookup.
 
 ### 2. **Subscription Connector Component**
-- **Role**: Manages connections based on subscription data, opening connections to GraphQL or WebSocket servers as required.
+- **Role**: Manages upstream connections based on subscription data, opening
+  GraphQL or WebSocket connections as required and publishing each received
+  message to `connection_events`.
 - **Capabilities**:
-  - Dynamically selects the correct handler (GraphQL or WebSocket) based on the subscription type.
-  - Re-establishes connections when restarted by loading subscriptions from Redis.
-  - Listens for `subscription_events` and `unsubscribe_events` from Kafka to create or close connections.
-- **Handlers**:
-  - **GraphQLHandler**: Connects to GraphQL subscriptions and listens for incoming events.
-  - **WebSocketHandler**: Connects to WebSocket endpoints and listens for messages.
-- **Fault Recovery**: On restart, it reloads all active subscriptions from Redis to ensure no subscriptions are lost.
+  - Selects the handler (GraphQL or WebSocket) from `connection_type`.
+  - Consumes `subscription_events` (open), `update_events` (reconnect with new
+    config), and `unsubscribe_events` (close) from Kafka.
+  - On restart, reloads all active subscriptions via a Redis `SCAN MATCH 'sub:*'`
+    so connections survive a connector bounce.
+- **Handlers**: **GraphQLHandler** and **WebSocketHandler**, each generating the
+  `eventId` (producer-side) that the dispatcher uses for idempotency.
+- **Scaling caveat**: connections live in process memory and every pod reloads
+  **all** `sub:*` keys, so this service must run as a **single replica** until
+  connection ownership is sharded by partition (see Scaling below).
 
 ### 3. **Webhook Dispatcher Component**
-- **Role**: Forwards data received from subscriptions to the appropriate webhook URL.
+- **Role**: Delivers `connection_events` to webhook URLs and runs the system's
+  background pollers.
 - **Capabilities**:
-  - Consumes events from Kafka topics and sends the corresponding data to the registered webhook.
-  - Handles retry logic for failed webhook deliveries using exponential backoff, with intervals of 15 minutes, 1 hour, 2 hours, 6 hours, 12 hours, and 24 hours.
-  - Moves failed messages to a Dead Letter Queue (DLQ) after maximum retry attempts and notifies the system admin.
+  - Consumes `connection_events`, looks up the subscription (Redis, falling back
+    to Postgres and re-warming), and POSTs the payload **signed** with
+    HMAC-SHA256 (`X-AnyHook-Signature` / `X-AnyHook-Timestamp`).
+  - On failure, enqueues into `pending_retries`; the retry poller re-fires on a
+    ladder of 15 minutes, 1 hour, 2 hours, 6 hours, 12 hours, and 24 hours.
+  - Moves deliveries that exhaust the ladder to the Dead Letter Queue
+    (`dlq_events`) and dispatches a notification.
+  - Also runs the **outbox drainer** (publishes the management service's outbox
+    rows to Kafka) and the **notification-attempt** poller — all three pollers
+    use `FOR UPDATE SKIP LOCKED` and are multi-pod safe.
 
 ### 4. **Kafka**
-- **Role**: Acts as the event bus for communication between components.
-- **Kafka Topics**:
-  - `subscription_events`: Published by the Subscription Management component when a new subscription is created.
-  - `unsubscribe_events`: Published when a subscription is deleted.
-  - `connection_events`: Consumed by the Webhook Dispatcher to forward data to webhooks.
-  - `dlq_events`: Used for messages that failed all retry attempts.
+- **Role**: Event bus decoupling the API write path from connection setup and
+  webhook delivery. Keyed by `subscriptionId` (per-subscription ordering at the
+  bus level). Topics are created once by Subscription Management with
+  `KAFKA_PARTITIONS` partitions (default 8).
+- **Kafka Topics** (all five):
+  - `subscription_events`: open the upstream connection for a new subscription.
+  - `update_events`: subscription config changed — reconnect with the new config.
+  - `unsubscribe_events`: subscription removed — close the upstream connection.
+  - `connection_events`: one record per upstream source message; consumed by the
+    Webhook Dispatcher for delivery.
+  - `dlq_events`: tombstone for deliveries that exhausted the retry ladder.
+    **Write-only today — there is no DLQ consumer/redrive yet.**
 
 ### 5. **Redis**
-- **Role**: Caching layer to store subscription details for fast access by the Subscription Connector. Redis stores active subscriptions, and the connector reloads connections from Redis upon restarting.
-- **Fault Tolerance**: Redis ensures that active subscriptions are maintained in memory, and the connector can reload subscriptions after failure or restart.
+- **Role**: Hot cache for subscription rows (`sub:*`) read on the delivery hot
+  path and by the connector on reload, plus rate-limit counters. Treated as a
+  cache: the dispatcher falls back to Postgres on a miss and re-warms.
 
 ### 6. **PostgreSQL**
-- **Role**: Persistent storage for subscription data. This ensures that subscriptions can be permanently stored and recovered after system failures.
+- **Role**: System of record. Beyond subscriptions and tenants, it holds the
+  delivery history (`delivery_events`), the retry queue (`pending_retries`), the
+  transactional outbox (`outbox_events`), persisted notification attempts
+  (`notification_attempts`), and the idempotency table (`processed_events`).
 
 ---
 
 ## System Flow
 
-1. **Subscription Creation**: When a client subscribes through the `/subscribe` API, the subscription is saved in PostgreSQL, cached in Redis, and a `subscription_events` message is published to Kafka.
-2. **Connection Handling**: The Subscription Connector component listens to Kafka events and establishes a connection (either GraphQL or WebSocket) based on the subscription type.
-3. **Data Handling**: When data is received through the connection, it is published to the `connection_events` topic in Kafka.
-4. **Webhook Dispatching**: The Webhook Dispatcher listens to `connection_events` and forwards the received data to the specified webhook. It retries delivery on failure and eventually sends failed messages to the DLQ if all retries fail.
+1. **Subscription creation (transactional outbox)**: A client calls `/subscribe`.
+   In one PostgreSQL transaction, Subscription Management inserts the subscription
+   row **and** an `outbox_events` row recording the intended `subscription_events`
+   publish, then commits and warms the Redis `sub:*` cache. The Kafka publish is
+   **not** done inline — this removes the "DB committed but Kafka publish lost"
+   failure mode.
+2. **Outbox drain**: The Webhook Dispatcher's outbox drainer claims undelivered
+   `outbox_events` rows (`FOR UPDATE SKIP LOCKED`) and publishes them to Kafka,
+   marking each delivered on success.
+3. **Connection handling**: The Subscription Connector consumes
+   `subscription_events` / `update_events` / `unsubscribe_events` and opens,
+   reconnects, or closes the GraphQL/WebSocket upstream accordingly.
+4. **Data handling**: Each upstream message is published to `connection_events`
+   (keyed by `subscriptionId`, with a producer-generated `eventId`).
+5. **Webhook dispatching**: The Webhook Dispatcher consumes `connection_events`,
+   looks up the subscription (Redis → Postgres fallback), and POSTs the signed
+   payload. On failure it enqueues into `pending_retries`; the retry poller
+   re-fires on the backoff ladder and, after the last attempt, publishes to
+   `dlq_events` and dispatches an operator notification.
+
+## Delivery guarantee
+
+AnyHook delivers each source event **at least once**. It does **not** provide
+exactly-once or globally ordered delivery. Concretely:
+
+- Kafka consumers use **manual offset commits**, so a crash before commit replays
+  the message rather than dropping it.
+- Redeliveries are **deduplicated best-effort**: the dispatcher checks for an
+  existing `delivery_events` row for `(subscription_id, event_id)` before
+  sending. A `processed_events` table (primary-keyed on that pair) is present in
+  the schema to make this an atomic, DB-enforced gate, but the dispatcher is not
+  yet wired to it — so a tight redelivery race can still double-fire.
+- A **retried** event can arrive **after** a later live event for the same
+  subscription. Receivers should treat `X-AnyHook-Event-Id` as the dedup/ordering
+  key and tolerate reordering.
+
+See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) (§6 and ADR-0002) for details.
+
+## Scaling & high availability
+
+- **Workers scale by Kafka partition.** Topics are created with 8 partitions by
+  default; the Webhook Dispatcher can run up to that many replicas, and its
+  pollers (`pending_retries`, `outbox_events`, `notification_attempts`) are all
+  `FOR UPDATE SKIP LOCKED` claim loops that are multi-pod safe. Migrations run as
+  a one-shot `migrate` job that the app services gate on, not on every API boot.
+- **The Subscription Connector must run as a single replica** until connection
+  ownership is sharded by partition: each pod reloads **all** `sub:*` keys from
+  Redis, so multiple connector replicas would open duplicate upstream
+  connections and fan out duplicate events. `docker-compose.yml` pins it to
+  `deploy.replicas: 1`.
+- **Kafka durability.** The default compose stack is a single-node broker
+  (`RF=1`) — fine for dev/CI, a SPOF for production. For production, run a
+  3-broker quorum (`RF>=3`, `min.insync.replicas=2`) with producer
+  `acks: 'all'` + `idempotent: true`; the compose file documents the prod
+  topology inline.
+
+## Observability
+
+Each service runs an **internal** metrics/health HTTP server on `METRICS_PORT`
+(default **9090**) exposing `GET /metrics` (Prometheus) and `GET /health`. This
+port is **not** published by `docker-compose.yml`, so `/metrics` is reachable
+only inside the Docker network — it is not part of the public API surface.
+(Subscription Management additionally exposes `/health/live` liveness and
+`/health` readiness on its public Express app.) Prometheus alert rules live in
+[`prometheus/alerts.yml`](prometheus/alerts.yml) with a matching
+[`RUNBOOK`](docs/RUNBOOK.md).
 
 ---
 
 ## Technologies Used
 
-- **Node.js**: Primary language for the Subscription Proxy Server.
-- **Redis**: Used for caching subscription data.
-- **PostgreSQL**: Persistent storage for subscriptions.
-- **Kafka**: Event-driven messaging between components.
-- **GraphQL & WebSocket**: Supported connection types.
-- **Axios**: Used in the Webhook Dispatcher to send data to webhooks.
+- **Node.js**: Primary runtime for all three backend services.
+- **PostgreSQL**: System of record (subscriptions, tenants, delivery history,
+  outbox, retry queue, notification attempts).
+- **Redis**: Hot cache for subscription rows and rate-limit counters.
+- **Kafka**: Event bus between the services.
+- **GraphQL & WebSocket**: Supported upstream source connection types.
+- **Axios**: Outbound webhook HTTP client in the Webhook Dispatcher.
+- **Next.js / React**: Management dashboard (`dashboard/`).
 
 ---
 
 ## Fault Tolerance and Recovery
 
-- **Redis Caching**: Ensures active subscriptions are quickly accessible and can be reloaded after service restarts.
-- **Automatic Reconnection**: On restart, the Subscription Connector reloads active subscriptions from Redis and re-establishes the connections.
-- **Retry Logic**: For failed webhook deliveries, the system retries with exponential backoff. After reaching the retry limit, messages are moved to the Dead Letter Queue (DLQ).
+- **Transactional outbox**: Kafka publishes are written to `outbox_events` in the
+  same DB transaction as the data change, so a crash between commit and publish
+  cannot lose the event; the dispatcher's drainer publishes it on the next sweep.
+- **Persistent, multi-pod-safe queues**: `pending_retries`, `outbox_events`, and
+  `notification_attempts` survive restarts and are claimed with
+  `FOR UPDATE SKIP LOCKED` + stale-lock reclaim, so a crashed worker's in-flight
+  rows are picked up by the next poll cycle.
+- **Automatic reconnection**: On restart the Subscription Connector reloads
+  active subscriptions from Redis and re-establishes upstream connections.
+- **Retry ladder + DLQ**: Failed webhook deliveries retry on a fixed backoff
+  ladder (15 m, 1 h, 2 h, 6 h, 12 h, 24 h); after the last attempt the message is
+  moved to the Dead Letter Queue and an operator notification is dispatched.
 
 ---

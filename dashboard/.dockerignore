@@ -1,0 +1,48 @@
+# Build-context exclusions for the dashboard image (dashboard/Dockerfile uses
+# `COPY . .` in the builder stage). Prevents .env* secrets, the host's
+# node_modules, prior .next build output, git history, and test/doc noise from
+# entering the builder layer. Keep in sync with dashboard/.gitignore.
+#
+# NOTE: do NOT exclude package.json / package-lock.json / public / src /
+# next.config.* / tsconfig.json -- the build needs them.
+
+# Secrets / local env
+.env
+.env.*
+
+# Dependencies (reinstalled via `npm ci` inside the image)
+node_modules
+**/node_modules
+
+# Prior build output (rebuilt by `npm run build`)
+.next
+out
+
+# Version control
+.git
+.gitignore
+.gitattributes
+
+# Tests + e2e + coverage
+e2e
+tests
+test-results
+playwright-report
+coverage
+*.lcov
+.nyc_output
+
+# Docs + markdown
+*.md
+
+# CI / tooling / editor
+.github
+.claude
+.vscode
+.idea
+
+# Logs + OS cruft
+logs
+*.log
+npm-debug.log*
+.DS_Store

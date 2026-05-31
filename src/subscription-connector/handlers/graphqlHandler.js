@@ -3,6 +3,7 @@ const { WebSocket } = require('ws'); // Use ws WebSocket implementation for Node
 const gql = require('graphql-tag');
 const BaseHandler = require('./baseHandler');
 const { createLogger } = require('../../lib/logger');
+const { assertConnectAllowed, createSafeAgent, SsrfBlockedError } = require('../../lib/ssrf-guard');
 
 const log = createLogger('graphql-handler');
 
@@ -11,6 +12,15 @@ class GraphQLHandler extends BaseHandler {
     super(producer, redisClient);
     this.activeSubscriptions = {}; // Track active subscriptions by ID
     this.wsClients = {}; // Store WebSocket client instances by subscription ID
+  }
+
+  /** Upstream connections this handler currently holds. (P1-2 gauge / P2-17 drain) */
+  activeCount() {
+    return Object.keys(this.wsClients).length;
+  }
+
+  activeSubscriptionIds() {
+    return Object.keys(this.wsClients);
   }
 
   async connect(subscription) {
@@ -39,9 +49,36 @@ class GraphQLHandler extends BaseHandler {
       }
     }
 
+    // SSRF guard (P0-4): resolve endpoint_url right before connecting and
+    // reject if it currently points at a private / loopback / link-local /
+    // CGNAT / IMDS address. Create-time validation alone is defeated by DNS
+    // rebinding; this is the connect-time re-check. We also pin the socket
+    // to the vetted public IP via a custom ws agent so the actual dial
+    // can't be re-pointed in the TOCTOU window. Refuse (don't reconnect)
+    // on a block — a subscription aimed at an internal address is a
+    // misconfiguration/attack, not a transient fault.
+    let pinnedIp, family;
+    try {
+      ({ pinnedIp, family } = await assertConnectAllowed(endpoint_url));
+    } catch (err) {
+      if (err instanceof SsrfBlockedError) {
+        log.error(
+          `[GraphQLHandler] - SSRF guard blocked endpoint for subscription ${subscription_id} (${err.reason}); refusing to connect`
+        );
+        return;
+      }
+      log.error(
+        `[GraphQLHandler] - Endpoint validation failed for subscription ${subscription_id}:`,
+        err.message
+      );
+      return;
+    }
+    const isHttps = /^wss:/i.test(endpoint_url);
+    const pinnedAgent = createSafeAgent(pinnedIp, family, isHttps);
+
     log.info(`[GraphQLHandler] - Connecting to WebSocket for subscription ID: ${subscription_id}`);
-    log.info(`[GraphQLHandler] - Endpoint URL: ${endpoint_url}`);
-    log.info(`[GraphQLHandler] - GraphQL Query: ${query}`);
+    log.debug(`[GraphQLHandler] - Endpoint URL: ${endpoint_url}`);
+    log.debug(`[GraphQLHandler] - GraphQL Query: ${query}`);
 
     // Parse headers safely
     let parsedHeaders = {};
@@ -53,6 +90,18 @@ class GraphQLHandler extends BaseHandler {
           `[GraphQLHandler] - Failed to parse headers for subscription ID: ${subscription_id}`,
           err
         );
+      }
+    }
+
+    // ws WebSocket subclass that injects the SSRF-safe pinned agent. graphql-ws
+    // instantiates the impl as `new WebSocketImpl(url, protocol)` (no options
+    // arg), so we capture the agent here and force it into ws's options. The
+    // agent's pinned lookup re-checks the IP is public on every dial, so it
+    // stays safe across graphql-ws's internal reconnects. SNI/Host/cert still
+    // use the original hostname.
+    class PinnedWebSocket extends WebSocket {
+      constructor(address, protocols) {
+        super(address, protocols, { agent: pinnedAgent, headers: parsedHeaders });
       }
     }
 
@@ -72,7 +121,7 @@ class GraphQLHandler extends BaseHandler {
       // subscription on every reconnect.
       const wsClient = createClient({
         url: endpoint_url,
-        webSocketImpl: WebSocket,
+        webSocketImpl: PinnedWebSocket,
         retryAttempts: Number.MAX_SAFE_INTEGER,
         shouldRetry: () => true,
         retryWait: async retries => {
@@ -111,13 +160,16 @@ class GraphQLHandler extends BaseHandler {
         },
         {
           next: data => {
-            log.info(
+            // Full payload at debug only — info-level JSON.stringify of every
+            // 'next' is hot-path CPU and leaks source PII/secrets to central
+            // logs. Keep the per-message lifecycle marker at info. (P2-6)
+            log.debug(
               `[GraphQLHandler] - New data received for subscription ID: ${subscription_id}`,
               JSON.stringify(data)
             );
+            log.info(`Processing message for subscription ID: ${subscription_id}`);
 
             // Raise event for processing
-            log.info(`Processing message for subscription ID: ${subscription_id}`);
             this.raiseConnectionEvent(subscription_id, data);
           },
           error: err => {
@@ -163,6 +215,40 @@ class GraphQLHandler extends BaseHandler {
         `[GraphQLHandler] - WebSocket connection closed for subscription ID: ${subscriptionId}`
       );
     }
+  }
+
+  /**
+   * Gracefully close every graphql-ws client. dispose() returns a promise
+   * that resolves once the client has sent its close frame and torn down
+   * the socket; awaiting them (within the shutdown force-exit budget) means
+   * upstream sources see a clean close instead of a dropped TCP. (P2-17)
+   */
+  async closeAll() {
+    const ids = this.activeSubscriptionIds();
+    if (ids.length === 0) return;
+    log.info(`[GraphQLHandler] - Draining ${ids.length} upstream connection(s)`);
+    await Promise.allSettled(
+      ids.map(async id => {
+        // Stop re-delivering events first.
+        if (this.activeSubscriptions[id]) {
+          try {
+            this.activeSubscriptions[id]();
+          } catch (err) {
+            log.error(`[GraphQLHandler] - drain unsubscribe failed for ${id}:`, err.message);
+          }
+          delete this.activeSubscriptions[id];
+        }
+        const client = this.wsClients[id];
+        delete this.wsClients[id];
+        if (!client) return;
+        try {
+          // dispose() may return a promise (graphql-ws lazy:false) or void.
+          await client.dispose();
+        } catch (err) {
+          log.error(`[GraphQLHandler] - drain dispose failed for ${id}:`, err.message);
+        }
+      })
+    );
   }
 }
 

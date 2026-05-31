@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   LayoutDashboard,
   Radio,
@@ -27,6 +27,34 @@ export function Sidebar() {
   const pathname = usePathname();
   const { user, organization, organizations, switchOrg, logout } = useAuth();
   const [orgPickerOpen, setOrgPickerOpen] = useState(false);
+  const orgPickerRef = useRef<HTMLDivElement>(null);
+  const orgTriggerRef = useRef<HTMLButtonElement>(null);
+
+  // Close the org picker on Escape (returning focus to the trigger) or on a
+  // click/focus outside its container — the keyboard + pointer affordances a
+  // custom disclosure needs but doesn't get for free like a <select> would.
+  useEffect(() => {
+    if (!orgPickerOpen) return;
+
+    function handleKeyDown(e: KeyboardEvent) {
+      if (e.key === "Escape") {
+        setOrgPickerOpen(false);
+        orgTriggerRef.current?.focus();
+      }
+    }
+    function handlePointerDown(e: MouseEvent) {
+      if (!orgPickerRef.current?.contains(e.target as Node)) {
+        setOrgPickerOpen(false);
+      }
+    }
+
+    document.addEventListener("keydown", handleKeyDown);
+    document.addEventListener("mousedown", handlePointerDown);
+    return () => {
+      document.removeEventListener("keydown", handleKeyDown);
+      document.removeEventListener("mousedown", handlePointerDown);
+    };
+  }, [orgPickerOpen]);
 
   // Hide sidebar on auth pages
   if (pathname === "/login" || pathname === "/register") {
@@ -42,10 +70,17 @@ export function Sidebar() {
 
       {/* Organization picker */}
       {organization && (
-        <div className="relative border-b border-neutral-200 dark:border-neutral-800 p-3">
+        <div
+          ref={orgPickerRef}
+          className="relative border-b border-neutral-200 dark:border-neutral-800 p-3"
+        >
           <button
+            ref={orgTriggerRef}
             type="button"
             onClick={() => setOrgPickerOpen((v) => !v)}
+            aria-haspopup="menu"
+            aria-expanded={orgPickerOpen}
+            aria-label={`Current organization: ${organization.name}. Switch organization`}
             className="w-full flex items-center gap-2 rounded-lg border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-900 px-3 py-2 text-left text-sm hover:bg-neutral-100 dark:hover:bg-neutral-800 transition-colors"
           >
             <Building2 className="h-4 w-4 text-neutral-500 flex-shrink-0" />
@@ -61,15 +96,21 @@ export function Sidebar() {
           </button>
 
           {orgPickerOpen && (
-            <div className="absolute left-3 right-3 mt-1 z-10 rounded-lg border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-950 shadow-lg overflow-hidden">
+            <div
+              role="menu"
+              aria-label="Switch organization"
+              className="absolute left-3 right-3 mt-1 z-10 rounded-lg border border-neutral-200 dark:border-neutral-800 bg-white dark:bg-neutral-950 shadow-lg overflow-hidden"
+            >
               {organizations.map((org) => {
                 const active = org.id === organization.id;
                 return (
                   <button
                     key={org.id}
                     type="button"
+                    role="menuitem"
                     onClick={async () => {
                       setOrgPickerOpen(false);
+                      orgTriggerRef.current?.focus();
                       if (!active) await switchOrg(org.id);
                     }}
                     className={cn(

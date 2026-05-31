@@ -26,6 +26,7 @@ import {
 import type { Subscription, SubscriptionPage } from "@/lib/api";
 import { useToast } from "@/lib/toast";
 import { useDebounced } from "@/lib/utils";
+import { useVisiblePolling } from "@/lib/use-visible-polling";
 import { downloadFile, exportAsCsv, exportAsJson } from "@/lib/export";
 
 const POLL_INTERVAL = 10000;
@@ -60,7 +61,6 @@ export default function SubscriptionsPage() {
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
-  const [isPolling, setIsPolling] = useState(true);
   const [bulkDeleting, setBulkDeleting] = useState(false);
   const [showImport, setShowImport] = useState(false);
   const toast = useToast();
@@ -109,15 +109,16 @@ export default function SubscriptionsPage() {
     [page, debouncedSearch]
   );
 
+  // Refetch immediately whenever the page/search changes.
   useEffect(() => {
     loadData();
   }, [loadData]);
 
-  useEffect(() => {
-    if (!isPolling) return;
-    const interval = setInterval(() => loadData(), POLL_INTERVAL);
-    return () => clearInterval(interval);
-  }, [isPolling, loadData]);
+  // Silent background refresh of the current page (no spinner). Pauses
+  // while the tab is hidden. The interval re-reads the latest loadData
+  // via the hook's callback ref, so it always refreshes the current page.
+  const pollPage = useCallback(() => loadData(), [loadData]);
+  const { isPolling } = useVisiblePolling(pollPage, POLL_INTERVAL);
 
   function handleDelete(id: string) {
     setDeleteTarget(id);

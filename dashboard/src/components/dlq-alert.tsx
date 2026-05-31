@@ -1,10 +1,11 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { AlertTriangle, X } from "lucide-react";
 import { fetchGlobalDeliveryStats } from "@/lib/api";
 import { useToast } from "@/lib/toast";
+import { useVisiblePolling } from "@/lib/use-visible-polling";
 
 const POLL_INTERVAL_MS = 30_000;
 const STORAGE_KEY = "anyhook.dlq.acked";
@@ -29,53 +30,52 @@ export function DlqAlert() {
   const [bannerCount, setBannerCount] = useState(0);
   const baseline = useRef<number | null>(null);
   const lastSeen = useRef<number>(0);
+  const ackedFromStorage = useRef<number>(0);
   const toast = useToast();
 
+  // Read the persisted ack baseline once on mount, before the first poll.
   useEffect(() => {
-    let alive = true;
-    let ackedFromStorage = 0;
+    let acked = 0;
     try {
       const raw = window.localStorage.getItem(STORAGE_KEY);
-      if (raw) ackedFromStorage = parseInt(raw, 10) || 0;
+      if (raw) acked = parseInt(raw, 10) || 0;
     } catch {
       // localStorage may be blocked
     }
-    lastSeen.current = ackedFromStorage;
+    ackedFromStorage.current = acked;
+    lastSeen.current = acked;
+  }, []);
 
-    async function poll() {
-      try {
-        const stats = await fetchGlobalDeliveryStats();
-        if (!alive) return;
-        const failed = stats.failed || 0;
-        if (baseline.current === null) {
-          // First poll — set the baseline. If a previous session left
-          // an ack count behind, prefer the higher value so we don't
-          // re-warn about already-acked failures.
-          baseline.current = Math.max(failed, ackedFromStorage);
-          lastSeen.current = baseline.current;
-          return;
-        }
-        if (failed > lastSeen.current) {
-          const delta = failed - lastSeen.current;
-          lastSeen.current = failed;
-          setBannerCount(c => c + delta);
-          toast.error(
-            `${delta} new failed deliver${delta === 1 ? "y" : "ies"}`,
-            "Open the Subscriptions list and filter by status to investigate."
-          );
-        }
-      } catch {
-        // Silent — we don't want a stats failure to spam the user
+  const poll = useCallback(async () => {
+    try {
+      const stats = await fetchGlobalDeliveryStats();
+      const failed = stats.failed || 0;
+      if (baseline.current === null) {
+        // First poll — set the baseline. If a previous session left
+        // an ack count behind, prefer the higher value so we don't
+        // re-warn about already-acked failures.
+        baseline.current = Math.max(failed, ackedFromStorage.current);
+        lastSeen.current = baseline.current;
+        return;
       }
+      if (failed > lastSeen.current) {
+        const delta = failed - lastSeen.current;
+        lastSeen.current = failed;
+        setBannerCount(c => c + delta);
+        toast.error(
+          `${delta} new failed deliver${delta === 1 ? "y" : "ies"}`,
+          "Open the Subscriptions list and filter by status to investigate."
+        );
+      }
+    } catch {
+      // Silent — we don't want a stats failure to spam the user
     }
-
-    poll();
-    const id = setInterval(poll, POLL_INTERVAL_MS);
-    return () => {
-      alive = false;
-      clearInterval(id);
-    };
   }, [toast]);
+
+  // Initial + recurring failed-delivery check; pauses on hidden tabs.
+  // (The localStorage baseline effect above runs first, so the refs the
+  // poll reads are populated before the immediate tick.)
+  useVisiblePolling(poll, POLL_INTERVAL_MS, { immediate: true });
 
   function ack() {
     setBannerCount(0);

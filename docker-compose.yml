@@ -1,16 +1,67 @@
 version: '3.8'
 
+# IMAGE_TAG selects which published backend image the three app services run.
+# Defaults to :latest for a frictionless `docker compose up`, but CI/CD should
+# pass an immutable tag (e.g. IMAGE_TAG=sha-<commit>) so a deploy pins to the
+# exact artifact it tested -- a mutable :latest can silently drift between
+# `pull` and `up`. The dashboard keeps its own tag (built locally here).
+#
+# Resource limits + restart back-off below are honored by `docker compose up`
+# (Compose Spec) for deploy.resources.limits and deploy.replicas. The
+# deploy.restart_policy block is only applied by Swarm/k8s translators (plain
+# `docker compose up` uses the top-level `restart:`), so both are set: the
+# top-level value caps local crash-loops, restart_policy carries the same
+# intent to orchestrators. Limits are conservative starting points -- profile
+# under load and raise as needed.
+
 services:
+  migrate:
+    # One-shot schema migration job. Runs `npm run migrate` (node-pg-migrate)
+    # once per release and EXITS -- it is not a long-running service, hence
+    # `restart: "no"`. The app services gate their start on this completing
+    # successfully (depends_on ... service_completed_successfully), so the
+    # schema is guaranteed current before any API/worker pod boots. This
+    # decouples migrations from app boot: no multi-pod migration race, and a
+    # failed migration fails the deploy here instead of crash-looping every
+    # API pod. Uses the same image as the app (node-pg-migrate now ships in
+    # `dependencies`, so it survives the production prune).
+    image: ghcr.io/moesaleh/anyhook:${IMAGE_TAG:-latest}
+    restart: "no"
+    command: npm run migrate
+    env_file:
+      - ./.env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.50"
+    networks:
+      - anyhook
+
   subscription-management:
-    image: ghcr.io/moesaleh/anyhook:latest
+    image: ghcr.io/moesaleh/anyhook:${IMAGE_TAG:-latest}
     container_name: anyhook-subscription
     restart: unless-stopped
     command: node /app/src/subscription-management/index.js
     env_file:
       - ./.env
+    environment:
+      # This is the only service that creates Kafka topics (createKafkaTopics
+      # in src/subscription-management/index.js). Surface the topic-shape knobs
+      # explicitly so a prod operator can set them via the shell environment
+      # even when they're left commented out in .env. Defaults mirror the code
+      # (8 partitions, RF=1). For prod HA see the kafka service notes below and
+      # set KAFKA_REPLICATION_FACTOR>=3.
+      - KAFKA_PARTITIONS=${KAFKA_PARTITIONS:-8}
+      - KAFKA_REPLICATION_FACTOR=${KAFKA_REPLICATION_FACTOR:-1}
     ports:
       - "${PORT:-3001}:3001"
     depends_on:
+      migrate:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       redis:
@@ -28,17 +79,34 @@ services:
       timeout: 10s
       retries: 3
       start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: "1.0"
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 5
+        window: 120s
     networks:
       - anyhook
 
   subscription-connector:
-    image: ghcr.io/moesaleh/anyhook:latest
-    container_name: anyhook-connector
+    image: ghcr.io/moesaleh/anyhook:${IMAGE_TAG:-latest}
+    # No container_name: this is a stateless Kafka consumer and MUST be
+    # scalable. A fixed container_name makes `docker compose up --scale
+    # subscription-connector=N` fail, pinning every partition to one pod
+    # (one CPU core ceiling). Scale via replicas below or `--scale`; Kafka
+    # rebalances partitions across the group. Keep replicas <= KAFKA_PARTITIONS
+    # (default 8) -- extra consumers beyond the partition count sit idle.
     restart: unless-stopped
     command: node /app/src/subscription-connector/index.js
     env_file:
       - ./.env
     depends_on:
+      migrate:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       redis:
@@ -54,17 +122,33 @@ services:
       timeout: 10s
       retries: 3
       start_period: 30s
+    deploy:
+      # Tunable: raise to scale out consumers (up to KAFKA_PARTITIONS).
+      replicas: 1
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1.0"
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 5
+        window: 120s
     networks:
       - anyhook
 
   webhook-dispatcher:
-    image: ghcr.io/moesaleh/anyhook:latest
-    container_name: anyhook-dispatcher
+    image: ghcr.io/moesaleh/anyhook:${IMAGE_TAG:-latest}
+    # No container_name: stateless Kafka consumer, same scaling story as
+    # subscription-connector above. Scale via replicas / `--scale`; keep
+    # replicas <= KAFKA_PARTITIONS.
     restart: unless-stopped
     command: node /app/src/webhook-dispatcher/index.js
     env_file:
       - ./.env
     depends_on:
+      migrate:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       redis:
@@ -79,6 +163,18 @@ services:
       timeout: 10s
       retries: 3
       start_period: 30s
+    deploy:
+      # Tunable: raise to scale out delivery workers (up to KAFKA_PARTITIONS).
+      replicas: 1
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1.0"
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 5
+        window: 120s
     networks:
       - anyhook
 
@@ -102,6 +198,16 @@ services:
       timeout: 10s
       retries: 3
       start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1.0"
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 5
+        window: 120s
     networks:
       - anyhook
 
@@ -129,6 +235,13 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
+    deploy:
+      resources:
+        limits:
+          # Data tier gets a larger ceiling than the workers; Postgres needs
+          # headroom for shared_buffers + work_mem under real load.
+          memory: 1G
+          cpus: "2.0"
     networks:
       - anyhook
 
@@ -146,9 +259,42 @@ services:
       timeout: 5s
       retries: 5
       start_period: 5s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1.0"
     networks:
       - anyhook
 
+  # ---------------------------------------------------------------------------
+  # Kafka — SINGLE-NODE DEV DEFAULT.
+  #
+  # This is one KRaft combined controller+broker node. It is fine for local
+  # development and CI but is a single point of failure with NO data durability
+  # guarantees: with one broker the topic replication factor can only be 1
+  # (KAFKA_REPLICATION_FACTOR=1, the code default), so a broker loss loses
+  # in-flight events and `min.insync.replicas` cannot protect a producer.
+  #
+  # PRODUCTION TOPOLOGY (do NOT run the single-node config below in prod):
+  #   * Run a 3-broker KRaft quorum (3 controller voters) so the cluster
+  #     tolerates the loss of one node. Set KAFKA_QUORUM_VOTERS to all three,
+  #     give each a distinct KAFKA_NODE_ID, and use unique advertised listeners.
+  #   * Create topics with replication factor >= 3:
+  #       KAFKA_REPLICATION_FACTOR=3   (passed through to subscription-management)
+  #   * Require at least 2 in-sync replicas to acknowledge a write:
+  #       KAFKA_CFG_MIN_INSYNC_REPLICAS=2   (per broker)
+  #     paired with producers using acks=all + idempotent=true (see P1-8 in the
+  #     fix plan; producer-side change lives in the app, not here) so the outbox
+  #     gets true end-to-end at-least-once durability and survives one broker
+  #     loss without dropping acknowledged events.
+  #   * Set KAFKA_PARTITIONS to comfortably exceed your max consumer replica
+  #     count per stage (default 8). Replicas beyond the partition count idle.
+  #
+  # A real multi-broker cluster is usually run outside compose (managed Kafka /
+  # MSK / a dedicated StatefulSet); this block intentionally stays single-node
+  # so `docker compose up` works out of the box for development.
+  # ---------------------------------------------------------------------------
   kafka:
     image: bitnami/kafka:3.9.1
     container_name: kafka
@@ -165,6 +311,11 @@ services:
       - KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER
     volumes:
       - kafka_data:/bitnami/kafka
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: "2.0"
     networks:
       - anyhook
     healthcheck:

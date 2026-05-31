@@ -48,15 +48,64 @@ function userOrgKeyFn(req) {
   return req.auth.organizationId;
 }
 
-function ipKeyFn(req) {
+/**
+ * Whether to trust client-supplied X-Forwarded-For. Gated on the SAME
+ * signal Express uses (app.js: `app.set('trust proxy', …)` keyed off
+ * process.env.TRUST_PROXY). Any non-empty TRUST_PROXY value enables it,
+ * matching app.js's `if (trustProxyEnv) { … }`. Read at call time so a
+ * test or a runtime config can toggle it without re-importing.
+ */
+function trustsProxy() {
+  return !!process.env.TRUST_PROXY;
+}
+
+/** Leftmost X-Forwarded-For token, trimmed, or null when absent/empty. */
+function firstXffToken(req) {
   const xff = req.headers && req.headers['x-forwarded-for'];
-  if (typeof xff === 'string' && xff.length > 0) {
-    const first = xff.split(',')[0];
-    if (first && first.trim()) return first.trim();
+  if (typeof xff !== 'string' || xff.length === 0) return null;
+  const first = xff.split(',')[0];
+  return first && first.trim() ? first.trim() : null;
+}
+
+/**
+ * Resolve the rate-limit subject for IP-keyed (pre-auth) routes.
+ *
+ * SECURITY (P2-5): X-Forwarded-For is client-supplied and trivially
+ * spoofable. Honoring its first token unconditionally let an attacker
+ * with no proxy in front of them forge a different "IP" per request and
+ * sidestep per-IP login/2FA throttling (or poison a victim's bucket).
+ * We therefore only trust XFF when TRUST_PROXY is set — i.e. when there
+ * actually IS a reverse proxy and Express is configured to trust it
+ * (the same gate app.js applies). In that mode Express has already
+ * resolved req.ip from the proxy chain, so req.ip is the canonical,
+ * trustworthy value and is preferred.
+ *
+ * Untrusted mode: ignore XFF and key off req.ip (the real socket peer).
+ * XFF is consulted only as a LAST resort when no socket-level address
+ * is identifiable at all — that branch can't be abused to evade limits
+ * any more than the catch-all 'unknown' bucket it replaces, and it
+ * preserves behavior for callers that pass only headers.
+ */
+function ipKeyFn(req) {
+  const firstXff = firstXffToken(req);
+
+  // Trusting a real proxy: Express already resolved req.ip from the
+  // proxy chain, so it's the canonical value. Prefer it; only fall back
+  // to XFF defensively if req.ip wasn't populated.
+  if (trustsProxy()) {
+    if (req.ip) return req.ip;
+    if (firstXff) return firstXff;
+  } else if (req.ip) {
+    // Untrusted: the real socket peer wins — never key off a forged
+    // header when we have a genuine address.
+    return req.ip;
   }
-  if (req.ip) return req.ip;
+
   if (req.connection && req.connection.remoteAddress) return req.connection.remoteAddress;
   if (req.socket && req.socket.remoteAddress) return req.socket.remoteAddress;
+  // Last resort: no socket-level address. XFF here is no worse than the
+  // 'unknown' bucket it replaces and keeps header-only callers working.
+  if (firstXff) return firstXff;
   return 'unknown';
 }
 
@@ -71,8 +120,7 @@ function ipKeyFn(req) {
  * cluster doesn't grow it unboundedly. Naive LRU: when full, drop
  * a random entry. The hit rate is still ~99% for typical org count.
  */
-const RATE_LIMIT_OVERRIDE_TTL_MS =
-  parseInt(process.env.RATE_LIMIT_OVERRIDE_TTL_MS, 10) || 5000;
+const RATE_LIMIT_OVERRIDE_TTL_MS = parseInt(process.env.RATE_LIMIT_OVERRIDE_TTL_MS, 10) || 5000;
 const RATE_LIMIT_CACHE_MAX = 1024;
 const overrideCache = new Map(); // orgId -> { ts, requests, windowSec }
 
@@ -94,6 +142,53 @@ function setCachedOverride(orgId, requests, windowSec) {
     overrideCache.delete(firstKey);
   }
   overrideCache.set(orgId, { ts: Date.now(), requests, windowSec });
+}
+
+/**
+ * Atomic fixed-window increment.
+ *
+ * The naive `INCR` then separate `EXPIRE key (only when count===1)` is
+ * two round trips: a crash / Redis failover / dropped connection in the
+ * gap strands a TTL-less key that counts forever, permanently rate-
+ * limiting the org behind that bucket (P2-2). We collapse both into a
+ * single atomic operation:
+ *
+ *   - Preferred: a Lua script (INCR + conditional PEXPIRE) via EVAL —
+ *     one server-side, atomic round trip. PEXPIRE (ms) so we can reuse
+ *     the same `ttlMs` unit regardless of window size.
+ *   - Fallback: the original INCR + conditional EXPIRE, used only when
+ *     the client doesn't expose `eval` (e.g. the unit-test stub). The
+ *     fallback keeps the historical "expire once per bucket" behavior
+ *     so existing tests stay valid; production clients take the atomic
+ *     path.
+ *
+ * Returns the post-increment count. Throws on Redis error so the caller
+ * can fail open exactly as before.
+ */
+const INCR_EXPIRE_LUA =
+  "local c = redis.call('INCR', KEYS[1]) " +
+  "if c == 1 then redis.call('PEXPIRE', KEYS[1], ARGV[1]) end " +
+  'return c';
+
+async function atomicIncrWithExpire(redisClient, key, ttlMs) {
+  if (typeof redisClient.eval === 'function') {
+    // node-redis v4/v5 EVAL signature: eval(script, { keys, arguments }).
+    // ARGV/KEYS are strings on the wire; the script's redis.call coerces.
+    const res = await redisClient.eval(INCR_EXPIRE_LUA, {
+      keys: [key],
+      arguments: [String(ttlMs)],
+    });
+    return typeof res === 'number' ? res : Number(res);
+  }
+  // Non-atomic fallback (no EVAL support). Same two-step behavior the
+  // module shipped with; only reached by stubs lacking eval().
+  const count = await redisClient.incr(key);
+  if (count === 1) {
+    // Keep EXPIRE in seconds here to match the legacy call shape the
+    // unit tests assert against (expireCalls records seconds).
+    await redisClient.expire(key, Math.ceil(ttlMs / 1000));
+  }
+  return count;
 }
 
 function makeRateLimit({ redisClient, limit, windowSec, prefix, logger, keyFn, pool } = {}) {
@@ -160,10 +255,10 @@ function makeRateLimit({ redisClient, limit, windowSec, prefix, logger, keyFn, p
 
     let count;
     try {
-      count = await redisClient.incr(key);
-      if (count === 1) {
-        await redisClient.expire(key, effectiveWindow * 2);
-      }
+      // Atomic INCR + (first-hit) PEXPIRE in one operation so a crash
+      // between the two can't strand a TTL-less key (P2-2). TTL is the
+      // legacy windowSec*2 grace, expressed in ms.
+      count = await atomicIncrWithExpire(redisClient, key, effectiveWindow * 2 * 1000);
     } catch (err) {
       if (logger) {
         logger.error('Rate limit check failed (failing open)', { err: err.message, subject });

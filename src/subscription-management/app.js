@@ -31,6 +31,7 @@ const {
   SUBSCRIPTION_KEY_PATTERN,
 } = require('../lib/subscription-cache');
 const { enqueueOutbox } = require('../lib/outbox');
+const { dispatchNotification } = require('../lib/notifications');
 const { mountAuthRoutes } = require('./auth');
 
 // Read OpenAPI spec at module load. Errors during read fall back to a
@@ -44,6 +45,14 @@ try {
 
 const VALID_CONNECTION_TYPES = ['graphql', 'websocket'];
 
+// Bounds for caller-supplied args.headers. These are spread verbatim
+// into the outbound WebSocket/axios upstream connection by the
+// connector, so an unbounded or non-string map is both a memory and an
+// injection footgun (P2-19). Keep generous enough for real auth setups
+// (a bearer token, a couple of custom headers) but firmly capped.
+const MAX_HEADER_COUNT = 50;
+const MAX_HEADER_BYTES = 8192; // total of all name + value bytes
+
 /**
  * Strip the per-subscription webhook signing secret before returning
  * subscription rows to API callers. Secrets are shown ONCE at creation
@@ -54,6 +63,32 @@ function withoutSecret(row) {
   // eslint-disable-next-line no-unused-vars
   const { webhook_secret, ...rest } = row;
   return rest;
+}
+
+/**
+ * Recursively redact webhook_secret from any value pulled out of the
+ * Redis cache before it leaves the admin /redis* endpoints. The cache
+ * stores full subscription rows (sub:* keys) INCLUDING webhook_secret,
+ * and withoutSecret() is only applied on the SQL read paths — so
+ * without this an admin-key holder could read every tenant's signing
+ * secret straight out of the cache dump (P2-4). We never return
+ * webhook_secret to a caller after creation.
+ *
+ * Arrays/objects are walked so a secret nested under any shape is
+ * caught; primitives pass through untouched. Depth is bounded to avoid
+ * pathological recursion on a hostile cached value.
+ */
+function redactCachedValue(value, depth = 0) {
+  if (depth > 8 || value === null || typeof value !== 'object') return value;
+  if (Array.isArray(value)) {
+    return value.map(v => redactCachedValue(v, depth + 1));
+  }
+  const out = {};
+  for (const [k, v] of Object.entries(value)) {
+    if (k === 'webhook_secret') continue; // drop the signing secret entirely
+    out[k] = redactCachedValue(v, depth + 1);
+  }
+  return out;
 }
 
 function validateSubscriptionInput(body) {
@@ -74,6 +109,37 @@ function validateSubscriptionInput(body) {
     }
     if (connection_type === 'graphql' && (!args.query || typeof args.query !== 'string')) {
       errors.push('args.query is required for graphql subscriptions');
+    }
+    // args.headers is optional, but if present it must be a flat
+    // string->string map, bounded in count and total size, before the
+    // connector spreads it into the outbound ws/axios request (P2-19).
+    if (args.headers !== undefined) {
+      if (
+        args.headers === null ||
+        typeof args.headers !== 'object' ||
+        Array.isArray(args.headers)
+      ) {
+        errors.push('args.headers must be an object of string header names to string values');
+      } else {
+        const headerEntries = Object.entries(args.headers);
+        if (headerEntries.length > MAX_HEADER_COUNT) {
+          errors.push(`args.headers must have at most ${MAX_HEADER_COUNT} entries`);
+        }
+        let totalBytes = 0;
+        let nonStringValue = false;
+        for (const [name, val] of headerEntries) {
+          if (typeof val !== 'string') {
+            nonStringValue = true;
+            break;
+          }
+          totalBytes += Buffer.byteLength(name, 'utf8') + Buffer.byteLength(val, 'utf8');
+        }
+        if (nonStringValue) {
+          errors.push('args.headers values must all be strings');
+        } else if (totalBytes > MAX_HEADER_BYTES) {
+          errors.push(`args.headers total size must not exceed ${MAX_HEADER_BYTES} bytes`);
+        }
+      }
     }
   }
 
@@ -486,7 +552,19 @@ function createApp({
     }
   });
 
-  // Org-wide delivery stats
+  // Org-wide delivery stats.
+  //
+  // Bounded to a trailing 30-day window (P1-5). Without a time predicate
+  // this COUNT(*)/FILTER aggregation scanned every delivery_events row
+  // the org ever produced — a per-org full scan that degrades as the
+  // (unbounded, retention-pruned) table ages. The 30-day predicate lets
+  // it ride the covering index idx_delivery_events_org_created_status
+  // (organization_id, created_at DESC, status) added in migration
+  // 20260510000000. The 24h / 7d figures are subsets of the window so
+  // they're computed within it; the response shape is unchanged
+  // (total_deliveries is now "last 30 days" rather than all-time —
+  // documented here and in openapi).
+  const STATS_WINDOW = '30 days';
   app.get('/deliveries/stats', requireAuth, rateLimit, async (req, res) => {
     try {
       const result = await pool.query(
@@ -502,8 +580,9 @@ function createApp({
             COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '24 hours')::int AS deliveries_24h,
             COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '7 days')::int AS deliveries_7d
          FROM delivery_events
-         WHERE organization_id = $1`,
-        [req.auth.organizationId]
+         WHERE organization_id = $1
+           AND created_at > NOW() - $2::interval`,
+        [req.auth.organizationId, STATS_WINDOW]
       );
       const stats = result.rows[0];
       res.status(200).json({
@@ -715,7 +794,10 @@ function createApp({
     const subscriptionId = uuidv4();
     const webhookSecret = crypto.randomBytes(32).toString('hex');
 
-    log.info(
+    // debug, not info: this serializes caller-supplied request fields
+    // (webhook_url, org) on the write hot path — keep it out of the
+    // default-level central logs (CPU + PII/URL leakage) (P2-6).
+    log.debug(
       `[Subscribe API] - Incoming request to create subscription. Connection Type: ${connection_type}, Webhook URL: ${webhook_url}, Org: ${req.auth.organizationId}`
     );
 
@@ -734,7 +816,7 @@ function createApp({
       await enqueueOutbox(client, 'subscription_events', subscriptionId, subscriptionId);
       await client.query('COMMIT');
 
-      log.info(
+      log.debug(
         `[Subscribe API] - Subscription + outbox row committed. Subscription ID: ${subscriptionId}`
       );
 
@@ -770,13 +852,23 @@ function createApp({
   //
   // - Capped at MAX_BULK_SIZE per request so a single call can't blow
   //   past the org quota by orders of magnitude.
-  // - Per-entry validation: invalid entries return { index, error };
-  //   valid entries proceed independently. The whole call is NOT
-  //   transactional — partial success is allowed (matches the
-  //   "import 100 from a JSON; 3 had bad URLs, ignore those" UX).
-  // - Quota: takes the same advisory lock the per-request quota
-  //   middleware uses; counts current usage + bulk size against the
-  //   org's effective limit. 429 if the request would put us over.
+  // - Per-entry validation: invalid entries return { index, error } and
+  //   are skipped; the valid entries are inserted. Validation runs
+  //   BEFORE the advisory lock is taken (no DB work, so no reason to
+  //   hold the lock for it).
+  // - The valid rows are written in a SINGLE multi-row INSERT inside one
+  //   transaction (subscriptions + the matching outbox rows), so the DB
+  //   write for the batch is all-or-nothing and costs one round-trip
+  //   instead of one-per-row (P2-7). On a DB failure every valid entry
+  //   reports { error: 'Insert failed' } and nothing is persisted.
+  // - Quota: takes the same per-org advisory lock the per-request quota
+  //   middleware uses (ADVISORY_LOCK_KEY_QUOTAS, exported from quotas.js,
+  //   keyed hashtext(org)) so a bulk import and a concurrent single
+  //   /subscribe serialize. The lock is held only for the count check +
+  //   the INSERT transaction and released BEFORE the response flush and
+  //   the Redis cache writes (mirrors the shortened hold in quotas.js).
+  // - Redis cache SETs are pipelined (fired concurrently) AFTER the lock
+  //   is released, not serialized under it.
   // - Each successful entry produces its own webhook_secret, returned
   //   ONCE in the response.
   const MAX_BULK_SIZE = 100;
@@ -793,9 +885,39 @@ function createApp({
       );
     }
 
-    // Per-org advisory lock for the duration of the request — same
-    // pattern as the per-request quota middleware. Two parallel bulks
-    // for the same org serialize.
+    // Validate + pre-compute ids/secrets up front, outside the lock.
+    // `valid` keeps the original index so the response preserves input
+    // order; `results` is seeded with the validation failures.
+    const results = [];
+    const valid = [];
+    for (let i = 0; i < entries.length; i++) {
+      const validationErrors = validateSubscriptionInput(entries[i]);
+      if (validationErrors.length > 0) {
+        results.push({ index: i, error: validationErrors.join('; ') });
+        continue;
+      }
+      valid.push({
+        index: i,
+        entry: entries[i],
+        subscriptionId: uuidv4(),
+        webhookSecret: crypto.randomBytes(32).toString('hex'),
+      });
+    }
+
+    // Nothing to insert (every entry was invalid) — no lock, no DB.
+    if (valid.length === 0) {
+      return res.status(201).json({
+        results,
+        summary: { total: entries.length, successful: 0, failed: results.length },
+      });
+    }
+
+    // Per-org advisory lock — same key as the subscriptionQuota
+    // middleware so a concurrent single-row /subscribe and a bulk import
+    // for the same org serialize. Held only for the count + INSERT, then
+    // released before the response flush / cache writes (P2-7). The
+    // 'finish'/'close' listeners stay wired purely as an idempotent
+    // safety net for the rare path where we throw before release() runs.
     const lockClient = await pool.connect();
     let released = false;
     const release = async () => {
@@ -815,10 +937,10 @@ function createApp({
     res.on('finish', release);
     res.on('close', release);
 
+    // Holds the inserted rows so the cache SETs can run after release().
+    let insertedRows = null;
+
     try {
-      // Same lock-key as the subscriptionQuota middleware so a
-      // concurrent single-row /subscribe and a bulk import for the
-      // same org serialize against each other.
       await lockClient.query('SELECT pg_advisory_lock($1, hashtext($2::text))', [
         ADVISORY_LOCK_KEY_QUOTAS,
         req.auth.organizationId,
@@ -834,57 +956,114 @@ function createApp({
       const envLimit = parseInt(process.env.ORG_MAX_SUBSCRIPTIONS, 10) || 100;
       const effectiveLimit =
         usageRow.rows[0].override != null ? usageRow.rows[0].override : envLimit;
-      if (used + entries.length > effectiveLimit) {
+      // Count only the rows we'll actually insert (the valid ones)
+      // against the cap.
+      if (used + valid.length > effectiveLimit) {
         await release();
         return res.status(429).json({
           error: 'Subscription quota would be exceeded',
           quota: 'subscriptions',
           used,
           limit: effectiveLimit,
-          requested: entries.length,
+          requested: valid.length,
         });
       }
 
-      const results = [];
-      for (let i = 0; i < entries.length; i++) {
-        const entry = entries[i];
-        const validationErrors = validateSubscriptionInput(entry);
-        if (validationErrors.length > 0) {
-          results.push({ index: i, error: validationErrors.join('; ') });
-          continue;
-        }
-        const subscriptionId = uuidv4();
-        const webhookSecret = crypto.randomBytes(32).toString('hex');
-        try {
-          const insRes = await lockClient.query(
-            `INSERT INTO subscriptions
-               (subscription_id, organization_id, connection_type, args, webhook_url, webhook_secret)
-             VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-            [
-              subscriptionId,
-              req.auth.organizationId,
-              entry.connection_type,
-              entry.args,
-              entry.webhook_url,
-              webhookSecret,
-            ]
+      try {
+        await lockClient.query('BEGIN');
+
+        // One multi-row INSERT for every valid row. Six columns/row;
+        // params are flattened in column order. RETURNING * so we can
+        // cache the full row exactly as the single-create path does.
+        const subValues = [];
+        const subParams = [];
+        valid.forEach((v, n) => {
+          const b = n * 6;
+          subValues.push(`($${b + 1}, $${b + 2}, $${b + 3}, $${b + 4}, $${b + 5}, $${b + 6})`);
+          subParams.push(
+            v.subscriptionId,
+            req.auth.organizationId,
+            v.entry.connection_type,
+            v.entry.args,
+            v.entry.webhook_url,
+            v.webhookSecret
           );
-          await redisClient.set(
-            subscriptionCacheKey(subscriptionId),
-            JSON.stringify(insRes.rows[0])
-          );
-          // Atomic outbox enqueue alongside the row insert. The
-          // surrounding lockClient already holds the per-org advisory
-          // lock — the INSERT and the outbox enqueue land on the same
-          // pg session, so they commit together.
-          await enqueueOutbox(lockClient, 'subscription_events', subscriptionId, subscriptionId);
-          results.push({ index: i, subscriptionId, webhook_secret: webhookSecret });
-        } catch (err) {
-          log.error(`[Bulk Subscribe] - Failed entry ${i}`, err.message);
-          results.push({ index: i, error: 'Insert failed' });
+        });
+        const insRes = await lockClient.query(
+          `INSERT INTO subscriptions
+             (subscription_id, organization_id, connection_type, args, webhook_url, webhook_secret)
+           VALUES ${subValues.join(', ')}
+           RETURNING *`,
+          subParams
+        );
+
+        // One multi-row INSERT into the outbox for the same rows
+        // (topic/key/value mirror enqueueOutbox), atomic with the
+        // subscription INSERT under this transaction. Inlined as a
+        // multi-row form rather than looping enqueueOutbox to keep it to
+        // a single round-trip.
+        const outValues = [];
+        const outParams = [];
+        valid.forEach((v, n) => {
+          const b = n * 3;
+          outValues.push(`($${b + 1}, $${b + 2}, $${b + 3})`);
+          outParams.push('subscription_events', v.subscriptionId, v.subscriptionId);
+        });
+        await lockClient.query(
+          `INSERT INTO outbox_events (topic, message_key, message_value)
+           VALUES ${outValues.join(', ')}`,
+          outParams
+        );
+
+        await lockClient.query('COMMIT');
+        insertedRows = insRes.rows;
+      } catch (err) {
+        await lockClient.query('ROLLBACK').catch(() => {});
+        log.error('[Bulk Subscribe] - Batch insert failed:', err.message);
+        // Whole batch failed — every valid entry reports a failure.
+        for (const v of valid) {
+          results.push({ index: v.index, error: 'Insert failed' });
         }
+      } finally {
+        // Release the lock + return the pooled connection the moment the
+        // DB work is done — before the response flush and the cache
+        // writes below (P2-7).
+        await release();
       }
 
+      if (insertedRows) {
+        // Map inserted rows back to their subscription id for cache
+        // writes + the success entries.
+        const rowById = new Map(insertedRows.map(r => [r.subscription_id, r]));
+        for (const v of valid) {
+          results.push({
+            index: v.index,
+            subscriptionId: v.subscriptionId,
+            webhook_secret: v.webhookSecret,
+          });
+        }
+        // Best-effort cache writes, pipelined (fired concurrently)
+        // rather than serialized — a Redis miss falls back to PG at
+        // delivery time. Not awaited under any lock.
+        await Promise.allSettled(
+          valid.map(v => {
+            const row = rowById.get(v.subscriptionId);
+            if (!row) return Promise.resolve();
+            return Promise.resolve(
+              redisClient.set(subscriptionCacheKey(v.subscriptionId), JSON.stringify(row))
+            ).catch(redisErr => {
+              log.error(
+                `[Bulk Subscribe] - Redis SET failed for ${v.subscriptionId} (will fall back to PG):`,
+                redisErr.message
+              );
+            });
+          })
+        );
+      }
+
+      // Sort results back into input order — validation failures and
+      // successes were pushed in two passes.
+      results.sort((a, b) => a.index - b.index);
       const successful = results.filter(r => r.subscriptionId).length;
       const failed = results.length - successful;
       res.status(201).json({
@@ -892,6 +1071,7 @@ function createApp({
         summary: { total: entries.length, successful, failed },
       });
     } catch (err) {
+      await release();
       log.error('[Bulk Subscribe] - Error processing bulk request:', err);
       errorResponse(res, 500, 'Failed to process bulk subscribe');
     }
@@ -905,7 +1085,9 @@ function createApp({
     if (!subscription_id || typeof subscription_id !== 'string') {
       return errorResponse(res, 400, 'subscription_id is required');
     }
-    log.info(
+    // debug, not info: per-request payload-bearing log on the write
+    // hot path (P2-6).
+    log.debug(
       `[Unsubscribe API] - Incoming request to delete subscription. Subscription ID: ${subscription_id}, Org: ${req.auth.organizationId}`
     );
     const client = await pool.connect();
@@ -921,7 +1103,7 @@ function createApp({
       }
       await enqueueOutbox(client, 'unsubscribe_events', subscription_id, subscription_id);
       await client.query('COMMIT');
-      log.info(
+      log.debug(
         `[Unsubscribe API] - Subscription + outbox row committed. Subscription ID: ${subscription_id}`
       );
       res.status(200).json({ message: 'Unsubscribed successfully' });
@@ -951,6 +1133,13 @@ function createApp({
   });
 
   app.get('/redis', requireAdminKey, async (req, res) => {
+    // Bulk cache introspection dumps every key in the instance — a broad
+    // exposure even behind the admin key. Gate it out of production
+    // (P2-4); the per-key GET /redis/:key (redacted) remains available
+    // for targeted debugging there.
+    if (process.env.NODE_ENV === 'production') {
+      return errorResponse(res, 403, 'Bulk Redis dump is disabled in production');
+    }
     try {
       const keys = [];
       let cursor = 0;
@@ -972,7 +1161,9 @@ function createApp({
       const replies = await multi.exec();
       const result = keys.reduce((obj, key, index) => {
         try {
-          obj[key] = JSON.parse(replies[index]);
+          // Redact webhook_secret out of any cached value (sub:* rows
+          // hold it) before returning it to the admin caller (P2-4).
+          obj[key] = redactCachedValue(JSON.parse(replies[index]));
         } catch {
           obj[key] = replies[index];
         }
@@ -991,7 +1182,9 @@ function createApp({
       const data = await redisClient.get(key);
       if (data) {
         try {
-          res.status(200).json(JSON.parse(data));
+          // Redact webhook_secret before returning a cached value
+          // (sub:* keys hold the signing secret) (P2-4).
+          res.status(200).json(redactCachedValue(JSON.parse(data)));
         } catch {
           res.status(200).json({ value: data });
         }
@@ -1096,4 +1289,4 @@ function createApp({
   return app;
 }
 
-module.exports = { createApp, withoutSecret, validateSubscriptionInput };
+module.exports = { createApp, withoutSecret, redactCachedValue, validateSubscriptionInput };

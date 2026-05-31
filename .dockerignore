@@ -1,0 +1,47 @@
+# Build-context exclusions for the backend image (Dockerfile uses `COPY . .`
+# in the builder stage). Without this, the build context would ingest local
+# secrets (.env*), the host's node_modules, the full git history, and test/
+# doc/CI noise into the builder layer -- baking JWT_SECRET / ADMIN_API_KEY /
+# DB + SMTP creds into the image. Keep this list in sync with .gitignore.
+#
+# NOTE: do NOT exclude package.json / package-lock.json / src / migrations /
+# scripts -- the Dockerfile copies those into the runtime image.
+
+# Secrets / local env
+.env
+.env.*
+
+# Dependencies (reinstalled via `npm ci` inside the image)
+node_modules
+**/node_modules
+
+# Version control
+.git
+.gitignore
+.gitattributes
+
+# Tests + coverage
+tests
+coverage
+*.lcov
+.nyc_output
+
+# Docs + markdown
+docs
+*.md
+
+# CI / tooling / editor
+.github
+.claude
+.vscode
+.idea
+
+# Logs + OS cruft
+logs
+*.log
+npm-debug.log*
+.DS_Store
+
+# The dashboard builds from its own context (./dashboard) with its own
+# Dockerfile + .dockerignore; it's not part of the backend image.
+dashboard

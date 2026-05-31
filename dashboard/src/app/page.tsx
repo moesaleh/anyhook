@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
+import { useState, useCallback } from "react";
 import Link from "next/link";
 import {
   Radio,
@@ -17,6 +17,7 @@ import { DeleteDialog } from "@/components/delete-dialog";
 import { EmptyState } from "@/components/empty-state";
 import { LiveIndicator } from "@/components/live-indicator";
 import { ServiceHealth } from "@/components/service-health";
+import { useVisiblePolling } from "@/lib/use-visible-polling";
 import {
   fetchSubscriptions,
   fetchAllStatuses,
@@ -75,11 +76,10 @@ export default function DashboardPage() {
     }
   }, []);
 
-  useEffect(() => {
-    loadData();
-    const interval = setInterval(loadData, POLL_INTERVAL);
-    return () => clearInterval(interval);
-  }, [loadData]);
+  // Initial load + recurring refresh — pauses automatically on hidden tabs.
+  const { isPolling } = useVisiblePolling(loadData, POLL_INTERVAL, {
+    immediate: true,
+  });
 
   async function handleDelete(id: string) {
     setDeleteTarget(id);
@@ -143,7 +143,7 @@ export default function DashboardPage() {
       <div className="mb-6">
         <LiveIndicator
           lastUpdated={lastUpdated}
-          isPolling={true}
+          isPolling={isPolling}
           intervalMs={POLL_INTERVAL}
         />
       </div>

@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(xargs wc *)",
+      "Bash(git -C C:/Labs/GithubClonedRepos/anyhook status --short)",
+      "Bash(git -C C:/Labs/GithubClonedRepos/anyhook log --oneline -5)",
+      "Bash(git -C C:/Labs/GithubClonedRepos/anyhook remote -v)"
+    ]
+  }
+}

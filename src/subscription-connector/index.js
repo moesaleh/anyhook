@@ -341,8 +341,44 @@ async function handleMessage({ topic, message }) {
     log.error(`Received empty message on topic ${topic}`);
     return;
   }
-  // Kafka only delivers partitions this pod owns, so any message we receive
-  // here is for a subscription we own — no extra ownership filter needed.
+
+  // Co-partition ownership guard (P1-2). We CANNOT assume "Kafka only delivers
+  // partitions this pod owns ⇒ we own this subscription". The consumer
+  // co-subscribes to three topics (subscription_events / update_events /
+  // unsubscribe_events) with no custom partitionAssigner, so kafkajs's default
+  // RoundRobinAssigner flattens every (topic,partition) pair into ONE list and
+  // round-robins that flat index — it does NOT guarantee partition p of
+  // update_events lands on the same member as partition p of
+  // subscription_events. At >=2 replicas an update_events/unsubscribe_events
+  // message can therefore arrive on a pod that does NOT hold the socket, where
+  // a naive disconnect() is a no-op and connect() would open a DUPLICATE
+  // upstream (update), or a Redis delete off the owning pod would LEAK the
+  // socket forever (unsubscribe — the owning pod never tears down).
+  //
+  // Ownership is keyed off the canonical OWNERSHIP_TOPIC (subscription_events)
+  // partition for this id — exactly where its lifecycle events are produced AND
+  // where the owning pod established the connection. So once we actually know
+  // our assignment, gate EVERY topic on ownsSubscription(id): if this pod
+  // doesn't own the partition, the correctly-assigned pod is also receiving the
+  // message (it owns at least the subscription_events partition for this id) and
+  // will act on it. The GROUP_JOIN reconcile is the backstop that closes any
+  // socket whose partition we no longer own after a rebalance.
+  //
+  // We only gate once assignment is known (initialReloadDone): before the first
+  // GROUP_JOIN, ownedPartitions is empty because we haven't LEARNED our
+  // partitions yet, not because we own none — gating then would drop every
+  // message. At the shipped replicas:1 this pod owns all partitions, so the
+  // gate is a no-op there; it only sheds off-pod messages in a true multi-pod
+  // assignment.
+  if (initialReloadDone && !ownsSubscription(subscriptionId)) {
+    log.debug(
+      `Ignoring ${topic} for subscription ${subscriptionId}: partition ${partitionFor(
+        subscriptionId
+      )} not owned by this pod (handled by the owning pod)`
+    );
+    return;
+  }
+
   log.info(`Received message from topic: ${topic} with subscriptionId: ${subscriptionId}`);
 
   if (topic === 'subscription_events') {

@@ -39,7 +39,15 @@
 CREATE TABLE IF NOT EXISTS processed_events (
     subscription_id UUID NOT NULL
         REFERENCES subscriptions(subscription_id) ON DELETE CASCADE,
-    event_id TEXT NOT NULL,
+    -- UUID (not TEXT) to match its siblings delivery_events.event_id and
+    -- pending_retries.event_id, which the dispatcher inserts the SAME id into
+    -- right after claiming here. If this were TEXT, a non-UUID producer id
+    -- would commit the claim marker but then throw on the downstream UUID
+    -- inserts — leaving the event permanently un-delivered AND un-retried
+    -- (the committed marker blocks every future redelivery). Typing it UUID
+    -- makes an invalid id fail fast in claimEvent, before any marker commits,
+    -- so the event stays eligible for redelivery.
+    event_id UUID NOT NULL,
     organization_id UUID REFERENCES organizations(id) ON DELETE CASCADE,
     processed_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
     PRIMARY KEY (subscription_id, event_id)

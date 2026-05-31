@@ -10,6 +10,7 @@ import {
   Hash,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { useVisiblePolling } from "@/lib/use-visible-polling";
 import { DeliveryStatusBadge } from "./delivery-status-badge";
 import { PayloadViewer } from "./payload-viewer";
 import { fetchDeliveries } from "@/lib/api";
@@ -67,11 +68,12 @@ export function DeliveryTable({
     loadDeliveries();
   }, [loadDeliveries]);
 
-  useEffect(() => {
-    if (!isPolling) return;
-    const interval = setInterval(() => loadDeliveries(), pollIntervalMs);
-    return () => clearInterval(interval);
-  }, [isPolling, pollIntervalMs, loadDeliveries]);
+  // Recurring refresh that pauses while the tab is hidden (P2-27), matching
+  // the rest of the dashboard. The initial-load effect above owns first paint
+  // (and the loading skeleton), so this only owns the recurring interval.
+  useVisiblePolling(() => loadDeliveries(), pollIntervalMs, {
+    enabled: isPolling,
+  });
 
   function formatBytes(bytes: number | null): string {
     if (bytes == null) return "—";

@@ -22,10 +22,37 @@ const log = createLogger('notifications');
  * Format a Slack incoming-webhook payload from a notification event.
  * Slack accepts plain `{text, blocks?}` JSON. We use blocks for the
  * structured fields so the receiver can grep them quickly.
+ *
+ * `eventName` selects the template: 'quota_warning' renders an approaching-
+ * cap alert (no subscription/URL fields — the payload carries used/limit, not
+ * a delivery), 'failed' a single delivery failure, and 'dlq' (the default for
+ * an unknown/absent name) the retries-exhausted DLQ story. Threading the name
+ * keeps a quota_warning from masquerading as a DLQ'd delivery.
  */
-function formatSlackPayload(event) {
+function formatSlackPayload(event, eventName = 'dlq') {
+  if (eventName === 'quota_warning') {
+    const lines = [
+      `*Subscription quota warning* — raise the cap before requests start 429ing.`,
+      `• Usage: ${event.used}/${event.limit} subscriptions`,
+      event.organizationName ? `• Organization: ${event.organizationName}` : null,
+    ].filter(Boolean);
+    return {
+      text: `AnyHook: organization at ${event.used}/${event.limit} subscriptions`,
+      blocks: [
+        {
+          type: 'section',
+          text: { type: 'mrkdwn', text: lines.join('\n') },
+        },
+      ],
+    };
+  }
+
+  const headline =
+    eventName === 'failed'
+      ? `*Webhook delivery failed* — the retry policy is still running.`
+      : `*Webhook delivery failed* — moved to DLQ after retries exhausted.`;
   const lines = [
-    `*Webhook delivery failed* — moved to DLQ after retries exhausted.`,
+    headline,
     `• Subscription: \`${event.subscriptionId}\``,
     `• Webhook URL: ${event.webhookUrl}`,
     `• Event: \`${event.eventId}\``,
@@ -43,9 +70,45 @@ function formatSlackPayload(event) {
 }
 
 /**
- * Format an email body for a DLQ event.
+ * Format an email body for a notification event. Branches on `eventName` so
+ * the operator never receives a DLQ incident write-up for a quota warning
+ * (which carries used/limit, not a failed delivery). Defaults to the DLQ
+ * template for an unknown/absent name.
  */
-function formatEmailBody(event) {
+function formatEmailBody(event, eventName = 'dlq') {
+  if (eventName === 'quota_warning') {
+    return [
+      `Organization is at ${event.used}/${event.limit} subscriptions — raise the`,
+      `cap before requests start 429ing.`,
+      ``,
+      event.organizationName ? `Organization: ${event.organizationName}` : null,
+      `Used:  ${event.used}`,
+      `Limit: ${event.limit}`,
+      ``,
+      `No delivery has failed. Increase ORG_MAX_SUBSCRIPTIONS (or the org's`,
+      `override) from the AnyHook dashboard before new subscriptions are rejected.`,
+    ]
+      .filter(line => line !== null)
+      .join('\n');
+  }
+
+  if (eventName === 'failed') {
+    return [
+      `A webhook delivery failed. The retry policy is still running — this is`,
+      `NOT yet a Dead Letter Queue event.`,
+      ``,
+      `Subscription: ${event.subscriptionId}`,
+      `Webhook URL:  ${event.webhookUrl}`,
+      `Event ID:     ${event.eventId}`,
+      event.organizationName ? `Organization: ${event.organizationName}` : null,
+      ``,
+      `If the remaining retries also fail the event will be parked in the Dead`,
+      `Letter Queue. Investigate via the AnyHook dashboard.`,
+    ]
+      .filter(line => line !== null)
+      .join('\n');
+  }
+
   return [
     `A webhook delivery has been moved to the Dead Letter Queue after`,
     `exceeding the retry policy.`,
@@ -63,18 +126,28 @@ function formatEmailBody(event) {
     .join('\n');
 }
 
-async function sendEmailNotification(emailTransport, pref, event) {
+function formatEmailSubject(event, eventName) {
+  if (eventName === 'quota_warning') {
+    return `[AnyHook] Subscription quota warning — ${event.used}/${event.limit}`;
+  }
+  if (eventName === 'failed') {
+    return `[AnyHook] Delivery failed — subscription ${String(event.subscriptionId).slice(0, 8)}`;
+  }
+  return `[AnyHook] DLQ — subscription ${String(event.subscriptionId).slice(0, 8)}`;
+}
+
+async function sendEmailNotification(emailTransport, pref, event, eventName) {
   if (!emailTransport || !emailTransport.enabled) {
     return { delivered: false, reason: 'no_transport' };
   }
   return emailTransport.send({
     to: pref.destination,
-    subject: `[AnyHook] DLQ — subscription ${event.subscriptionId.slice(0, 8)}`,
-    text: formatEmailBody(event),
+    subject: formatEmailSubject(event, eventName),
+    text: formatEmailBody(event, eventName),
   });
 }
 
-async function sendSlackNotification(pref, event) {
+async function sendSlackNotification(pref, event, eventName) {
   // Slack webhooks are user-supplied URLs validated at create-time, but a
   // create-time hostname check is defeated by DNS rebinding — the record can
   // re-point at 169.254.169.254 (cloud IMDS) or an RFC1918 host before this
@@ -105,7 +178,7 @@ async function sendSlackNotification(pref, event) {
   }
 
   try {
-    const res = await axios.post(pref.destination, formatSlackPayload(event), cfg);
+    const res = await axios.post(pref.destination, formatSlackPayload(event, eventName), cfg);
     return { delivered: true, status: res.status };
   } catch (err) {
     // With maxRedirects:0 a 3xx is rejected by axios rather than chased; treat
@@ -130,14 +203,16 @@ const NOTIFICATION_MAX_ATTEMPTS = NOTIFICATION_RETRY_INTERVALS.length + 1; // 1 
 /**
  * Send via the wire (email or Slack). Pure send — doesn't touch the
  * DB. Used by both the synchronous dispatch path and the retry
- * poller. Returns { delivered, reason?, status?, error? }.
+ * poller. `eventName` selects the message template (quota_warning /
+ * failed / dlq) so the rendered alert matches the actual event.
+ * Returns { delivered, reason?, status?, error? }.
  */
-async function sendOnWire(pref, event, emailTransport) {
+async function sendOnWire(pref, event, emailTransport, eventName) {
   if (pref.channel === 'email') {
-    return sendEmailNotification(emailTransport, pref, event);
+    return sendEmailNotification(emailTransport, pref, event, eventName);
   }
   if (pref.channel === 'slack') {
-    return sendSlackNotification(pref, event);
+    return sendSlackNotification(pref, event, eventName);
   }
   return { delivered: false, reason: 'unknown_channel' };
 }
@@ -210,7 +285,7 @@ async function dispatchNotification({ pool, emailTransport, organizationId, even
     prefs.map(async pref => {
       let sendResult;
       try {
-        sendResult = await sendOnWire(pref, event, emailTransport);
+        sendResult = await sendOnWire(pref, event, emailTransport, eventName);
       } catch (err) {
         log.error(`Notification dispatch threw for pref ${pref.id}:`, err.message);
         sendResult = { delivered: false, reason: 'exception', error: err.message };
@@ -295,7 +370,7 @@ async function pollNotificationAttempts({ pool, emailTransport, workerId, batchS
     };
     let sendResult;
     try {
-      sendResult = await sendOnWire(pref, row.payload, emailTransport);
+      sendResult = await sendOnWire(pref, row.payload, emailTransport, row.event_name);
     } catch (err) {
       sendResult = { delivered: false, reason: 'exception', error: err.message };
     }

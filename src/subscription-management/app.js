@@ -277,6 +277,13 @@ function createApp({
 
   const { requireAuth } = mountAuthRoutes(app, {
     pool,
+    // Wire the Redis client through so the per-account login/2FA lockout
+    // (loginLockState/recordLoginFailure/clearLoginFailures in auth.js)
+    // actually engages in production. Omitting it left every throttle
+    // helper hitting its `!redisClient` early-return, silently disabling
+    // the credential-stuffing / password-spray defense even though
+    // createApp receives redisClient and index.js boots through it.
+    redisClient,
     rateLimit,
     authRateLimit,
     apiKeyQuota,

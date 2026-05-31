@@ -1,14 +1,22 @@
 "use client";
 
-import { useEffect, useState, type FormEvent } from "react";
+import {
+  useEffect,
+  useRef,
+  useState,
+  type FormEvent,
+  type ReactNode,
+} from "react";
 import {
   AlertCircle,
+  AlertTriangle,
   Check,
   Copy,
   Loader2,
   MailPlus,
   ShieldAlert,
   Trash2,
+  X,
 } from "lucide-react";
 import {
   fetchInvitations,
@@ -33,6 +41,7 @@ export function InvitationsPanel() {
   const [error, setError] = useState<string | null>(null);
   const [showCreate, setShowCreate] = useState(false);
   const [created, setCreated] = useState<CreatedInvitation | null>(null);
+  const { confirm, dialog: confirmDialog } = useConfirm();
 
   async function load() {
     try {
@@ -50,10 +59,22 @@ export function InvitationsPanel() {
     load();
   }, []);
 
-  async function handleRevoke(id: string) {
-    if (!confirm("Revoke this invitation? The link will stop working.")) return;
+  async function handleRevoke(inv: Invitation) {
+    const ok = await confirm({
+      title: "Revoke invitation",
+      description: (
+        <>
+          Revoke the invitation for{" "}
+          <span className="font-medium">{inv.email}</span>? The link will stop
+          working immediately.
+        </>
+      ),
+      confirmLabel: "Revoke invitation",
+      destructive: true,
+    });
+    if (!ok) return;
     try {
-      await revokeInvitation(id);
+      await revokeInvitation(inv.id);
       await load();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Revoke failed");
@@ -167,7 +188,7 @@ export function InvitationsPanel() {
                       {isPending && (
                         <button
                           type="button"
-                          onClick={() => handleRevoke(inv.id)}
+                          onClick={() => handleRevoke(inv)}
                           className="p-1.5 rounded-md text-neutral-400 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-950"
                           title="Revoke"
                           aria-label="Revoke invitation"
@@ -183,6 +204,8 @@ export function InvitationsPanel() {
           </table>
         )}
       </div>
+
+      {confirmDialog}
     </div>
   );
 }
@@ -371,6 +394,175 @@ function CreatedInvitationCard({
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+/* ── Generic confirm dialog ─────────────────────────────────────────────── */
+
+interface ConfirmState {
+  title: string;
+  description: ReactNode;
+  confirmLabel: string;
+  destructive: boolean;
+}
+
+/**
+ * A small Promise-based confirmation hook. Replaces native `window.confirm`
+ * (main-thread-blocking, unstyleable, untestable via Playwright) with the
+ * app's own accessible modal — the same pattern the Settings page adopted in
+ * P2-32. `confirm(opts)` resolves `true`/`false` when the user picks an
+ * action, so call sites read like `if (await confirm(...))`.
+ *
+ * The dialog mirrors `DeleteDialog`'s a11y contract (role=alertdialog,
+ * aria-modal, Escape-to-cancel, focus the safe default button, backdrop
+ * click cancels) but is content-agnostic so any panel can reuse it.
+ */
+function useConfirm() {
+  const [state, setState] = useState<ConfirmState | null>(null);
+  const resolverRef = useRef<((value: boolean) => void) | null>(null);
+
+  function confirm(opts: {
+    title: string;
+    description: ReactNode;
+    confirmLabel?: string;
+    destructive?: boolean;
+  }): Promise<boolean> {
+    setState({
+      title: opts.title,
+      description: opts.description,
+      confirmLabel: opts.confirmLabel ?? "Confirm",
+      destructive: opts.destructive ?? false,
+    });
+    return new Promise<boolean>((resolve) => {
+      resolverRef.current = resolve;
+    });
+  }
+
+  function settle(value: boolean) {
+    resolverRef.current?.(value);
+    resolverRef.current = null;
+    setState(null);
+  }
+
+  const dialog = state ? (
+    <ConfirmDialog
+      title={state.title}
+      description={state.description}
+      confirmLabel={state.confirmLabel}
+      destructive={state.destructive}
+      onConfirm={() => settle(true)}
+      onCancel={() => settle(false)}
+    />
+  ) : null;
+
+  return { confirm, dialog };
+}
+
+function ConfirmDialog({
+  title,
+  description,
+  confirmLabel,
+  destructive,
+  onConfirm,
+  onCancel,
+}: {
+  title: string;
+  description: ReactNode;
+  confirmLabel: string;
+  destructive: boolean;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  const cancelRef = useRef<HTMLButtonElement>(null);
+
+  // Focus the (safe) cancel button when the dialog mounts.
+  useEffect(() => {
+    cancelRef.current?.focus();
+  }, []);
+
+  // Escape cancels.
+  useEffect(() => {
+    function handleKeyDown(e: KeyboardEvent) {
+      if (e.key === "Escape") onCancel();
+    }
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [onCancel]);
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center"
+      role="alertdialog"
+      aria-modal="true"
+      aria-labelledby="confirm-dialog-title"
+      aria-describedby="confirm-dialog-description"
+    >
+      <div
+        className="absolute inset-0 bg-black/50 backdrop-blur-sm"
+        onClick={onCancel}
+      />
+      <div className="relative bg-white dark:bg-neutral-950 rounded-xl border border-neutral-200 dark:border-neutral-800 shadow-xl max-w-md w-full mx-4 p-6">
+        <button
+          onClick={onCancel}
+          className="absolute top-4 right-4 text-neutral-400 hover:text-neutral-600"
+          aria-label="Close dialog"
+        >
+          <X className="h-4 w-4" />
+        </button>
+
+        <div className="flex items-start gap-4">
+          <div
+            className={cn(
+              "flex-shrink-0 w-10 h-10 rounded-full flex items-center justify-center",
+              destructive
+                ? "bg-red-50 dark:bg-red-950"
+                : "bg-indigo-50 dark:bg-indigo-950"
+            )}
+          >
+            <AlertTriangle
+              className={cn(
+                "h-5 w-5",
+                destructive
+                  ? "text-red-600 dark:text-red-400"
+                  : "text-indigo-600 dark:text-indigo-400"
+              )}
+            />
+          </div>
+          <div className="flex-1">
+            <h3 id="confirm-dialog-title" className="text-base font-semibold">
+              {title}
+            </h3>
+            <p
+              id="confirm-dialog-description"
+              className="mt-2 text-sm text-neutral-500"
+            >
+              {description}
+            </p>
+          </div>
+        </div>
+
+        <div className="flex justify-end gap-3 mt-6">
+          <button
+            ref={cancelRef}
+            onClick={onCancel}
+            className="rounded-lg border border-neutral-200 dark:border-neutral-800 px-4 py-2 text-sm font-medium hover:bg-neutral-50 dark:hover:bg-neutral-900 transition-colors"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={onConfirm}
+            className={cn(
+              "rounded-lg px-4 py-2 text-sm font-medium text-white transition-colors",
+              destructive
+                ? "bg-red-600 hover:bg-red-700"
+                : "bg-indigo-600 hover:bg-indigo-700"
+            )}
+          >
+            {confirmLabel}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }

@@ -261,7 +261,17 @@ function mountAuthRoutes(
       let ttl = LOGIN_FAIL_WINDOW_SEC;
       if (typeof redisClient.ttl === 'function') {
         const t = await redisClient.ttl(key);
-        if (Number.isFinite(t) && t > 0) ttl = t;
+        if (Number.isFinite(t) && t > 0) {
+          ttl = t;
+        } else if (t === -1 && typeof redisClient.expire === 'function') {
+          // Belt-and-suspenders: the key exists but has NO expiry (Redis
+          // -1). recordLoginFailure now arms the TTL atomically, but a key
+          // stranded by an older code path / a failover mid-write would
+          // otherwise lock this subject out FOREVER (count stays >= MAX and
+          // never decays). Re-arm the window so the lockout can self-heal
+          // instead of requiring a manual `DEL login:fail:<subject>`.
+          await redisClient.expire(key, LOGIN_FAIL_WINDOW_SEC);
+        }
       }
       return { locked: true, retryAfter: ttl };
     } catch (err) {
@@ -270,12 +280,43 @@ function mountAuthRoutes(
     }
   }
 
-  // Increment the failure counter for a subject, (re)arming the window
-  // TTL on the first failure. Best-effort; swallows Redis errors.
+  // Atomic INCR + (first-hit) PEXPIRE for the failure counter.
+  //
+  // The naive `INCR` then a SEPARATE `EXPIRE (only when count===1)` is two
+  // round trips: a crash / Redis failover / dropped connection in the gap
+  // strands a TTL-less key that counts forever. Unlike rate-limit.js
+  // (which fails open), loginLockState treats `count >= LOGIN_FAIL_MAX` as
+  // locked, so a stranded TTL-less key would PERMANENTLY lock the account
+  // out — an attacker who can induce a Redis blip could turn the throttle
+  // into an account-lockout DoS. Collapsing both into one server-side
+  // atomic op closes that window. Mirrors atomicIncrWithExpire() in
+  // src/lib/rate-limit.js (inlined here to avoid a cross-module coupling).
+  //
+  //   - Preferred: a Lua script (INCR + conditional PEXPIRE) via EVAL —
+  //     one atomic round trip. PEXPIRE takes ms.
+  //   - Fallback: the original INCR + conditional EXPIRE, used only when
+  //     the client doesn't expose `eval` (e.g. the in-memory test stub).
+  const LOGIN_FAIL_INCR_LUA =
+    "local c = redis.call('INCR', KEYS[1]) " +
+    "if c == 1 then redis.call('PEXPIRE', KEYS[1], ARGV[1]) end " +
+    'return c';
+
+  // Increment the failure counter for a subject, atomically (re)arming the
+  // window TTL on the first failure. Best-effort; swallows Redis errors.
   async function recordLoginFailure(subject) {
     if (!redisClient || !subject) return;
     const key = loginFailKey(subject);
     try {
+      if (typeof redisClient.eval === 'function') {
+        // node-redis v4/v5 EVAL signature: eval(script, { keys, arguments }).
+        await redisClient.eval(LOGIN_FAIL_INCR_LUA, {
+          keys: [key],
+          arguments: [String(LOGIN_FAIL_WINDOW_SEC * 1000)],
+        });
+        return;
+      }
+      // Non-atomic fallback (no EVAL support) — same two-step behavior the
+      // helper shipped with; only reached by stubs lacking eval().
       const count = await redisClient.incr(key);
       if (count === 1) {
         await redisClient.expire(key, LOGIN_FAIL_WINDOW_SEC);

@@ -19,7 +19,7 @@ const PRIOR = JSON.stringify(A.priorResults || {}, null, 2)
 
 const COMMON = `Repo (local working tree, already edited by the fix workflow): ${ROOT}.
 The fix plan is ${PLAN} and the rationale is ${ASSESS} — search them for item IDs.
-You are part of a VERIFICATION pass over fixes that were just applied. Inspect the CURRENT local code (use Read/Grep/Glob) and the git diff vs the last commit (\`git diff HEAD\`).
+You are part of a VERIFICATION pass over fixes that were just applied. Inspect the CURRENT local code (use Read/Grep/Glob) and the git diff of ALL the applied fixes vs the pre-fix baseline (\`git diff main\` — local branch \`main\` is the baseline commit before any fixes; the checked-out branch holds the fixes).
 Hetzner test results captured by the orchestrator before this run (authoritative test signal):
 ${PRIOR}
 Be precise and evidence-based: cite file:line. Do NOT edit files in this phase. Return ONLY the structured object.`
@@ -121,26 +121,41 @@ ROLE: ADVERSARIAL AUDITOR. Lens — ${c.lens}
 Try to BREAK the fixes. Report concrete, actionable findings only (each with the exact file to change + a suggested fix). Prefer high-confidence defects over speculation; mark confidence honestly. Empty findings is a valid result if the work is clean.`,
 }))
 
-const TESTRUNNERS = [
-  { label: 'test-backend-lint', suite: 'backend eslint', cmd: `cd ${WORKDIR} && npm run lint > /tmp/av-be-lint.log 2>&1; echo "EXIT:$?"; tail -n 80 /tmp/av-be-lint.log` },
-  { label: 'test-backend-jest', suite: 'backend jest (unit+integration, needs Postgres)', cmd: `cd ${WORKDIR} && npm test > /tmp/av-be-jest.log 2>&1; echo "EXIT:$?"; tail -n 120 /tmp/av-be-jest.log` },
-  { label: 'test-dashboard', suite: 'dashboard lint+typecheck+build+vitest', cmd: `cd ${WORKDIR}/dashboard && (npm run lint && npm run typecheck && npm run build && npx vitest run) > /tmp/av-dash.log 2>&1; echo "EXIT:$?"; tail -n 120 /tmp/av-dash.log` },
+// REAL adversarial probe runners. The Hetzner box already has the verify branch
+// cloned + npm ci'd at ${WORKDIR}, real Postgres (localhost:55432, db 'anyhook'),
+// Redis (localhost:56379), Kafka (localhost:59092), schema migrated, and
+// ${WORKDIR}/.env.test with all connection vars. Each agent runs on the REAL
+// code against REAL infra (NOT mocks) and proves one item. Isolation: use a
+// distinct DB name / Redis key prefix / Kafka topic+group prefix so probes
+// don't collide when run in parallel.
+const PROBE_ENV = `On the Hetzner box, every probe command must first cd + source env:
+  cd ${WORKDIR} && set -a && . ./.env.test && set +a
+Connection: DATABASE_URL (postgres @localhost:55432/anyhook), REDIS_URL (@localhost:56379), KAFKA_BROKERS (localhost:59092). psql: PGPASSWORD=postgres psql -h localhost -p 55432 -U postgres.
+To migrate a FRESH isolated db: create it, then \`TEST_DATABASE_URL=postgres://postgres:postgres@localhost:55432/<db> node -e "require('./tests/integration/global-setup')()"\`.
+Write your probe script under ${WORKDIR}/verify-scenarios/<name>.js requiring the REAL ../src modules. Run with \`timeout 90 node verify-scenarios/<name>.js; echo EXIT:$?\` and capture to a log. NEVER mock the module under test — the whole point is real execution.`
+const PROBE_RUNNERS = [
+  { label: 'probe-ratelimit', isolation: 'Redis key prefix rlprobe:', prove: 'P2-2 atomic rate-limit. First READ ${WORKDIR}/src/lib/rate-limit.js to learn makeRateLimit/ipKeyFn signatures + the exact Redis key it writes. Then require the REAL rate-limit.js against the REAL Redis client (REDIS_URL). Fire the limiter through several requests and PROVE the counter key ALWAYS carries a TTL (redis PTTL > 0) immediately after the first increment — i.e. INCR+EXPIRE is atomic (Lua/MULTI/SET-NX), with no TTL-less window that would permanently lock an org. Also confirm it fails OPEN if Redis errors.' },
+  { label: 'probe-data-integrity', isolation: 'fresh db av_data', prove: 'P1-4 + P2-11 + P2-12 on REAL Postgres. Create a fresh migrated db av_data. (a) IDEMPOTENCY: INSERT the same (subscription_id,event_id) into processed_events twice with ON CONFLICT DO NOTHING — prove exactly ONE row survives (the dedup gate is DB-enforced). (b) COMPOSITE FK: insert an org+subscription, then attempt a delivery_events row whose organization_id does NOT match the subscription owner — prove the composite FK REJECTS it (P2-11). (c) TIMESTAMPTZ: query information_schema.columns and prove subscriptions.created_at is timestamp WITH time zone (P2-12). Report each sub-result.' },
+  { label: 'probe-quota-warning', isolation: 'fresh db av_quota', prove: 'P0-2 quota_warning actually fires (it was a ReferenceError before — dispatchNotification not imported). On a fresh migrated db, build the REAL app via require("./src/subscription-management/app").createApp with a real pg pool, the in-memory redis stub pattern from tests/integration/setup.js, AND a spy notifyQuotaWarning (or assert against the real dispatchNotification path). Register/seed an org with a low subscription limit, create subscriptions until it crosses the 80% warn threshold via the real /subscribe route (supertest), and PROVE the quota-warning dispatch path is invoked (spy called / a notification_attempts row written) — NOT a swallowed ReferenceError. If wiring an end-to-end supertest flow is too heavy, at minimum require app.js and assert dispatchNotification is in scope (no ReferenceError) by exercising notifyQuotaWarning directly.' },
+  { label: 'probe-service-boot', isolation: 'no published ports needed', prove: 'P0-1 + P1-9 + P2-1: the services actually BOOT against real infra (the original P0-1 was a boot crash-loop). For EACH of src/subscription-management/index.js, src/webhook-dispatcher/index.js, src/subscription-connector/index.js: start it as a real process with the sourced env + RUN_MIGRATIONS_ON_BOOT=false, give it ~12s, and prove it reaches a connected/listening state WITHOUT crash-exiting (capture stdout/stderr; grep for "listening"/"connected" and for any uncaught throw or process.exit(1)). For subscription-management also curl its /health/live. Kill each after. Report per-service boot status + first error line if any.' },
+  { label: 'probe-dispatcher-ssrf-e2e', isolation: 'Kafka topic/group prefix sse2e, Redis prefix sse2e:', prove: 'P0-4 send-time SSRF end-to-end through the REAL dispatcher (the generated dispatcher.test.js MOCKS ssrf-guard, so this is the only real proof). Seed a subscription whose webhook_url resolves to a private/IMDS address (e.g. http://127.0.0.1.nip.io:PORT/ pointing at a local listener) into Redis+PG, start a local HTTP listener on that port, drive a connection_event through the dispatcher delivery path, and PROVE the private listener is NEVER hit and the attempt is recorded failed/DLQ (not delivered). Kafka is up at localhost:59092 — if a full Kafka round-trip proves too fragile in the time budget, instead require the dispatcher\'s exported sendWebhook (with the REAL ssrf-guard, only pg/redis/producer mocked) and prove it refuses the private URL and never connects to the listener. Report which mode you used and the result.' },
 ].map((c) => ({
   label: c.label, agentType: 'general-purpose', phase: 'Verify+Audit+Test', schema: TESTRUN_SCHEMA,
-  prompt: `ROLE: HETZNER TEST RUNNER for "${c.suite}". The verify branch is already cloned + \`npm ci\`'d at ${WORKDIR} on the Hetzner box, with the data stack up and a .env in place.
-Load the remote exec tool: call ToolSearch with query "select:mcp__hetzner-moelabs__exec", then invoke mcp__hetzner-moelabs__exec with this exact command:
-${c.cmd}
-Parse the output: the line "EXIT:N" is the suite's exit code (0 = pass). Return suite, passed (exitCode===0), exitCode, a concise list of distinct failures (test names / error lines), and the log tail. Do not edit any files. If the remote tool is unavailable, set passed=false, exitCode="unavailable" and say so in logTail.`,
+  prompt: `ROLE: REAL ADVERSARIAL PROBE on the Hetzner box (load it first: ToolSearch "select:mcp__hetzner-moelabs__exec").
+${PROBE_ENV}
+Isolation for this probe: ${c.isolation}.
+PROVE: ${c.prove}
+Author a real probe script, run it on Hetzner, and report: suite=${c.label}, passed (true only if the property is genuinely demonstrated), exitCode, failures (specific), logTail (the decisive output). This is real execution — a mock of the thing under test = automatic FAIL. If infra is genuinely unavailable, passed=false + explain in logTail.`,
 }))
 
 // ----- run -----
 phase('Verify+Audit+Test')
-log(`Phase 1 — ${VERIFIERS.length} fix-verifiers + ${AUDITORS.length} auditors + ${TESTRUNNERS.length} Hetzner test-runners, all in parallel`)
+log(`Phase 1 — ${VERIFIERS.length} fix-verifiers + ${AUDITORS.length} auditors + ${PROBE_RUNNERS.length} real Hetzner probes, all in parallel`)
 const lane = (c) => agent(c.prompt, { label: c.label, phase: c.phase, agentType: c.agentType, model: 'opus', schema: c.schema })
   .then((r) => ({ label: c.label, kind: c.schema === VERIFY_SCHEMA ? 'verify' : c.schema === AUDIT_SCHEMA ? 'audit' : 'test', result: r }))
   .catch((e) => ({ label: c.label, error: String((e && e.message) || e) }))
 
-const phase1 = await parallel([...VERIFIERS, ...AUDITORS, ...TESTRUNNERS].map((c) => () => lane(c)))
+const phase1 = await parallel([...VERIFIERS, ...AUDITORS, ...PROBE_RUNNERS].map((c) => () => lane(c)))
 
 // ----- Phase 2: synthesize -----
 phase('Synthesize')

@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useMemo, useEffect } from "react";
+import { useState, useMemo, useEffect, useRef, type ReactNode } from "react";
 import Link from "next/link";
 import {
   Search,
@@ -13,6 +13,8 @@ import {
   ChevronLeft,
   ChevronRight,
   Eye,
+  AlertTriangle,
+  X,
 } from "lucide-react";
 import { cn, formatDate, truncate, useDebounced } from "@/lib/utils";
 import { StatusBadge } from "./status-badge";
@@ -52,6 +54,7 @@ export function SubscriptionTable({
   const [page, setPage] = useState(1);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  const { confirm, dialog: confirmDialog } = useConfirm();
 
   // Reset selection if the underlying list shrinks (after a delete).
   // Keeps the bulk-delete toolbar from claiming "3 selected" when only
@@ -143,12 +146,19 @@ export function SubscriptionTable({
   async function confirmBulkDelete() {
     if (!onBulkDelete) return;
     if (selected.size === 0) return;
-    if (
-      !confirm(
-        `Delete ${selected.size} subscription${selected.size === 1 ? "" : "s"}? This cannot be undone.`
-      )
-    )
-      return;
+    const count = selected.size;
+    const ok = await confirm({
+      title: "Delete subscriptions",
+      description: (
+        <>
+          Delete <span className="font-medium">{count}</span> subscription
+          {count === 1 ? "" : "s"}? This cannot be undone.
+        </>
+      ),
+      confirmLabel: "Delete selected",
+      destructive: true,
+    });
+    if (!ok) return;
     await onBulkDelete([...selected]);
     setSelected(new Set());
   }
@@ -468,6 +478,176 @@ export function SubscriptionTable({
           </div>
         </div>
       )}
+
+      {confirmDialog}
+    </div>
+  );
+}
+
+/* ── Generic confirm dialog ─────────────────────────────────────────────── */
+
+interface ConfirmState {
+  title: string;
+  description: ReactNode;
+  confirmLabel: string;
+  destructive: boolean;
+}
+
+/**
+ * Promise-based confirmation hook — same accessible pattern as the settings
+ * page (P2-32). Replaces native `window.confirm` (main-thread-blocking,
+ * unstyleable, untestable via Playwright) with the app's own modal.
+ * `confirm(opts)` resolves `true`/`false` so call sites read like
+ * `if (await confirm(...))`.
+ *
+ * Mirrors `DeleteDialog`'s a11y contract (role=alertdialog, aria-modal,
+ * Escape-to-cancel, focus the safe default button, backdrop click cancels).
+ */
+function useConfirm() {
+  const [state, setState] = useState<ConfirmState | null>(null);
+  const resolverRef = useRef<((value: boolean) => void) | null>(null);
+
+  function confirm(opts: {
+    title: string;
+    description: ReactNode;
+    confirmLabel?: string;
+    destructive?: boolean;
+  }): Promise<boolean> {
+    setState({
+      title: opts.title,
+      description: opts.description,
+      confirmLabel: opts.confirmLabel ?? "Confirm",
+      destructive: opts.destructive ?? false,
+    });
+    return new Promise<boolean>((resolve) => {
+      resolverRef.current = resolve;
+    });
+  }
+
+  function settle(value: boolean) {
+    resolverRef.current?.(value);
+    resolverRef.current = null;
+    setState(null);
+  }
+
+  const dialog = state ? (
+    <ConfirmDialog
+      title={state.title}
+      description={state.description}
+      confirmLabel={state.confirmLabel}
+      destructive={state.destructive}
+      onConfirm={() => settle(true)}
+      onCancel={() => settle(false)}
+    />
+  ) : null;
+
+  return { confirm, dialog };
+}
+
+function ConfirmDialog({
+  title,
+  description,
+  confirmLabel,
+  destructive,
+  onConfirm,
+  onCancel,
+}: {
+  title: string;
+  description: ReactNode;
+  confirmLabel: string;
+  destructive: boolean;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  const cancelRef = useRef<HTMLButtonElement>(null);
+
+  // Focus the (safe) cancel button when the dialog mounts.
+  useEffect(() => {
+    cancelRef.current?.focus();
+  }, []);
+
+  // Escape cancels.
+  useEffect(() => {
+    function handleKeyDown(e: KeyboardEvent) {
+      if (e.key === "Escape") onCancel();
+    }
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [onCancel]);
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center"
+      role="alertdialog"
+      aria-modal="true"
+      aria-labelledby="confirm-dialog-title"
+      aria-describedby="confirm-dialog-description"
+    >
+      <div
+        className="absolute inset-0 bg-black/50 backdrop-blur-sm"
+        onClick={onCancel}
+      />
+      <div className="relative bg-white dark:bg-neutral-950 rounded-xl border border-neutral-200 dark:border-neutral-800 shadow-xl max-w-md w-full mx-4 p-6">
+        <button
+          onClick={onCancel}
+          className="absolute top-4 right-4 text-neutral-400 hover:text-neutral-600"
+          aria-label="Close dialog"
+        >
+          <X className="h-4 w-4" />
+        </button>
+
+        <div className="flex items-start gap-4">
+          <div
+            className={cn(
+              "flex-shrink-0 w-10 h-10 rounded-full flex items-center justify-center",
+              destructive
+                ? "bg-red-50 dark:bg-red-950"
+                : "bg-indigo-50 dark:bg-indigo-950"
+            )}
+          >
+            <AlertTriangle
+              className={cn(
+                "h-5 w-5",
+                destructive
+                  ? "text-red-600 dark:text-red-400"
+                  : "text-indigo-600 dark:text-indigo-400"
+              )}
+            />
+          </div>
+          <div className="flex-1">
+            <h3 id="confirm-dialog-title" className="text-base font-semibold">
+              {title}
+            </h3>
+            <p
+              id="confirm-dialog-description"
+              className="mt-2 text-sm text-neutral-500"
+            >
+              {description}
+            </p>
+          </div>
+        </div>
+
+        <div className="flex justify-end gap-3 mt-6">
+          <button
+            ref={cancelRef}
+            onClick={onCancel}
+            className="rounded-lg border border-neutral-200 dark:border-neutral-800 px-4 py-2 text-sm font-medium hover:bg-neutral-50 dark:hover:bg-neutral-900 transition-colors"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={onConfirm}
+            className={cn(
+              "rounded-lg px-4 py-2 text-sm font-medium text-white transition-colors",
+              destructive
+                ? "bg-red-600 hover:bg-red-700"
+                : "bg-indigo-600 hover:bg-indigo-700"
+            )}
+          >
+            {confirmLabel}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }

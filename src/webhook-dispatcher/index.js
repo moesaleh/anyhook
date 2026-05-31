@@ -890,14 +890,30 @@ async function processClaimedRetry(row) {
     }
   }
 
-  // Subscription truly deleted (not in Redis, not in PG) — drop the
-  // queue row + record a 'failed' delivery_event for audit. The FK
-  // CASCADE on sub deletion would normally handle this; this branch
-  // covers a race window between sub-delete and the retry poller.
+  // Subscription truly deleted (not in Redis, not in PG) — drop the queue row
+  // and record the terminal 'failed' outcome.
+  //
+  // The DURABLE record of this outcome is the warn log below + the
+  // webhook_deliveries_total{status="failed"} metric — NOT the delivery_events
+  // row. By construction a delivery_events row can never persist for an
+  // already-deleted subscription: subscription_id is NOT NULL and carries BOTH
+  // a single-column FK to subscriptions(subscription_id) ON DELETE CASCADE
+  // (which would cascade the row away) AND, since 20260511, the composite
+  // delivery_events_sub_org_fkey (subscription_id, organization_id) NO ACTION
+  // (which rejects the INSERT outright, because the parent (sub, org) pair is
+  // gone). The recordDelivery() call below is therefore EXPECTED to fail with a
+  // foreign-key violation; recordDelivery swallows it best-effort, so the
+  // swallowed error in the logs here is normal, not a bug. We still issue the
+  // INSERT (a) to cover the narrow race where the sub row hasn't been deleted
+  // yet — only its caches were flushed — in which case the audit row does land,
+  // and (b) because the audit-row write is part of this branch's documented
+  // contract. The metric + log guarantee the signal is never silently lost even
+  // when the FK rejects the row.
   if (!subscription) {
     log.warn(
-      `Subscription ${row.subscription_id} not in Redis OR Postgres; dropping retry ${row.event_id}`
+      `Subscription ${row.subscription_id} deleted before retry ${row.event_id} (attempt ${row.retry_count}); dropping queue row, recording terminal 'failed'`
     );
+    webhookDeliveries.inc({ status: 'failed' });
     await pool.query('DELETE FROM pending_retries WHERE event_id = $1', [row.event_id]);
     await recordDelivery({
       subscriptionId: row.subscription_id,

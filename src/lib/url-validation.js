@@ -105,25 +105,51 @@ function isPrivateIPv4Number(n) {
 }
 
 /**
+ * Build a dotted-decimal IPv4 string from two 16-bit hextets (the low
+ * 32 bits of an IPv6 address), e.g. (0x7f00, 0x0001) -> "127.0.0.1".
+ */
+function hextetsToIPv4(high, low) {
+  return `${(high >> 8) & 0xff}.${high & 0xff}.${(low >> 8) & 0xff}.${low & 0xff}`;
+}
+
+/**
  * Return the embedded IPv4 (as a dotted-decimal string) for an IPv4-in-
  * IPv6 hostname, or null. Handles:
- *   ::ffff:1.2.3.4     dotted (canonical IPv4-mapped)
- *   ::ffff:7f00:1      hex (NOT canonicalised by Node URL parser)
- *   ::1.2.3.4          deprecated IPv4-compatible
+ *   ::ffff:1.2.3.4         dotted (canonical IPv4-mapped)
+ *   ::ffff:7f00:1          hex (NOT canonicalised by Node URL parser)
+ *   ::1.2.3.4              deprecated IPv4-compatible
+ *   64:ff9b::1.2.3.4       NAT64 well-known prefix (RFC 6052), dotted
+ *   64:ff9b::7f00:1        NAT64, hex low 32 bits
+ *   64:ff9b:1::7f00:1      NAT64 local-use prefix (RFC 8215)
+ *   2002:7f00:1::          6to4 (RFC 3056) — v4 in bits 16..47
+ *
+ * NAT64 and 6to4 matter for SSRF: on a NAT64-enabled host an attacker
+ * AAAA of 64:ff9b::a9fe:a9fe routes to 169.254.169.254 (IMDS). Decoding
+ * the embedded v4 here lets isPrivateIPv4Number reject it.
  */
 function ipv6EmbeddedIPv4(h) {
   let m = h.match(/^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
   if (m) return m[1];
 
   m = h.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
-  if (m) {
-    const high = parseInt(m[1], 16);
-    const low = parseInt(m[2], 16);
-    return `${(high >> 8) & 0xff}.${high & 0xff}.${(low >> 8) & 0xff}.${low & 0xff}`;
-  }
+  if (m) return hextetsToIPv4(parseInt(m[1], 16), parseInt(m[2], 16));
 
   m = h.match(/^::(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
   if (m) return m[1];
+
+  // NAT64 well-known prefix 64:ff9b::/96 (RFC 6052) and the RFC 8215
+  // local-use prefix 64:ff9b:1::/48. The embedded IPv4 occupies the low
+  // 32 bits, expressed either dotted or as two hex hextets.
+  m = h.match(/^64:ff9b(?::1)?::(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
+  if (m) return m[1];
+
+  m = h.match(/^64:ff9b(?::1)?::([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+  if (m) return hextetsToIPv4(parseInt(m[1], 16), parseInt(m[2], 16));
+
+  // 6to4 2002::/16 (RFC 3056): the IPv4 is bits 16..47, i.e. the two
+  // hextets immediately after the 2002 prefix.
+  m = h.match(/^2002:([0-9a-f]{1,4}):([0-9a-f]{1,4})(?::.*)?$/);
+  if (m) return hextetsToIPv4(parseInt(m[1], 16), parseInt(m[2], 16));
 
   return null;
 }
@@ -139,9 +165,15 @@ function isPrivateOrLoopbackHost(hostname) {
     return true;
   }
 
-  // IPv6: loopback, unspecified, link-local (fe80::/10), unique-local (fc00::/7)
+  // IPv6: loopback, unspecified, link-local (fe80::/10), unique-local (fc00::/7).
+  // The fc/fd/fe80 prefixes are only meaningful for an IPv6 *literal*, which
+  // always contains a ':'. Requiring a hextet boundary (':' after the prefix)
+  // means a DNS hostname that merely starts with those letters — e.g.
+  // fcm.googleapis.com (Firebase Cloud Messaging) or fdroid.org — is NOT
+  // string-rejected here; it falls through to be resolved and re-classified
+  // on its actual A/AAAA records by the connect-time guard.
   if (h === '::1' || h === '::') return true;
-  if (h.startsWith('fe80:') || h.startsWith('fc') || h.startsWith('fd')) return true;
+  if (/^fe80:/.test(h) || /^f[cd][0-9a-f]{0,2}:/.test(h)) return true;
 
   // IPv4-in-IPv6 — extract the v4 then fall through to the v4 check.
   const embedded = ipv6EmbeddedIPv4(h);

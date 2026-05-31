@@ -236,6 +236,36 @@ describeIfPg('auth + tenancy (integration)', () => {
     });
   });
 
+  describe('per-account login lockout', () => {
+    // Dedicated email used by no other test — the failure counter is keyed
+    // by the lowercased email and the harness never clears Redis between
+    // tests, so isolation depends on this address being unique. The account
+    // is intentionally UNREGISTERED so the test is self-contained and
+    // exercises the pre-resolution (email-subject) counter path.
+    const LOCKOUT_EMAIL = 'lockout-account-test@lockout.test';
+    // Matches LOGIN_FAIL_MAX (default 10) in src/subscription-management/auth.js.
+    const LOGIN_FAIL_MAX = 10;
+
+    it('locks the account with 429 + Retry-After after LOGIN_FAIL_MAX failures', async () => {
+      // Each wrong-password attempt returns 401 and increments the counter.
+      for (let i = 0; i < LOGIN_FAIL_MAX; i++) {
+        const res = await request(app)
+          .post('/auth/login')
+          .send({ email: LOCKOUT_EMAIL, password: 'wrong-pw' });
+        expect(res.status).toBe(401);
+      }
+
+      // The next attempt is bounced by the lockout gate before any password
+      // verify — 429 with a Retry-After header and a vague error body.
+      const locked = await request(app)
+        .post('/auth/login')
+        .send({ email: LOCKOUT_EMAIL, password: 'wrong-pw' });
+      expect(locked.status).toBe(429);
+      expect(Number(locked.headers['retry-after'])).toBeGreaterThan(0);
+      expect(typeof locked.body.error).toBe('string');
+    });
+  });
+
   describe('multi-org isolation', () => {
     it("one user cannot see another org's subscriptions", async () => {
       // User A's org

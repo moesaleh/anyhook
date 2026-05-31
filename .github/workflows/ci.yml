@@ -245,10 +245,95 @@ jobs:
           cosign sign --yes --key env://COSIGN_PRIVATE_KEY \
             "ghcr.io/moesaleh/anyhook-dashboard@${DASHBOARD_DIGEST}"
 
-  # Gated production deploy. Runs only after a successful publish, and only on
-  # push to main / manual dispatch. The `environment: production` binding means
-  # GitHub holds this job until a required reviewer approves it; with no
-  # reviewers/secrets configured it simply no-ops (every step is guarded on the
+  # Boot the just-published backend image against a real data tier and assert it
+  # reaches "listening" (/health/live = 200) BEFORE the deploy gate. The publish
+  # job builds + Trivy-scans the image but never RUNS it; this closes the P0-1 gap
+  # (the production image once crash-looped on boot because node-pg-migrate was
+  # pruned, and nothing in CI would have caught it). The boot path here is
+  # identical to production: the one-shot `migrate` service applies the schema,
+  # then Postgres/Redis/Kafka must go healthy, then subscription-management starts
+  # — and it only calls app.listen() after all three deps connect.
+  image-smoke:
+    name: Smoke-test published image (boot to listening)
+    runs-on: ubuntu-latest
+    needs: [publish]
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Minimal throwaway env for the ephemeral smoke stack. RUN_MIGRATIONS_ON_BOOT
+      # stays false so the app takes the same "schema already current" path as a
+      # real deploy (the one-shot `migrate` service runs the migrations first).
+      # Data-tier hosts are the compose service names, reached over the network.
+      - name: Write throwaway .env for the smoke stack
+        run: |
+          cat > .env <<'EOF'
+          PORT=3001
+          NODE_ENV=production
+          JWT_SECRET=ci_smoke_only_jwt_secret_at_least_32_characters
+          ADMIN_API_KEY=ci-smoke-admin-key
+          POSTGRES_USER=postgres
+          POSTGRES_PASSWORD=ci_smoke_pw
+          POSTGRES_DB=subscriptions_db
+          POSTGRES_PORT=5432
+          DATABASE_URL=postgres://postgres:ci_smoke_pw@postgres:5432/subscriptions_db
+          REDIS_PORT=6379
+          REDIS_URL=redis://redis:6379
+          KAFKA_PORT=9092
+          KAFKA_HOST=kafka:9092
+          KAFKA_NODE_ID=0
+          KAFKA_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093
+          KAFKA_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+          KAFKA_QUORUM_VOTERS=0@kafka:9093
+          RUN_MIGRATIONS_ON_BOOT=false
+          EOF
+
+      - name: Boot subscription-management from the :sha image
+        env:
+          IMAGE_TAG: sha-${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # --wait blocks until the one-shot `migrate` completes successfully AND
+          # subscription-management's healthcheck (/health/live) goes green, or the
+          # timeout trips and this step fails the job.
+          docker compose up -d --wait --wait-timeout 240 subscription-management
+
+      - name: Assert /health/live returns 200
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 20); do
+            code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://localhost:3001/health/live || true)"
+            if [ "$code" = "200" ]; then
+              echo "published image reached listening (/health/live=200) on attempt $i"
+              exit 0
+            fi
+            echo "attempt $i: /health/live -> ${code:-none}; retrying in 3s"
+            sleep 3
+          done
+          echo "::error::published image never reached /health/live=200"
+          exit 1
+
+      - name: Dump stack logs on failure
+        if: failure()
+        run: docker compose logs --no-color --tail=200 || true
+
+      - name: Tear down
+        if: always()
+        env:
+          IMAGE_TAG: sha-${{ github.sha }}
+        run: docker compose down -v --remove-orphans || true
+
+  # Gated production deploy. Runs only after a successful publish + image smoke
+  # test, and only on push to main / manual dispatch. The `environment: production`
+  # binding means GitHub holds this job until a required reviewer approves it; with
+  # no reviewers/secrets configured it simply no-ops (every step is guarded on the
   # DEPLOY_SSH_HOST secret), so the workflow stays green out of the box.
   #
   # Flow: pull the :sha-<commit> images, run DB migrations as a discrete
@@ -256,7 +341,7 @@ jobs:
   deploy:
     name: Deploy (production)
     runs-on: ubuntu-latest
-    needs: [publish]
+    needs: [publish, image-smoke]
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     environment: production
     steps:

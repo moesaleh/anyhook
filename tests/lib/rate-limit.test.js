@@ -263,9 +263,7 @@ describe('per-org override cache', () => {
 
   it('caches the override row across requests for the same org', async () => {
     const redis = mockRedis();
-    const pool = mockPoolWithOverride([
-      { rate_limit_requests: 5, rate_limit_window_sec: 60 },
-    ]);
+    const pool = mockPoolWithOverride([{ rate_limit_requests: 5, rate_limit_window_sec: 60 }]);
     const mw = makeRateLimit({ redisClient: redis, limit: 999, windowSec: 60, pool });
 
     await mw(mockReq('org-1'), mockRes(), () => {});
@@ -300,9 +298,7 @@ describe('per-org override cache', () => {
   it('applies the cached override to subsequent requests', async () => {
     const redis = mockRedis();
     // Pool returns a tight limit of 2.
-    const pool = mockPoolWithOverride([
-      { rate_limit_requests: 2, rate_limit_window_sec: 60 },
-    ]);
+    const pool = mockPoolWithOverride([{ rate_limit_requests: 2, rate_limit_window_sec: 60 }]);
     const mw = makeRateLimit({
       redisClient: redis,
       limit: 999, // env default would allow many; the override should win
@@ -331,15 +327,15 @@ describe('defaultKeyFn (per-organization)', () => {
 
 describe('userOrgKeyFn (per-user-per-org composite)', () => {
   it('returns "<orgId>:<userId>" for cookie-authenticated requests', () => {
-    expect(
-      userOrgKeyFn({ auth: { organizationId: 'org-1', userId: 'user-A' } })
-    ).toBe('org-1:user-A');
+    expect(userOrgKeyFn({ auth: { organizationId: 'org-1', userId: 'user-A' } })).toBe(
+      'org-1:user-A'
+    );
   });
 
   it('falls back to org-only for API-key auth (no userId)', () => {
-    expect(
-      userOrgKeyFn({ auth: { organizationId: 'org-1', userId: null, via: 'api_key' } })
-    ).toBe('org-1');
+    expect(userOrgKeyFn({ auth: { organizationId: 'org-1', userId: null, via: 'api_key' } })).toBe(
+      'org-1'
+    );
   });
 
   it('returns null when no organization is resolved', () => {
@@ -348,9 +344,7 @@ describe('userOrgKeyFn (per-user-per-org composite)', () => {
   });
 
   it('two users in the same org get distinct keys', () => {
-    expect(
-      userOrgKeyFn({ auth: { organizationId: 'org-1', userId: 'user-A' } })
-    ).not.toBe(
+    expect(userOrgKeyFn({ auth: { organizationId: 'org-1', userId: 'user-A' } })).not.toBe(
       userOrgKeyFn({ auth: { organizationId: 'org-1', userId: 'user-B' } })
     );
   });

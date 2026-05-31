@@ -33,6 +33,37 @@ describe('formatSlackPayload', () => {
     });
     expect(out.blocks[0].text.text).not.toContain('Organization:');
   });
+
+  it('renders the quota_warning template (usage/cap, not a delivery)', () => {
+    const out = formatSlackPayload(
+      { used: 95, limit: 100, organizationName: 'Acme Inc' },
+      'quota_warning'
+    );
+    const body = out.blocks[0].text.text;
+    expect(out.text).toContain('95/100 subscriptions');
+    expect(body).toContain('Subscription quota warning');
+    expect(body).toContain('Usage: 95/100 subscriptions');
+    expect(body).toContain('Acme Inc');
+    // Must NOT carry the default DLQ story or any delivery fields.
+    expect(body).not.toContain('moved to DLQ after retries exhausted');
+    expect(body).not.toContain('Webhook URL:');
+  });
+
+  it('renders the failed template (retry policy still running, not DLQ)', () => {
+    const out = formatSlackPayload(
+      {
+        subscriptionId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+        webhookUrl: 'https://hooks.example.com/in',
+        eventId: '11111111-1111-1111-1111-111111111111',
+        organizationName: 'Acme Inc',
+      },
+      'failed'
+    );
+    const body = out.blocks[0].text.text;
+    expect(body).toContain('the retry policy is still running');
+    // The default branch's DLQ headline must not leak into the failed template.
+    expect(body).not.toContain('moved to DLQ after retries exhausted');
+  });
 });
 
 describe('formatEmailBody', () => {
@@ -56,6 +87,40 @@ describe('formatEmailBody', () => {
       eventId: '11111111-1111-1111-1111-111111111111',
     });
     expect(out).not.toContain('Organization:');
+  });
+
+  it('renders the quota_warning body (used/limit, no failed delivery)', () => {
+    const out = formatEmailBody(
+      { used: 95, limit: 100, organizationName: 'Acme Inc' },
+      'quota_warning'
+    );
+    expect(out).toContain('95/100 subscriptions');
+    expect(out).toContain('Used:  95');
+    expect(out).toContain('Limit: 100');
+    expect(out).toContain('No delivery has failed.');
+    expect(out).toContain('ORG_MAX_SUBSCRIPTIONS');
+    expect(out).toContain('Organization: Acme Inc');
+    // Not a DLQ incident write-up.
+    expect(out).not.toContain('moved to the Dead Letter Queue after');
+    expect(out).not.toContain('dlq_events');
+  });
+
+  it('renders the failed body (retry policy running, not yet DLQ)', () => {
+    const out = formatEmailBody(
+      {
+        subscriptionId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+        webhookUrl: 'https://hooks.example.com/in',
+        eventId: '11111111-1111-1111-1111-111111111111',
+        organizationName: 'Acme Inc',
+      },
+      'failed'
+    );
+    expect(out).toContain('The retry policy is still running');
+    expect(out).toContain('NOT yet a Dead Letter Queue event');
+    expect(out).toContain('aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee');
+    // The default DLQ template's redrive wording must not appear here.
+    expect(out).not.toContain('moved to the Dead Letter Queue after');
+    expect(out).not.toContain('awaits an operator redrive');
   });
 });
 
@@ -484,5 +549,58 @@ describe('dispatchNotification — channel fan-out (only configured channels; er
     });
     expect(out).toEqual([]);
     expect(inserts(pool)).toHaveLength(0);
+  });
+});
+
+/* ------------------------------------------------------------------------- *
+ * Email subject templating per event type. formatEmailSubject isn't exported,
+ * so we exercise it through its real seam: dispatchNotification routes an email
+ * pref through sendEmailNotification -> formatEmailSubject, and the scripted
+ * transport captures the rendered { subject } on calls[0]. This proves the
+ * subject branches on eventName (quota_warning / failed / dlq) end-to-end.
+ * ------------------------------------------------------------------------- */
+describe('formatEmailSubject — per-event-type subject (via the email dispatch seam)', () => {
+  function emailPrefRows(events) {
+    return [
+      {
+        id: 'pref-email',
+        channel: 'email',
+        destination: 'ops@example.com',
+        events,
+        organization_name: 'Acme Inc',
+      },
+    ];
+  }
+
+  async function subjectFor(eventName, payload) {
+    const pool = makeMockPool({ prefRows: emailPrefRows([eventName]) });
+    const transport = scriptedEmailTransport({ results: [{ delivered: true }] });
+    await dispatchNotification({
+      pool,
+      emailTransport: transport,
+      organizationId: ORG,
+      eventName,
+      payload,
+    });
+    expect(transport.calls).toHaveLength(1);
+    return transport.calls[0].subject;
+  }
+
+  it('renders the quota_warning subject (used/limit, not DLQ)', async () => {
+    const subject = await subjectFor('quota_warning', { used: 95, limit: 100 });
+    expect(subject).toBe('[AnyHook] Subscription quota warning — 95/100');
+    expect(subject).not.toContain('DLQ');
+    expect(subject).not.toContain('Delivery failed');
+  });
+
+  it('renders the failed subject (subscription prefix, not DLQ)', async () => {
+    const subject = await subjectFor('failed', {
+      subscriptionId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+      webhookUrl: 'https://hooks.example.com/in',
+      eventId: 'evt-1',
+    });
+    expect(subject).toBe('[AnyHook] Delivery failed — subscription aaaaaaaa');
+    expect(subject).not.toContain('DLQ');
+    expect(subject).not.toContain('quota warning');
   });
 });

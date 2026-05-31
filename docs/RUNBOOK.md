@@ -81,10 +81,14 @@ If commit-correlated: roll back. If load-correlated: scale up.
 
 ## anyhook-outbox-backlog
 
-Outbox pending > 100 rows for 10m. (Requires the
-`outbox_pending_total` gauge — TODO: ship in webhook-dispatcher.)
+Outbox pending > 100 rows for 10m. The `outbox_pending_total` gauge
+(labelled by `topic`) is live: the webhook-dispatcher exposes it on
+its port 9090 /metrics endpoint and the outbox-drainer resets + sets
+it every drain cycle, so the alert (`AnyHookOutboxBacklogGrowing` in
+`prometheus/alerts.yml`) sees fresh per-topic data.
 
-Until the gauge is exposed, query manually:
+Optional cross-check straight from Postgres if you want to confirm
+the gauge against the source rows:
 ```sql
 SELECT topic, count(*) FROM outbox_events
 WHERE delivered_at IS NULL GROUP BY topic;

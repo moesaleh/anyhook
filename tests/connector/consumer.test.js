@@ -194,10 +194,17 @@ function deliver(topic, subscriptionId, { partition = 0, offset = '0' } = {}) {
 }
 
 // Fire the GROUP_JOIN handler with a partition assignment, then let the async
-// reconcile it kicks off settle.
-async function joinWithPartitions(partitions) {
+// reconcile it kicks off settle. `assignment` is EITHER an array (back-compat:
+// applies to subscription_events, the canonical OWNERSHIP_TOPIC) OR a per-topic
+// map { subscription_events:[...], update_events:[...], unsubscribe_events:[...] }
+// so a test can model kafkajs's RoundRobinAssigner handing DIFFERENT partitions
+// of each co-subscribed topic to this pod (the divergent-assignment scenario).
+async function joinWithPartitions(assignment) {
+  const memberAssignment = Array.isArray(assignment)
+    ? { subscription_events: assignment }
+    : assignment;
   mockKafka.groupJoin({
-    payload: { memberAssignment: { subscription_events: partitions } },
+    payload: { memberAssignment },
   });
   // reconcile is fire-and-forget inside GROUP_JOIN; flush microtasks + the
   // pLimit chain.
@@ -452,5 +459,87 @@ describe('P1-2 — reconcile only touches sub:* keys and owned partitions', () =
     await joinWithPartitions([4]);
 
     expect(mockHandlers.websocket.disconnect).not.toHaveBeenCalledWith('a');
+  });
+});
+
+describe('P1-2 — cross-topic ownership guard under divergent (multi-replica) assignment', () => {
+  // kafkajs's default RoundRobinAssigner flattens every (topic,partition) pair
+  // across the three co-subscribed topics into ONE list and round-robins that
+  // flat index, so it does NOT guarantee partition p of update_events lands on
+  // the same pod as partition p of subscription_events. At >=3 replicas an
+  // update_events/unsubscribe_events message can therefore reach a pod that
+  // does NOT own the subscription_events (canonical OWNERSHIP_TOPIC) partition
+  // for that id — i.e. a pod that never holds the upstream socket. The guard at
+  // src/subscription-connector/index.js (initialReloadDone && !ownsSubscription)
+  // must drop those off-pod messages: a stray connect() would open a DUPLICATE
+  // upstream and a stray unsubscribe Redis-delete would LEAK the owning pod's
+  // socket forever.
+  //
+  // Ownership is keyed solely off the subscription_events partition for the id
+  // (partitionFor uses the real DefaultPartitioner, OWNERSHIP_TOPIC). Under the
+  // real partitioner: 'sub-xyz' -> partition 1 (we OWN it), 's-notowned' ->
+  // partition 0 (we do NOT own it). We hand this pod a 3-replica-style split:
+  // subscription_events partition [1] only, but DIVERGENT update_events /
+  // unsubscribe_events sets that ALSO include partition 0 — modelling kafkajs
+  // delivering 's-notowned' lifecycle events here even though pod 0 owns it.
+
+  // Drive GROUP_JOIN with the divergent assignment so initialReloadDone is true
+  // and ownedPartitions = {1} (from subscription_events). The update_events /
+  // unsubscribe_events partition lists differ on purpose; the guard reads only
+  // ownedPartitions (subscription_events), so they don't affect ownership.
+  async function joinDivergent() {
+    mockRedis.scanKeys = [];
+    await joinWithPartitions({
+      subscription_events: [1],
+      update_events: [0, 1],
+      unsubscribe_events: [0, 1],
+    });
+  }
+
+  it('IGNORES an update_events message for a sub whose subscription_events partition this pod does NOT own', async () => {
+    // Seed Redis as if the config exists (so the ONLY reason to skip is the
+    // ownership guard, not a cache miss). 's-notowned' -> partition 0 ∉ {1}.
+    mockRedis.data.set(subscriptionCacheKey('s-notowned'), JSON.stringify(gqlSub('s-notowned')));
+    await joinDivergent();
+    jest.clearAllMocks(); // drop any connects from the initial reconcile
+
+    await deliver('update_events', 's-notowned');
+
+    // The owning pod (partition 0) handles the reload; this pod must do nothing.
+    expect(mockHandlers.graphql.disconnect).not.toHaveBeenCalled();
+    expect(mockHandlers.graphql.connect).not.toHaveBeenCalled();
+  });
+
+  it('IGNORES an unsubscribe_events message for a not-owned sub (no disconnect, Redis key preserved)', async () => {
+    const key = subscriptionCacheKey('s-notowned'); // partition 0 ∉ {1}
+    mockRedis.data.set(key, JSON.stringify(gqlSub('s-notowned')));
+    await joinDivergent();
+    jest.clearAllMocks();
+
+    await deliver('unsubscribe_events', 's-notowned');
+
+    // A stray delete here would leak the owning pod's socket — assert neither
+    // a disconnect NOR the Redis cleanup fired off the owning pod.
+    expect(mockHandlers.graphql.disconnect).not.toHaveBeenCalled();
+    expect(mockHandlers.websocket.disconnect).not.toHaveBeenCalled();
+    expect(mockRedis.data.has(key)).toBe(true);
+  });
+
+  it('positive control: ACTS on update/unsubscribe for a sub this pod DOES own under the same assignment', async () => {
+    // 'sub-xyz' -> partition 1 ∈ {1}: owned, so both topics must be handled.
+    mockRedis.data.set(subscriptionCacheKey('sub-xyz'), JSON.stringify(gqlSub('sub-xyz')));
+    await joinDivergent();
+    jest.clearAllMocks();
+
+    await deliver('update_events', 'sub-xyz');
+    expect(mockHandlers.graphql.disconnect).toHaveBeenCalledWith('sub-xyz');
+    expect(mockHandlers.graphql.connect).toHaveBeenCalledTimes(1);
+    expect(mockHandlers.graphql.connect.mock.calls[0][0].subscription_id).toBe('sub-xyz');
+
+    jest.clearAllMocks();
+    const key = subscriptionCacheKey('sub-xyz');
+    await deliver('unsubscribe_events', 'sub-xyz');
+    expect(mockHandlers.graphql.disconnect).toHaveBeenCalledWith('sub-xyz');
+    expect(mockRedis.data.has(key)).toBe(false); // owned → cache cleaned up
   });
 });

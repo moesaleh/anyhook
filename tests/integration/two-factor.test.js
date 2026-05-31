@@ -271,9 +271,7 @@ describeIfPg('2FA / TOTP (integration)', () => {
       expect(login.body.needs_2fa).toBeUndefined();
       const freshCookie = login.headers['set-cookie'];
 
-      const status = await request(app)
-        .get('/auth/2fa/status')
-        .set('Cookie', freshCookie);
+      const status = await request(app).get('/auth/2fa/status').set('Cookie', freshCookie);
       expect(status.body.enabled).toBe(false);
       expect(status.body.unused_backup_codes).toBe(0);
     });

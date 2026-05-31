@@ -90,7 +90,7 @@
 
 - [x] Event delivery counter per subscription (success / failure / retried)
 - [x] Delivery success rate percentage display
-- [ ] Mini sparkline charts on stat cards showing trends over time
+- [x] Mini sparkline charts on stat cards showing trends over time
 - [x] Latency metrics (average webhook response time)
 - [x] Time-range metrics: deliveries in last 24h / 7d displayed on dashboard and detail view
 - [x] Backend: `GET /deliveries/stats` global aggregation endpoint
@@ -122,83 +122,83 @@
 ---
 
 ## 8. Notifications & Alerts
-**Status: TODO**
+**Status: DONE**
 
-- [ ] Toast notification system for success/error/info messages
-- [ ] Alert banner when a subscription enters error state
-- [ ] Notification when a webhook delivery fails after all retries (DLQ event)
-- [ ] Optional email/Slack webhook for critical alerts (configurable)
-- [ ] Notification preferences page
+- [x] Toast notification system for success/error/info messages
+- [x] Alert banner when a subscription enters error state
+- [x] Notification when a webhook delivery fails after all retries (DLQ event)
+- [x] Optional email/Slack webhook for critical alerts (configurable)
+- [x] Notification preferences page
 
 ---
 
 ## 9. Dark Mode & Theming
-**Status: PARTIAL**
+**Status: DONE**
 
 - [x] Dark mode support across all existing components (via Tailwind `dark:` classes)
-- [ ] Theme toggle in sidebar/header (manual light/dark switch)
-- [ ] System preference detection (`prefers-color-scheme`)
-- [ ] Persist theme choice in localStorage
+- [x] Theme toggle in sidebar/header (manual light/dark switch)
+- [x] System preference detection (`prefers-color-scheme`)
+- [x] Persist theme choice in localStorage
 
 ---
 
 ## 10. Error Handling & Resilience
-**Status: PARTIAL**
+**Status: DONE**
 
 - [x] Error banners on dashboard and detail pages
 - [x] Retry button on API failure
 - [x] Graceful loading states (spinners) on all pages
 - [x] Empty states with helpful CTAs
 - [x] Global error boundary (catch unhandled React errors)
-- [ ] Offline detection banner ("You appear to be offline")
-- [ ] Request timeout handling with user-friendly message
-- [ ] Rate limiting feedback from API (429 toast)
+- [x] Offline detection banner ("You appear to be offline")
+- [x] Request timeout handling with user-friendly message
+- [x] Rate limiting feedback from API (429 toast)
 
 ---
 
 ## 11. Bulk Operations
-**Status: TODO**
+**Status: PARTIAL**
 
-- [ ] Multi-select rows in subscription table (checkboxes)
-- [ ] Bulk delete selected subscriptions
+- [x] Multi-select rows in subscription table (checkboxes)
+- [x] Bulk delete selected subscriptions
 - [ ] Bulk pause/resume subscriptions
-- [ ] Select all / deselect all
-- [ ] Confirmation dialog showing count of affected subscriptions
+- [x] Select all / deselect all
+- [x] Confirmation dialog showing count of affected subscriptions
 
 ---
 
 ## 12. Export & Import
-**Status: TODO**
+**Status: PARTIAL**
 
-- [ ] Export subscriptions as JSON file
-- [ ] Export subscriptions as CSV file
-- [ ] Import subscriptions from JSON (bulk create)
+- [x] Export subscriptions as JSON file
+- [x] Export subscriptions as CSV file
+- [x] Import subscriptions from JSON (bulk create)
 - [ ] Download subscription config for a single subscription
 
 ---
 
 ## 13. Testing & Quality
-**Status: PARTIAL**
+**Status: DONE**
 
 - [x] Component unit tests (Vitest + React Testing Library — 73 passing)
 - [x] Backend lib unit tests (Jest — 252 passing)
 - [x] Backend integration tests (real Postgres in CI; auth, subscriptions, organizations, invitations, password, quotas, two-factor)
 - [x] E2E tests for /login + /register render + form behaviour (Playwright)
-- [ ] E2E tests for the create-subscription wizard
-- [ ] E2E tests for the delete flow
-- [ ] E2E tests for the 2FA enrollment + login flows
-- [ ] Accessibility audit (keyboard navigation, screen reader labels, ARIA)
+- [x] E2E tests for the create-subscription wizard
+- [x] E2E tests for the delete flow
+- [x] E2E tests for the 2FA enrollment + login flows
+- [x] Accessibility audit (keyboard navigation, screen reader labels, ARIA)
 
 ---
 
 ## 14. Performance Optimizations
-**Status: TODO**
+**Status: PARTIAL**
 
 - [ ] Virtualized table for large subscription lists (1000+)
-- [ ] Debounced search input
+- [x] Debounced search input
 - [ ] Request deduplication (avoid duplicate fetches during fast navigation)
 - [ ] Optimistic UI updates on delete/create
-- [ ] Service worker for caching static assets
+- [x] Service worker for caching static assets
 
 ---
 
@@ -241,13 +241,13 @@
 | 5  | Edit/Update Subscription       | DONE     |
 | 6  | Dashboard Analytics & Metrics  | DONE     |
 | 7  | Webhook Delivery Logs          | DONE     |
-| 8  | Notifications & Alerts         | TODO     |
-| 9  | Dark Mode & Theming            | PARTIAL  |
-| 10 | Error Handling & Resilience    | PARTIAL  |
-| 11 | Bulk Operations                | TODO     |
-| 12 | Export & Import                | TODO     |
-| 13 | Testing & Quality              | PARTIAL  |
-| 14 | Performance Optimizations      | TODO     |
+| 8  | Notifications & Alerts         | DONE     |
+| 9  | Dark Mode & Theming            | DONE     |
+| 10 | Error Handling & Resilience    | DONE     |
+| 11 | Bulk Operations                | PARTIAL  |
+| 12 | Export & Import                | PARTIAL  |
+| 13 | Testing & Quality              | DONE     |
+| 14 | Performance Optimizations      | PARTIAL  |
 | 15 | Authentication & Authorization | DONE     |
 
-**Completed: 9/15 | Partial: 3/15 | Remaining: 3/15**
+**Completed: 12/15 | Partial: 3/15 | Remaining: 0/15**

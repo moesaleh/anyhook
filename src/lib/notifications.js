@@ -223,7 +223,16 @@ async function sendOnWire(pref, event, emailTransport, eventName) {
  * Schedules a retry on failure (status='failed' + next_attempt_at);
  * marks 'dlq' once max_attempts are exhausted.
  */
-async function recordAttempt(pool, prefId, organizationId, channel, destination, eventName, payload, sendResult) {
+async function recordAttempt(
+  pool,
+  prefId,
+  organizationId,
+  channel,
+  destination,
+  eventName,
+  payload,
+  sendResult
+) {
   const status = sendResult.delivered ? 'delivered' : 'failed';
   const attempts = 1;
   let nextAttemptAt = null;
@@ -246,7 +255,7 @@ async function recordAttempt(pool, prefId, organizationId, channel, destination,
         JSON.stringify(payload),
         status,
         attempts,
-        sendResult.delivered ? null : (sendResult.error || sendResult.reason || 'unknown'),
+        sendResult.delivered ? null : sendResult.error || sendResult.reason || 'unknown',
         nextAttemptAt,
       ]
     );
@@ -323,7 +332,13 @@ async function dispatchNotification({ pool, emailTransport, organizationId, even
  * rows it processed (so the dispatcher can adjust its sleep cadence
  * if needed; currently a fixed interval).
  */
-async function pollNotificationAttempts({ pool, emailTransport, workerId, batchSize = 25, lockTimeoutMs = 5 * 60_000 }) {
+async function pollNotificationAttempts({
+  pool,
+  emailTransport,
+  workerId,
+  batchSize = 25,
+  lockTimeoutMs = 5 * 60_000,
+}) {
   // Stale-lock sweep — fire-and-forget.
   pool
     .query(
@@ -398,7 +413,7 @@ async function pollNotificationAttempts({ pool, emailTransport, workerId, batchS
         [
           status,
           nextAttempts,
-          delivered ? null : (sendResult.error || sendResult.reason || 'unknown'),
+          delivered ? null : sendResult.error || sendResult.reason || 'unknown',
           nextAttemptAt,
           row.id,
         ]

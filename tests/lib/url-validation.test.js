@@ -35,6 +35,11 @@ describe('isPrivateOrLoopbackHost', () => {
     ['fd00::1', true],
     ['2001:db8::1', false],
     ['example.com', false],
+    // Public hostnames that merely start with fc/fd must NOT be string-
+    // rejected as IPv6 ULA — the prefix logic requires a ':' hextet
+    // boundary, so these fall through to be resolved/re-classified later.
+    ['fcm.googleapis.com', false], // Firebase Cloud Messaging
+    ['fdroid.org', false],
   ])('isPrivateOrLoopbackHost(%j) === %j', (hostname, expected) => {
     expect(isPrivateOrLoopbackHost(hostname)).toBe(expected);
   });
@@ -190,6 +195,16 @@ describe('ipv6EmbeddedIPv4', () => {
     ['::ffff:0808:0808', false], // 8.8.8.8 (public)
     ['[::ffff:7f00:1]', true], // brackets stripped
   ])('isPrivateOrLoopbackHost(%j) === %j (IPv6-mapped)', (h, expected) => {
+    expect(isPrivateOrLoopbackHost(h)).toBe(expected);
+  });
+
+  // NAT64 well-known prefix 64:ff9b::/96: on a NAT64-enabled host an
+  // attacker AAAA of 64:ff9b::a9fe:a9fe routes to 169.254.169.254 (IMDS),
+  // and 64:ff9b::7f00:1 routes to 127.0.0.1.
+  it.each([
+    ['64:ff9b::a9fe:a9fe', true], // 169.254.169.254 (IMDS)
+    ['64:ff9b::7f00:1', true], // 127.0.0.1
+  ])('isPrivateOrLoopbackHost(%j) === %j (NAT64)', (h, expected) => {
     expect(isPrivateOrLoopbackHost(h)).toBe(expected);
   });
 });

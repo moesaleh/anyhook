@@ -33,10 +33,17 @@ All 50 items applied via a multi-agent workflow, then **independently verified o
 - **P2-2** — rate-limit `INCR`+`EXPIRE` is atomic (Lua) and fails open; same fix applied to the new per-account login throttle (which was also wired into `createApp`, previously dead).
 - Dashboard: lint + `tsc --noEmit` + `next build` + vitest (88/88) all green.
 
-**Known follow-ups (non-blocking, tracked):**
-- P0-1: add a CI smoke test that boots the **published image** (boot proven locally, not yet in CI).
-- Test coverage the single-file-ownership fixers couldn't add: login/2FA lockout integration test, url-validation NAT64/`fc`-`fd` regression cases, connector multi-replica divergent-assignment test, notification-template (quota_warning/failed) assertions.
-- The pre-existing `Disable 2FA` integration test was stale (reused a cookie that disable intentionally invalidates — failed identically on baseline `main`); corrected to re-login.
+**Follow-ups — RESOLVED 2026-05-31 (second session, verified locally on real Postgres + Docker):**
+- ✅ **P0-1 CI smoke test** — `.github/workflows/ci.yml` gained an `image-smoke` job that boots the published `:sha` image via the repo compose (one-shot `migrate` → Postgres/Redis/Kafka healthy → `subscription-management`) and asserts `/health/live`=200; `deploy` now `needs: [publish, image-smoke]`. Verified end-to-end locally: full stack reaches healthy and `/health/live`→200.
+- ✅ **Test coverage** added — suite now **565/565** (30/30 suites), +14 tests: login lockout integration test (asserts 429 + `Retry-After` after `LOGIN_FAIL_MAX` failures) in `tests/integration/auth.test.js`; NAT64 (`64:ff9b::a9fe:a9fe`, `64:ff9b::7f00:1`) + public `fcm.googleapis.com`/`fdroid.org` cases in `tests/lib/url-validation.test.js`; connector divergent-assignment ownership-guard test in `tests/connector/consumer.test.js`; `quota_warning`/`failed` notification-template assertions in `tests/lib/notifications.test.js`. (2FA-stage lockout test intentionally deferred — the 2FA suite's reused user id + shared in-memory Redis counter make it flaky; the password-stage test covers the mechanism.)
+- ✅ **Kafka image** — `docker-compose.yml` repinned `bitnami/kafka:3.9.1` (now returns `manifest unknown` from Docker Hub) → `apache/kafka:3.9.1` (env vars `KAFKA_CFG_*`→`KAFKA_*`, healthcheck path `/opt/kafka/bin/...`, RF=1 knobs, ephemeral data dir). Broker verified healthy locally and the app connects.
+- ✅ **Stale docs corrected** — `docs/ARCHITECTURE.md`: the atomic `processed_events` dedup gate (P1-4) **is** wired (`webhook-dispatcher/index.js` `claimEvent`, `ON CONFLICT DO NOTHING`); removed the false "migrated but not yet wired" note + the bogus "P1-4 not wired" gap bullet and updated ADR-0002. `docs/RUNBOOK.md`: the `outbox_pending_total` gauge is live (not a TODO). `productfeatures.md`: statuses reconciled to code → 12 DONE / 3 PARTIAL / 0 TODO.
+- ✅ **Pre-existing lint breakage fixed** — `npm run lint` (CI `backend-lint`) was already RED on baseline `main` (prettier drift in `src/lib/notifications.js`, `tests/lib/rate-limit.test.js`, `tests/integration/two-factor.test.js`, untouched by the prior session); auto-formatted, gate now green (0 errors).
+
+**Still open (optional, non-blocking):**
+- **P1-2** — custom Kafka `PartitionAssigner` to co-partition the three sub-topics. The per-message ownership guard is the implemented + now-tested fix; the assigner is an optional optimization only.
+- **P1-5** — `delivery_events` range-partitioning. Retention is implemented via `prune_delivery_events()` (driven by an external scheduler); partitioning is the optional long-term form.
+- The pre-existing `Disable 2FA` integration test (stale cookie reuse) was already corrected last session.
 
 ---
 

@@ -3,9 +3,8 @@
 > Companion to the top-level [README](../README.md). This document describes the
 > system as it is actually implemented in `src/`, `migrations/`, and
 > `docker-compose.yml` — not an aspirational design. Where the running code and
-> the desired end-state differ (e.g. the connector's single-pod constraint, the
-> migrated-but-not-yet-wired atomic dedup table), that gap is called out
-> explicitly so operators are not surprised.
+> the desired end-state differ (e.g. the connector's single-pod constraint), that
+> gap is called out explicitly so operators are not surprised.
 
 ## 1. What AnyHook is
 
@@ -131,11 +130,18 @@ idempotent downstream (see §6).
 `webhook-dispatcher` consumes `connection_events` (manual offset commit, so a
 crash mid-delivery replays rather than drops):
 
-1. **Dedup check** — if a `delivery_events` row already exists for
-   `(subscription_id, event_id)`, treat it as a redelivery and skip (best-effort;
-   see §6 for the limitation and the migrated-but-unwired atomic gate).
-2. **Look up** the subscription from Redis; fall back to Postgres on a miss and
-   re-warm Redis.
+1. **Look up** the subscription from Redis; fall back to Postgres on a miss and
+   re-warm Redis. (Resolving the subscription *before* claiming the event means a
+   transient "not cached yet" miss doesn't burn the event's idempotency marker.)
+2. **Atomic dedup gate** (`claimEvent`) — `INSERT INTO processed_events
+   (subscription_id, event_id, organization_id) ... ON CONFLICT DO NOTHING
+   RETURNING 1`. The `PRIMARY KEY (subscription_id, event_id)` makes the
+   insert-or-skip atomic, so under a rebalance double-delivery (or two pods racing
+   the same event) **exactly one** caller gets a row back and proceeds; the loser
+   sees `rowCount === 0` and skips. This replaced the old non-atomic
+   `SELECT 1 FROM delivery_events` check-then-act (see §6). Events with no
+   producer-supplied id can't be deduped, and a PG error fails open — both
+   proceed rather than silently drop a legitimate event.
 3. **Sign + POST** — HMAC-SHA256 over `` `${timestamp}.${body}` `` using the
    per-subscription `webhook_secret`, sent as `X-AnyHook-Signature` /
    `X-AnyHook-Timestamp`, plus subscription/event/attempt headers. The
@@ -171,18 +177,34 @@ Why at-least-once:
   the broker config. With the default single broker / `RF=1`, an acknowledged
   publish can still be lost on broker disk loss (see §7).
 
-Deduplication of those replays is **best-effort in the running code**: the
-dispatcher does a `SELECT 1 FROM delivery_events WHERE subscription_id=? AND
-event_id=?` before sending. That is a check-then-act with no enforcing unique
-constraint, so two near-simultaneous redeliveries (rebalance window) can both
-pass the check and double-fire.
+Deduplication of those replays is **atomic in the running code**: before
+sending, the dispatcher (`claimEvent` in `src/webhook-dispatcher/index.js`) runs
 
-> **Migrated but not yet wired:** migration `20260509000000_add_processed_events`
-> adds a single-row-per-event `processed_events` table whose `PRIMARY KEY
-> (subscription_id, event_id)` is designed to be the atomic gate
-> (`INSERT ... ON CONFLICT DO NOTHING`; proceed only if a row was inserted). The
-> dispatcher code has **not** been switched to use it yet, so today's guarantee
-> remains at-least-once + best-effort dedup. See [`ADR-0002`](#adr-0002).
+```sql
+INSERT INTO processed_events (subscription_id, event_id, organization_id)
+VALUES ($1, $2, $3)
+ON CONFLICT DO NOTHING
+RETURNING 1;
+```
+
+The `PRIMARY KEY (subscription_id, event_id)` on `processed_events` (migration
+`20260509000000_add_processed_events`) makes the insert-or-skip atomic, so the
+claim is settled by Postgres in one statement: under two near-simultaneous
+redeliveries (a rebalance window) or two pods racing the same event, **exactly
+one** caller gets a row back (`rowCount === 1`) and proceeds; every loser sees
+`rowCount === 0` and skips. This **replaced** the old non-atomic
+`SELECT 1 FROM delivery_events WHERE subscription_id=? AND event_id=?`
+check-then-act, which had no enforcing unique constraint and could let both
+racers pass the check and double-fire.
+
+Two deliberate carve-outs keep the gate from dropping legitimate traffic:
+events with no producer-supplied id (legacy in-flight messages) carry no stable
+dedup key, so they always proceed; and on a Postgres error the claim **fails
+open** (proceeds), preferring a possible duplicate over silently dropping an
+event when the DB is flaky. `delivery_events` is left untouched as the
+per-attempt history table — it legitimately holds many rows per event — so the
+dedicated `processed_events` table is what carries the one-row-per-event
+uniqueness. See [`ADR-0002`](#adr-0002).
 
 Ordering: events for a single subscription are keyed to one Kafka partition, so
 they are produced in order — but the retry ladder means a retried event can be
@@ -263,11 +285,13 @@ fully-production-hardened deployment. Each maps to an item in
 
 - **Connector cannot scale past one replica** (P1-2) — connections aren't sharded
   by partition ownership. Single-replica until fixed.
-- **Atomic dedup not wired** (P1-4) — `processed_events` exists in the schema but
-  the dispatcher still uses the non-atomic `delivery_events` check.
-- **`delivery_events` retention is manual** (P1-5) — `prune_delivery_events(...)`
-  exists but must be driven by an external scheduler (cron / k8s CronJob /
-  pg_cron); partitioning is a documented follow-up.
+- **`delivery_events` retention needs an external scheduler** (P1-5) — retention
+  **is** implemented as the bounded-`DELETE` function `prune_delivery_events(...)`
+  (migration `20260510000000_delivery_events_retention`), but the function must be
+  invoked by an external scheduler (cron / k8s CronJob / pg_cron) — AnyHook does
+  not ship one. Range-partitioning `delivery_events` by `created_at` (which would
+  let retention be a cheap `DROP PARTITION` instead) is an **optional** follow-up
+  documented in that migration, not a missing capability.
 - **DLQ is write-only** (P2-3) — `dlq_events` has no consumer / redrive path.
 - **Connector recovery depends on Redis** (P1-10) — no Postgres fallback on a
   `sub:*` miss, unlike the dispatcher.
@@ -309,8 +333,8 @@ failure.
 
 ### ADR-0002 — At-least-once delivery with deduplication (not exactly-once)
 
-**Status:** Accepted; dedup is best-effort in code, atomic gate migrated but not
-yet wired.
+**Status:** Accepted, implemented. The atomic `processed_events` dedup gate is
+wired into the dispatcher (P1-4).
 
 **Context.** Webhook delivery crosses two unreliable boundaries (Kafka redelivery
 on rebalance/crash, and the receiver's own reliability). Exactly-once across an
@@ -322,18 +346,20 @@ ignore duplicates.
 (`raiseConnectionEvent`) so a redelivered Kafka message carries the same id; use
 manual offset commits so a crash replays rather than drops; expose the id to
 receivers as `X-AnyHook-Event-Id`. Dedup redeliveries in the dispatcher before
-sending.
+sending, with a **DB-enforced atomic claim** rather than a check-then-act read.
 
 **Consequences.**
 - Receivers must be idempotent on `X-AnyHook-Event-Id` and tolerate reordering
   (a retried event can arrive after a later live event for the same
   subscription).
-- The current dispatcher dedup is a non-atomic `SELECT` against `delivery_events`,
-  so a tight redelivery race can double-fire. The schema already includes a
-  single-row-per-event `processed_events` table whose primary key makes the
-  claim atomic (`INSERT ... ON CONFLICT DO NOTHING`); wiring the dispatcher to it
-  (P1-4) upgrades the guarantee from best-effort to DB-enforced without changing
-  the at-least-once contract.
+- The dispatcher dedup is an atomic claim against the single-row-per-event
+  `processed_events` table whose primary key makes the gate atomic
+  (`INSERT ... ON CONFLICT DO NOTHING`; proceed only if `rowCount === 1`). This
+  **replaced** the old non-atomic `SELECT` against `delivery_events`, which could
+  double-fire on a tight redelivery race — the guarantee is now DB-enforced, not
+  best-effort, without changing the at-least-once contract. The claim fails open
+  on a Postgres error (prefers a possible duplicate over dropping a legitimate
+  event), and events lacking a producer-supplied id can't be deduped.
 - We deliberately do **not** put a `UNIQUE(subscription_id, event_id)` on
   `delivery_events` itself, because that table legitimately holds many rows per
   event (one per attempt); the dedicated `processed_events` table carries the

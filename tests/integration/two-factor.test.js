@@ -261,15 +261,21 @@ describeIfPg('2FA / TOTP (integration)', () => {
       expect(res.status).toBe(200);
       expect(res.body.enabled).toBe(false);
 
-      const status = await request(app).get('/auth/2fa/status').set('Cookie', cookie);
-      expect(status.body.enabled).toBe(false);
-      expect(status.body.unused_backup_codes).toBe(0);
-
-      // Login is back to single-step
+      // Disabling 2FA bumps token_version and clears the session cookie (the
+      // account just weakened its auth posture), so the original `cookie` is
+      // now invalid. Re-login — single-step again now that 2FA is off — and
+      // use the fresh session to confirm status.
       const login = await request(app)
         .post('/auth/login')
         .send({ email: '2fa@example.com', password: 'password123' });
       expect(login.body.needs_2fa).toBeUndefined();
+      const freshCookie = login.headers['set-cookie'];
+
+      const status = await request(app)
+        .get('/auth/2fa/status')
+        .set('Cookie', freshCookie);
+      expect(status.body.enabled).toBe(false);
+      expect(status.body.unused_backup_codes).toBe(0);
     });
 
     it('rejects wrong password', async () => {
